@@ -1290,6 +1290,19 @@ static_assert(entity_table::max_slots == provisional_bit - 1);
 
 class pool_base;
 
+// The default sorting algorithm, injectable through world::sort's Algorithm
+// parameter. Replacements must permute the random-access range exactly as a
+// comparison sort over cmp would (the cycle-walk below consumes a gather
+// permutation): std::stable_sort qualifies, a partial sort does not.
+struct std_sort
+{
+    template <class It, class Cmp>
+    void operator()(It first, It last, Cmp cmp) const
+    {
+        std::sort(first, last, cmp);
+    }
+};
+
 // One bonded pair (world::bond<A, B>): both pools keep the A∩B intersection
 // mirror-partitioned at dense positions [0, paired) — the same entity at the
 // same position in both. Heap-stable, owned by the world; unbond() tombstones
@@ -1544,8 +1557,8 @@ protected:
     // permutation with cycle-walking swaps (swap_payload(a, b) mirrors each
     // swap into the derived pool's arrays). Cold path: one O(n) scratch
     // allocation (from the pool's resource) plus the O(n log n) sort.
-    template <class PosCompare, class SwapPayload>
-    void sort_dense_impl(PosCompare cmp, SwapPayload swap_payload)
+    template <class PosCompare, class SwapPayload, class Algo = std_sort>
+    void sort_dense_impl(PosCompare cmp, SwapPayload swap_payload, Algo&& algo = {})
     {
         const auto n = static_cast<std::uint32_t>(dense_.size());
         std::pmr::vector<std::uint32_t> perm(n, memory_);
@@ -1553,7 +1566,7 @@ protected:
         {
             perm[i] = i;
         }
-        std::sort(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
+        algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
         // Apply the gather permutation in place, cycle by cycle: position i
         // receives the element that was at perm[i].
         for (std::uint32_t i = 0; i < n; ++i)
@@ -1759,14 +1772,16 @@ public:
 
     [[nodiscard]] void* item_address(std::uint32_t pos) noexcept override { return &items_[pos]; }
 
-    template <class PosCompare>
-    void sort_dense(PosCompare cmp)
+    template <class PosCompare, class Algo = std_sort>
+    void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
         static_assert(std::is_swappable_v<T>,
                       "quiver: sorting a packed pool swaps components; T must be swappable "
                       "(stable storage sorts without touching payloads)");
         sort_dense_impl(
-            cmp, [this](std::uint32_t a, std::uint32_t b) { std::swap(items_[a], items_[b]); });
+            cmp,
+            [this](std::uint32_t a, std::uint32_t b) { std::swap(items_[a], items_[b]); },
+            std::forward<Algo>(algo));
     }
 
     bool copy_item(std::uint32_t src_index, entity dst) override
@@ -1889,10 +1904,13 @@ public:
         fire_add(e);
     }
 
-    template <class PosCompare>
-    void sort_dense(PosCompare cmp)
+    template <class PosCompare, class Algo = std_sort>
+    void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
-        sort_dense_impl(cmp, [](std::uint32_t, std::uint32_t) {});  // membership only
+        sort_dense_impl(
+            cmp,
+            [](std::uint32_t, std::uint32_t) {},  // membership only
+            std::forward<Algo>(algo));
     }
 
     bool copy_item(std::uint32_t, entity dst) override
@@ -2000,11 +2018,13 @@ public:
 
     // Payloads never move: only the dense/slot mirrors permute, so stable
     // pointers survive sorting (worth choosing stable storage for).
-    template <class PosCompare>
-    void sort_dense(PosCompare cmp)
+    template <class PosCompare, class Algo = std_sort>
+    void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
         sort_dense_impl(
-            cmp, [this](std::uint32_t a, std::uint32_t b) { std::swap(slot_of_[a], slot_of_[b]); });
+            cmp,
+            [this](std::uint32_t a, std::uint32_t b) { std::swap(slot_of_[a], slot_of_[b]); },
+            std::forward<Algo>(algo));
     }
 
     bool copy_item(std::uint32_t src_index, entity dst) override
@@ -2416,6 +2436,23 @@ class selection_t<except<Xs...>, Ts...>
 
     static constexpr std::size_t first_required = find_first_required();
 
+    // Slot of T among Ts... (matching through const and maybe<> spellings);
+    // sizeof...(Ts) when absent. Drives driven_by's static checks.
+    template <class T>
+    static consteval std::size_t driver_slot_of()
+    {
+        constexpr std::array<bool, sizeof...(Ts)> match{
+            std::same_as<detail::bare<detail::maybe_inner<Ts>>, detail::bare<T>>...};
+        for (std::size_t i = 0; i < match.size(); ++i)
+        {
+            if (match[i])
+            {
+                return i;
+            }
+        }
+        return sizeof...(Ts);
+    }
+
     // Locks every included pool for the duration of a user-callback loop.
     // Lock counters exist only in checked builds; release builds write nothing
     // here, which is what makes concurrent const iteration safe there.
@@ -2579,6 +2616,36 @@ public:
                 return false;
             });
         return result;
+    }
+
+    // Returns a copy of the selection that drives iteration from T's pool
+    // instead of the smallest required include. The override changes WHICH
+    // pool walks (and therefore visit order and probe count), never the match
+    // set; each(), entities(), range(), split(), count(), and first() all
+    // honor it. Pair with sort<T> for ordered multi-component iteration:
+    //
+    //   world.sort<Order>(cmp);
+    //   world.select<Order, Sprite>().driven_by<Order>().each(...);
+    //
+    // T must be a required (non-maybe) include, spelled with or without
+    // const. A missing T pool (const world, never registered) yields the
+    // empty selection, like any missing required include.
+    template <class T>
+    [[nodiscard]] selection_t driven_by() const noexcept
+    {
+        constexpr std::size_t slot = driver_slot_of<T>();
+        static_assert(slot < sizeof...(Ts),
+                      "quiver: driven_by<T> needs T to be one of the selection's component "
+                      "types (const-qualified spelling is fine)");
+        if constexpr (slot < sizeof...(Ts))
+        {
+            static_assert(!optional_include[slot],
+                          "quiver: driven_by<T> cannot drive from a maybe<> component — "
+                          "optional pools never drive iteration");
+        }
+        selection_t out = *this;
+        out.driver_override_ = static_cast<std::uint8_t>(slot);
+        return out;
     }
 
     // Range-for iteration with the same matching, constness, tag, and lock
@@ -2854,10 +2921,15 @@ private:
 
     // The pool actually iterated; null when any include pool is missing
     // (possible for selections built from a const world).
-    // The driver is the smallest REQUIRED pool; maybe<> pools never drive and
-    // a missing one never disqualifies the selection.
+    // The driver is the smallest REQUIRED pool — or the driven_by<T> choice
+    // when set; maybe<> pools never drive and a missing one never
+    // disqualifies the selection.
     [[nodiscard]] detail::pool_base* smallest() const noexcept
     {
+        if (driver_override_ != no_driver_override)
+        {
+            return includes_[driver_override_];  // null = empty selection
+        }
         detail::pool_base* best = nullptr;
         for (std::size_t i = 0; i < includes_.size(); ++i)
         {
@@ -3008,8 +3080,11 @@ private:
         }
     }
 
+    static constexpr std::uint8_t no_driver_override = 0xFF;
+
     std::array<detail::pool_base*, sizeof...(Ts)> includes_{};
     std::array<detail::pool_base*, sizeof...(Xs)> excludes_{};
+    std::uint8_t driver_override_ = no_driver_override;
 };
 
 namespace detail
@@ -4673,6 +4748,35 @@ public:
         return *existing;
     }
 
+    // Mutates the existing T in place through fn(T&), then fires on_replace —
+    // the funnel for OBSERVED writes (plain get<T>() writes stay invisible to
+    // hooks and trackers by design; route the ones that matter through here).
+    // Mirrors replace's contract: the entity must have T (checked), pointer-
+    // stable in every storage policy, not structural, and therefore legal
+    // during iteration of T's pool — including on the entity currently
+    // visited. O(1) plus the callable.
+    template <component T, class F>
+        requires std::invocable<F&, T&>
+    T& amend(entity e, F&& fn)
+    {
+        static_assert(!detail::is_tag_v<T>,
+                      "quiver: T uses tag storage and carries no data; there is nothing to "
+                      "amend — use has<T>/add<T>/remove<T>");
+        T* existing = lookup<T>(e);
+        if (existing == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate_pool("amend of a component the entity does not have; pool",
+                                     name_of<T>());
+            }
+            std::abort();  // cannot produce a component reference
+        }
+        std::invoke(fn, *existing);
+        peek_pool<T>()->fire_replace(e);  // non-null: the component exists
+        return *existing;
+    }
+
     // Add-or-replace. Structural (and therefore iteration-locked, with add's
     // report-then-proceed caveat) only when the component is actually added.
     // O(1) amortized.
@@ -4751,8 +4855,37 @@ public:
         {
             return false;
         }
-        const auto* pool = peek_pool<T>();
-        return pool != nullptr && pool->contains(e.index());
+        return probe<T>(e.index());
+    }
+
+    // True when e is alive and has EVERY listed component — the multi-type
+    // spelling of has (which stays the one-type form). Tags are legal:
+    // membership is exactly what they are. Safe on any handle; one liveness
+    // check, then one pool probe per type. O(types).
+    template <component T, component U, component... Rest>
+    [[nodiscard]] bool has_all(entity e) const noexcept
+    {
+        static_assert(detail::all_distinct<T, U, Rest...>,
+                      "quiver: duplicate component type in has_all<...>");
+        if (!table_.alive(e))
+        {
+            return false;
+        }
+        return probe<T>(e.index()) && probe<U>(e.index()) && (probe<Rest>(e.index()) && ...);
+    }
+
+    // True when e is alive and has AT LEAST ONE listed component. Same
+    // contract as has_all; short-circuits on the first hit. O(types).
+    template <component T, component U, component... Rest>
+    [[nodiscard]] bool has_any(entity e) const noexcept
+    {
+        static_assert(detail::all_distinct<T, U, Rest...>,
+                      "quiver: duplicate component type in has_any<...>");
+        if (!table_.alive(e))
+        {
+            return false;
+        }
+        return probe<T>(e.index()) || probe<U>(e.index()) || (probe<Rest>(e.index()) || ...);
     }
 
     // Checked reference access; the safe form is find<T>. O(1). One deduced-
@@ -4879,12 +5012,16 @@ public:
 
     // Reorders T's pool — the dense order selections, snapshots, and range()
     // iterate in. cmp compares component values (const T&, const T&) or
-    // entities (entity, entity); the value form wins when both bind. Cold:
-    // O(n log n) plus one scratch allocation; refused while T's pool is being
-    // iterated. Packed pools swap components, so outstanding T* die; stable
-    // pools permute bookkeeping only, so component pointers survive sorting.
-    template <component T, class Compare>
-    void sort(Compare cmp)
+    // entities (entity, entity); the value form wins when both bind. The
+    // optional algorithm is called as algo(first, last, cmp) over a random-
+    // access range of dense positions and must permute it exactly as a
+    // comparison sort would (std::stable_sort qualifies; default std::sort).
+    // Cold: O(n log n) plus one scratch allocation; refused while T's pool is
+    // being iterated. Packed pools swap components, so outstanding T* die;
+    // stable pools permute bookkeeping only, so component pointers survive
+    // sorting.
+    template <component T, class Compare, class Algorithm = detail::std_sort>
+    void sort(Compare cmp, Algorithm&& algo = {})
     {
         auto* pool = peek_pool<T>();
         if (pool == nullptr || pool->size() < 2)
@@ -4913,13 +5050,15 @@ public:
         if constexpr (std::invocable<Compare&, const T&, const T&> && !detail::is_tag_v<T>)
         {
             pool->sort_dense([&](std::uint32_t a, std::uint32_t b)
-                             { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); });
+                             { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); },
+                             std::forward<Algorithm>(algo));
         }
         else if constexpr (std::invocable<Compare&, entity, entity>)
         {
             pool->sort_dense(
                 [&](std::uint32_t a, std::uint32_t b)
-                { return static_cast<bool>(cmp(pool->entity_at(a), pool->entity_at(b))); });
+                { return static_cast<bool>(cmp(pool->entity_at(a), pool->entity_at(b))); },
+                std::forward<Algorithm>(algo));
         }
         else
         {
@@ -5829,6 +5968,15 @@ private:
     [[nodiscard]] detail::pool_base* pool_base_of() const noexcept
     {
         return peek_pool<T>();
+    }
+
+    // The post-liveness-check half of has, for has_all/has_any's single
+    // liveness gate. An unregistered pool counts as absent.
+    template <component T>
+    [[nodiscard]] bool probe(std::uint32_t index) const noexcept
+    {
+        const auto* pool = peek_pool<T>();
+        return pool != nullptr && pool->contains(index);
     }
 
     // Constness flows from the world: const Self yields const T*.
