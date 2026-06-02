@@ -4,104 +4,17 @@
 // violation-handler tests are skipped when checks are compiled out.
 // ============================================================================
 
-#include <quiver.hpp>
+#include "test_harness.hpp"
 
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <memory>
-#include <memory_resource>
-#include <string>
 #include <thread>
 #include <unordered_set>
-#include <vector>
-
-namespace ecs = quiver;
-
-// ------------------------------------------------------------------- harness
-
-static int checks_run = 0;
-static int checks_failed = 0;
-
-#define CHECK(cond)                                                     \
-    do                                                                  \
-    {                                                                   \
-        ++checks_run;                                                   \
-        if (!(cond))                                                    \
-        {                                                               \
-            ++checks_failed;                                            \
-            std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-        }                                                               \
-    } while (false)
-
-#define CHECK_VALID(world) CHECK((world).validate().has_value())
-
-static void section(const char* name)
-{
-    std::printf("--- %s\n", name);
-}
-
-// Captures violations instead of aborting, for tests that provoke them.
-static int violations_seen = 0;
-static std::string last_violation;
-
-static void counting_handler(const char* message)
-{
-    ++violations_seen;
-    last_violation = message;
-}
-
-struct violation_scope
-{
-    violation_scope()
-        : previous(ecs::set_violation_handler(&counting_handler))
-    {
-        violations_seen = 0;
-        last_violation.clear();
-    }
-
-    ~violation_scope() { ecs::set_violation_handler(previous); }
-
-    ecs::violation_handler previous;
-};
 
 // ---------------------------------------------------------- test components
-
-struct Pos
-{
-    int x = 0;
-};
-
-struct Vel
-{
-    int v = 0;
-};
-
-struct Hp
-{
-    int hp = 0;
-};
-
-struct TagA
-{
-};
-
-struct TagB
-{
-};
 
 // Empty but explicitly packed: storage_policy beats the empty-type auto-tag.
 struct EmptyPacked
 {
     static constexpr auto quiver_storage = ecs::storage::packed;
-};
-
-struct Stable
-{
-    int value = 0;
-    static constexpr auto quiver_storage = ecs::storage::stable;
 };
 
 struct MoveOnly
@@ -113,50 +26,6 @@ struct MoveOnly
 
     std::unique_ptr<int> box;
 };
-
-// Counts constructions/destructions to prove destructor balance everywhere.
-struct Counted
-{
-    static int live;
-    static int total_ctors;
-    static int total_dtors;
-
-    int value;
-
-    explicit Counted(int v = 0)
-        : value(v)
-    {
-        ++live;
-        ++total_ctors;
-    }
-
-    Counted(const Counted& other)
-        : value(other.value)
-    {
-        ++live;
-        ++total_ctors;
-    }
-
-    Counted(Counted&& other) noexcept
-        : value(other.value)
-    {
-        ++live;
-        ++total_ctors;
-    }
-
-    Counted& operator=(const Counted&) = default;
-    Counted& operator=(Counted&&) = default;
-
-    ~Counted()
-    {
-        --live;
-        ++total_dtors;
-    }
-};
-
-int Counted::live = 0;
-int Counted::total_ctors = 0;
-int Counted::total_dtors = 0;
 
 // Knows its own address; its move constructor records whether the source was
 // where it claimed to be. If the command buffer's arena ever relocated a
@@ -189,35 +58,6 @@ struct Anchored
     }
 
     const Anchored* self;
-};
-
-// Over-aligned payload; the move constructor verifies the arena honoured it.
-static int misaligned_payloads = 0;
-
-struct alignas(64) Aligned
-{
-    Aligned() = default;
-
-    Aligned(Aligned&& other) noexcept
-    {
-        if (reinterpret_cast<std::uintptr_t>(&other) % 64 != 0)
-        {
-            ++misaligned_payloads;
-        }
-        lanes[0] = other.lanes[0];
-    }
-
-    Aligned& operator=(Aligned&&) = default;
-
-    float lanes[16] = {};
-};
-
-// Stable-storage variant of Counted (local classes cannot host the static
-// policy member).
-struct StableCounted : Counted
-{
-    using Counted::Counted;
-    static constexpr auto quiver_storage = ecs::storage::stable;
 };
 
 // Non-movable component (std::atomic member): legal in stable storage, which
@@ -288,35 +128,6 @@ struct quiver::relink_traits<ForeignLink>
     static void relink(ForeignLink& value, const quiver::graft_map& map)
     {
         value.target = map.resolve(value.target);
-    }
-};
-
-// A minimal in-memory archive: raw bytes, trivially-copyable values only
-// (quiver's writer/reader concepts put the encoding on the archive's side).
-struct byte_writer
-{
-    std::vector<std::byte> data;
-
-    template <class T>
-        requires std::is_trivially_copyable_v<T>
-    void operator()(const T& value)
-    {
-        const auto* raw = reinterpret_cast<const std::byte*>(&value);
-        data.insert(data.end(), raw, raw + sizeof(T));
-    }
-};
-
-struct byte_reader
-{
-    const std::vector<std::byte>* data = nullptr;
-    std::size_t pos = 0;
-
-    template <class T>
-        requires std::is_trivially_copyable_v<T>
-    void operator()(T& value)
-    {
-        std::memcpy(&value, data->data() + pos, sizeof(T));
-        pos += sizeof(T);
     }
 };
 
@@ -4075,6 +3886,11 @@ int main()
     test_genericity_seams();
     test_compile_time_toolkit();
     test_world_ops_and_inspection();
+    test_has_all_any();
+    test_amend();
+    test_driven_by();
+    test_sort_algorithm();
+    test_custom_pool_from_scratch();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
