@@ -27,7 +27,7 @@ where clang-format >nul 2>&1
 if errorlevel 1 (
     echo SKIP: clang-format not found in PATH
 ) else (
-    for %%f in (include\*.hpp tests\*.cpp examples\*.cpp bench\*.cpp) do (
+    for %%f in (include\*.hpp tests\*.cpp tests\*.hpp examples\*.cpp bench\*.cpp) do (
         if exist "%%f" clang-format -i "%%f"
     )
     echo Formatting complete.
@@ -56,19 +56,21 @@ where clang-tidy >nul 2>&1
 if errorlevel 1 (
     echo SKIP: clang-tidy not found in PATH
 ) else (
-    if not exist "build-cdb\compile_commands.json" (
-        echo   Generating compile_commands.json via Ninja sidecar...
-        cmake --preset compile-db >nul
-        if !ERRORLEVEL! neq 0 (
-            echo ERROR: compile-db configure failed
-            exit /b 1
-        )
+    REM Reconfigure the sidecar every run: new test TUs must appear in the
+    REM database or clang-tidy errors out on them.
+    echo   Generating compile_commands.json via Ninja sidecar...
+    cmake --preset compile-db >nul
+    if !ERRORLEVEL! neq 0 (
+        echo ERROR: compile-db configure failed
+        exit /b 1
     )
 
     REM The sidecar preset compiles with clang++ directly, so the database is
     REM consumed as-is - no driver-mode tricks or normalization required.
-    for %%f in (tests\tests.cpp examples\gameplay.cpp bench\bench.cpp) do (
-        if exist "%%f" (
+    REM module_smoke.cpp is skipped: `import quiver;` targets the MSVC module
+    REM build, which the clang sidecar cannot resolve.
+    for %%f in (tests\*.cpp examples\*.cpp bench\*.cpp) do (
+        if exist "%%f" if not "%%f"=="tests\module_smoke.cpp" (
             echo   tidy: %%f
             clang-tidy --quiet -p build-cdb "%%f"
             if !ERRORLEVEL! neq 0 (
