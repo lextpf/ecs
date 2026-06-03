@@ -25,7 +25,7 @@ function(quiver_executable name)
     endif()
 endfunction()
 
-quiver_executable(quiver_tests tests/tests.cpp tests/tests_world.cpp)
+quiver_executable(quiver_tests tests/tests.cpp tests/tests_world.cpp tests/tests_bonds.cpp)
 quiver_executable(quiver_example examples/gameplay.cpp)
 quiver_executable(quiver_bench bench/bench.cpp)
 
