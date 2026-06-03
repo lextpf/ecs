@@ -208,3 +208,9 @@ void test_amend();
 void test_driven_by();
 void test_sort_algorithm();
 void test_custom_pool_from_scratch();
+
+// tests_bonds.cpp (M2/M3: N-ary bonds and bond views)
+void test_bond_n_ary();
+void test_bond_n_ary_paths();
+void test_bond_n_ary_violations();  // defined (and called) under QUIVER_CHECKS only
+void test_bond_n_ary_unbond();
