@@ -41,6 +41,11 @@ struct Sleeping  // tag
 {
 };
 
+struct Mass
+{
+    float kg = 0;
+};
+
 volatile std::uint64_t sink = 0;  // defeats dead-code elimination
 
 constexpr std::size_t entity_count = 100'000;
@@ -369,6 +374,83 @@ int main()
                                   for (std::size_t i = 1; i < (churn * 2); i += 2)
                                   {
                                       w.remove<Velocity>(entities[i]);
+                                  }
+                              }));
+    }
+
+    // --- bonded groups (N-ary) -------------------------------------------------
+    {
+        ecs::world w;
+        w.reserve_entities(entity_count);
+        std::vector<ecs::entity> entities(entity_count);
+        for (std::size_t i = 0; i < entity_count; ++i)
+        {
+            entities[i] = w.spawn(Transform{static_cast<float>(i), 0});
+            if (i % 2 == 0)
+            {
+                w.add<Velocity>(entities[i], Velocity{1, 1});
+            }
+            if (i % 4 == 0)
+            {
+                w.add<Mass>(entities[i], Mass{1});
+            }
+        }
+        const auto sel = w.select<Transform, const Velocity, const Mass>();
+        report("3-comp iteration, select (probes)",
+               best_ns_per_op(entity_count / 4,
+                              [&]
+                              {
+                                  sel.each([](Transform& t, const Velocity& v, const Mass& m)
+                                           { t.x += v.dx * m.kg; });
+                                  sink += 1;
+                              }));
+        auto view = w.bond<Transform, Velocity, Mass>();
+        report("3-comp iteration, bonded (linear)",
+               best_ns_per_op(entity_count / 4,
+                              [&]
+                              {
+                                  view.each([](Transform& t, const Velocity& v, const Mass& m)
+                                            { t.x += v.dx * m.kg; });
+                                  sink += 1;
+                              }));
+
+        // Maintenance at three owners: entities enter/leave through Mass.
+        constexpr std::size_t churn = 10'000;
+        report("3-owner bond add+remove<Mass> churn",
+               best_ns_per_op(churn * 2,
+                              [&]
+                              {
+                                  for (std::size_t i = 2; i < (churn * 4); i += 4)
+                                  {
+                                      w.add<Mass>(entities[i], Mass{1});
+                                  }
+                                  for (std::size_t i = 2; i < (churn * 4); i += 4)
+                                  {
+                                      w.remove<Mass>(entities[i]);
+                                  }
+                              }));
+
+        // Maintenance at four owners: the tag side churns.
+        ecs::world w4;
+        std::vector<ecs::entity> quad(churn);
+        for (std::size_t i = 0; i < churn; ++i)
+        {
+            quad[i] = w4.spawn(Transform{1, 1});
+            w4.add<Velocity>(quad[i], Velocity{1, 1});
+            w4.add<Mass>(quad[i], Mass{1});
+        }
+        w4.bond<Transform, Velocity, Mass, Sleeping>();
+        report("4-owner bond add+remove<Sleeping> churn",
+               best_ns_per_op(churn * 2,
+                              [&]
+                              {
+                                  for (const ecs::entity e : quad)
+                                  {
+                                      w4.add<Sleeping>(e);
+                                  }
+                                  for (const ecs::entity e : quad)
+                                  {
+                                      w4.remove<Sleeping>(e);
                                   }
                               }));
     }
