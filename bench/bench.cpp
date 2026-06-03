@@ -178,6 +178,32 @@ int main()
                    }));
     }
 
+    // --- membership probes -----------------------------------------------------
+    {
+        ecs::world w;
+        w.reserve_entities(entity_count);
+        std::vector<ecs::entity> entities(entity_count);
+        for (std::size_t i = 0; i < entity_count; ++i)
+        {
+            entities[i] = w.spawn(Transform{1, 1});
+            if (i % 2 == 0)
+            {
+                w.add<Velocity>(entities[i], Velocity{1, 1});
+            }
+        }
+        report("has_all<Transform, Velocity>",
+               best_ns_per_op(entity_count,
+                              [&]
+                              {
+                                  std::uint64_t hits = 0;
+                                  for (const ecs::entity e : entities)
+                                  {
+                                      hits += w.has_all<Transform, Velocity>(e) ? 1u : 0u;
+                                  }
+                                  sink += hits;
+                              }));
+    }
+
     // --- iteration -------------------------------------------------------------
     {
         ecs::world w;
