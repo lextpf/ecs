@@ -3891,6 +3891,12 @@ int main()
     test_driven_by();
     test_sort_algorithm();
     test_custom_pool_from_scratch();
+    test_bond_n_ary();
+    test_bond_n_ary_paths();
+#if QUIVER_CHECKS
+    test_bond_n_ary_violations();
+#endif
+    test_bond_n_ary_unbond();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
