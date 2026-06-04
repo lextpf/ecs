@@ -23,17 +23,6 @@ struct SortKeyStable
     static constexpr auto quiver_storage = ecs::storage::stable;
 };
 
-// An injectable algorithm: same contract as the default (permute the range
-// exactly as a comparison sort would), different tie behavior.
-struct stable_algo
-{
-    template <class It, class Cmp>
-    void operator()(It first, It last, Cmp cmp) const
-    {
-        std::stable_sort(first, last, cmp);
-    }
-};
-
 // ------------------------------------------------ from-scratch custom pool
 // The executable spec of the pool_of seam's FROM-SCRATCH path: derive
 // quiver::basic_pool directly (not a built-in pool), implement the typed
