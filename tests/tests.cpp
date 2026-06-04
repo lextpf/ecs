@@ -3897,6 +3897,9 @@ int main()
     test_bond_n_ary_violations();
 #endif
     test_bond_n_ary_unbond();
+    test_bond_observed_views();
+    test_bond_partition_sort();
+    test_bond_view_count();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
