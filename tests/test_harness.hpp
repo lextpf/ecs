@@ -8,6 +8,7 @@
 
 #include <quiver.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -169,6 +170,17 @@ struct alignas(64) Aligned
     float lanes[16] = {};
 };
 
+// An injectable sort algorithm: same contract as the default (permute the
+// range exactly as a comparison sort would), different tie behavior.
+struct stable_algo
+{
+    template <class It, class Cmp>
+    void operator()(It first, It last, Cmp cmp) const
+    {
+        std::stable_sort(first, last, cmp);
+    }
+};
+
 // A minimal in-memory archive: raw bytes, trivially-copyable values only
 // (quiver's writer/reader concepts put the encoding on the archive's side).
 struct byte_writer
@@ -214,3 +226,6 @@ void test_bond_n_ary();
 void test_bond_n_ary_paths();
 void test_bond_n_ary_violations();  // defined (and called) under QUIVER_CHECKS only
 void test_bond_n_ary_unbond();
+void test_bond_observed_views();
+void test_bond_partition_sort();
+void test_bond_view_count();
