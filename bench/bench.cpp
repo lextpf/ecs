@@ -46,6 +46,11 @@ struct Mass
     float kg = 0;
 };
 
+struct Heat
+{
+    float degrees = 0;
+};
+
 volatile std::uint64_t sink = 0;  // defeats dead-code elimination
 
 constexpr std::size_t entity_count = 100'000;
@@ -411,6 +416,23 @@ int main()
                               {
                                   view.each([](Transform& t, const Velocity& v, const Mass& m)
                                             { t.x += v.dx * m.kg; });
+                                  sink += 1;
+                              }));
+
+        // Observed extras pay one sparse probe per row, on top of the
+        // zero-probe owned walk.
+        for (std::size_t i = 0; i < entity_count; i += 8)
+        {
+            w.add<Heat>(entities[i], Heat{300});
+        }
+        auto observing = w.bonded<Transform, Velocity, Mass, ecs::maybe<Heat>>();
+        report("3-owned + observed maybe<Heat>",
+               best_ns_per_op(entity_count / 4,
+                              [&]
+                              {
+                                  observing.each(
+                                      [](Transform& t, const Velocity& v, const Mass& m, Heat* h)
+                                      { t.x += v.dx * m.kg + (h != nullptr ? h->degrees : 0.0f); });
                                   sink += 1;
                               }));
 
