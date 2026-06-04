@@ -117,8 +117,8 @@ class basic_entity_ref;
 using entity_ref = basic_entity_ref<world>;
 using const_entity_ref = basic_entity_ref<const world>;
 class runtime_selection;
-template <class... Ts>
-class bonded_view;
+template <class Excludes, class... Ts>
+class bonded_view_t;
 template <class Excludes, class... Ts>
 class selection_t;
 struct test_access;  // checked-build test backdoor; defined only when QUIVER_CHECKS is on
@@ -1655,8 +1655,8 @@ protected:
     friend class quiver::runtime_selection;
     template <class Excludes, class... Ts>
     friend class quiver::selection_t;
-    template <class... Ts>
-    friend class quiver::bonded_view;
+    template <class Excludes, class... Ts>
+    friend class quiver::bonded_view_t;
     friend struct quiver::test_access;  // declared unconditionally; defined only under checks
 
     struct hook_entry
@@ -3185,17 +3185,68 @@ inline constexpr bool row_stops<F, std::tuple<Es...>> =
     std::same_as<std::invoke_result_t<F&, Es...>, bool>;
 }  // namespace detail
 
-template <class... Ts>  // const-qualify elements for read-only payload access
-class bonded_view
+template <class Excludes, class... Ts>
+class bonded_view_t;  // primary; only the except<...> specialization exists
+
+template <class... Ts, class... Xs>  // const-qualify elements for read-only payload access
+class bonded_view_t<except<Xs...>, Ts...>
 {
     static_assert(sizeof...(Ts) >= 2, "quiver: a bonded view spans at least two pools");
+    static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
+                  "quiver: bonded view component types must be plain object types");
+    static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
+                  "quiver: maybe<T> of a tag component carries no data to point at; probe "
+                  "has<T> in the callback body instead");
+    static_assert(detail::all_distinct<detail::maybe_inner<Ts>...>,
+                  "quiver: duplicate component type in bonded<...>");
+    static_assert((component<Xs> && ...),
+                  "quiver: except<> types must be plain, non-const component types");
+    static_assert(detail::all_distinct<Xs...>, "quiver: duplicate component type in except<...>");
+    static_assert((!detail::type_among<detail::maybe_inner<Ts>, Xs...> && ...),
+                  "quiver: a component type appears in both bonded<...> and except<...>");
 
-    // Tags contribute nothing to callback arguments and rows.
-    template <class T>
-    [[nodiscard]] auto part_at(std::size_t slot, std::uint32_t pos) const noexcept
+    // Plain-listed types are the OWNED set (the partition's identity);
+    // maybe<>-marked types are OBSERVED — probed per row, pointer parts,
+    // null when absent, never part of the group identity.
+    static constexpr std::array<bool, sizeof...(Ts)> observed_part{detail::is_maybe_v<Ts>...};
+
+    static consteval std::size_t find_first_owned()
     {
-        if constexpr (detail::is_tag_v<detail::bare<T>>)
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
+            if (!observed_part[i])
+            {
+                return i;
+            }
+        }
+        return 0;  // unreachable: the owned-count static_assert below
+    }
+
+    static constexpr std::size_t first_owned = find_first_owned();
+    static constexpr std::size_t owned_count =
+        sizeof...(Ts) - (std::size_t{0} + ... + std::size_t{detail::is_maybe_v<Ts>});
+    static_assert(owned_count >= 2,
+                  "quiver: a bonded view lists the standing owned set plain (at least two "
+                  "non-maybe types); observed extras are maybe<>");
+
+    // Tags contribute nothing to callback arguments and rows; observed parts
+    // probe by entity INDEX (their pools do not share the partition layout).
+    template <class T>
+    [[nodiscard]] auto part_at(std::size_t slot,
+                               std::uint32_t pos,
+                               std::uint32_t index) const noexcept
+    {
+        if constexpr (detail::is_maybe_v<T>)
+        {
+            using inner = detail::bare<detail::maybe_inner<T>>;
+            using pointer =
+                std::conditional_t<std::is_const_v<detail::maybe_inner<T>>, const inner*, inner*>;
+            auto* pool = static_cast<pool_of_t<inner>*>(bases_[slot]);
+            return std::tuple<pointer>(pool == nullptr ? nullptr : pool->at(index));
+        }
+        else if constexpr (detail::is_tag_v<detail::bare<T>>)
+        {
+            (void)pos;
             return std::tuple<>{};
         }
         else
@@ -3212,13 +3263,28 @@ class bonded_view
         }
     }
 
-    // One row's payload parts, all owners in lockstep at the same position.
-    [[nodiscard]] auto row_parts(std::uint32_t pos) const noexcept
+    // One row's payload parts: owners in lockstep at the partition position,
+    // observed pools probed by the row entity's index.
+    [[nodiscard]] auto row_parts(std::uint32_t pos, std::uint32_t index) const noexcept
     {
-        return [this, pos]<std::size_t... Is>(std::index_sequence<Is...>)
+        return [this, pos, index]<std::size_t... Is>(std::index_sequence<Is...>)
         {
-            return std::tuple_cat(this->template part_at<Ts>(Is, pos)...);
+            return std::tuple_cat(this->template part_at<Ts>(Is, pos, index)...);
         }(std::index_sequence_for<Ts...>{});
+    }
+
+    // Row filter: every except<> pool must lack the entity. Null pools
+    // (never registered) exclude nothing.
+    [[nodiscard]] bool passes(std::uint32_t index) const noexcept
+    {
+        for (detail::pool_base* pool : excludes_)
+        {
+            if (pool != nullptr && pool->contains(index))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     // Locks every owner pool for a user-callback loop; tolerates null pools
@@ -3262,47 +3328,70 @@ class bonded_view
     };
 
 public:
-    using owned = types<Ts...>;  // introspection, as spelled (const preserved)
-    using pair = owned;          // the historical 2-ary name, kept for manifests
+    // Introspection, as spelled (const and maybe<> markers preserved):
+    // `owned` is the plain-listed partition identity, `parts` the full list.
+    using parts = types<Ts...>;
+    using owned = joined_t<std::conditional_t<detail::is_maybe_v<Ts>, types<>, types<Ts>>...>;
+    using excluded = types<Xs...>;
+    using pair = owned;  // the historical 2-ary name, kept for manifests
 
-    bonded_view() = default;  // empty: matches nothing
+    bonded_view_t() = default;  // empty: matches nothing
 
+    // O(1) without excludes; with excludes the partition is walked and
+    // filtered (observed parts never filter).
     [[nodiscard]] std::size_t count() const noexcept
     {
-        return bond_ != nullptr ? bond_->paired : 0;
+        if (bond_ == nullptr)
+        {
+            return 0;
+        }
+        if constexpr (sizeof...(Xs) == 0)
+        {
+            return bond_->paired;
+        }
+        else
+        {
+            std::size_t n = 0;
+            for (std::uint32_t pos = 0; pos < bond_->paired; ++pos)
+            {
+                n += passes(bases_[first_owned]->entity_at(pos).index()) ? 1 : 0;
+            }
+            return n;
+        }
     }
 
     [[nodiscard]] bool empty() const noexcept { return count() == 0; }
 
     [[nodiscard]] entity entity_at(std::size_t pos) const noexcept
     {
-        return bases_[0]->entity_at(pos);
+        return bases_[first_owned]->entity_at(pos);
     }
 
     [[nodiscard]] bool contains(entity e) const noexcept
     {
-        if (count() == 0)
+        if (bond_ == nullptr || bond_->paired == 0)
         {
             return false;
         }
-        const std::uint32_t pos = bases_[0]->position_of(e.index());
-        return pos < bond_->paired && bases_[0]->entity_at(pos) == e;
+        const std::uint32_t pos = bases_[first_owned]->position_of(e.index());
+        return pos < bond_->paired && bases_[first_owned]->entity_at(pos) == e && passes(e.index());
     }
 
-    // fn(entity, comps&...) or fn(comps&...); tags are filter-only; bool
-    // return stops the walk. Entity-first wins when both shapes bind. Locks
-    // EVERY owner pool (mutation rules apply to all of them).
+    // fn(entity, comps&...) or fn(comps&...); tags are filter-only; observed
+    // maybe<> parts arrive as pointers (null when absent); bool return stops
+    // the walk. Entity-first wins when both shapes bind. Locks EVERY listed
+    // pool (mutation rules apply to all of them).
     template <class F>
     void each(F&& fn) const
     {
-        using parts_row = decltype(std::declval<const bonded_view&>().row_parts(0));
+        using parts_row = decltype(std::declval<const bonded_view_t&>().row_parts(0, 0));
         using full_row =
             decltype(std::tuple_cat(std::declval<std::tuple<entity>>(), std::declval<parts_row>()));
         constexpr bool with_entity = detail::row_invocable<F, full_row>;
         static_assert(with_entity || detail::row_invocable<F, parts_row>,
                       "quiver: bonded callback must take (entity, comps&...) or (comps&...); "
-                      "tags contribute no argument");
-        if (count() == 0)
+                      "tags contribute no argument, observed maybe<T> parts arrive as T*");
+        if (bond_ == nullptr || bond_->paired == 0)
         {
             return;
         }
@@ -3310,10 +3399,14 @@ public:
         const std::uint32_t n = bond_->paired;
         for (std::uint32_t pos = 0; pos < n; ++pos)
         {
+            const entity e = bases_[first_owned]->entity_at(pos);
+            if (!passes(e.index()))
+            {
+                continue;
+            }
             if constexpr (with_entity)
             {
-                const auto row =
-                    std::tuple_cat(std::tuple<entity>(bases_[0]->entity_at(pos)), row_parts(pos));
+                const auto row = std::tuple_cat(std::tuple<entity>(e), row_parts(pos, e.index()));
                 if constexpr (detail::row_stops<F, full_row>)
                 {
                     if (!std::apply(fn, row))
@@ -3328,7 +3421,7 @@ public:
             }
             else
             {
-                const auto row = row_parts(pos);
+                const auto row = row_parts(pos, e.index());
                 if constexpr (detail::row_stops<F, parts_row>)
                 {
                     if (!std::apply(fn, row))
@@ -3344,12 +3437,12 @@ public:
         }
     }
 
-    // fn(entity) over the intersection; bool return stops. A direct walk:
-    // works for every part shape, including all-value rows.
+    // fn(entity) over the (filtered) intersection; bool return stops. A
+    // direct walk: works for every part shape, including all-value rows.
     template <class F>
     void entities(F&& fn) const
     {
-        if (count() == 0)
+        if (bond_ == nullptr || bond_->paired == 0)
         {
             return;
         }
@@ -3357,7 +3450,11 @@ public:
         const std::uint32_t n = bond_->paired;
         for (std::uint32_t pos = 0; pos < n; ++pos)
         {
-            const entity e = bases_[0]->entity_at(pos);
+            const entity e = bases_[first_owned]->entity_at(pos);
+            if (!passes(e.index()))
+            {
+                continue;
+            }
             if constexpr (std::predicate<F&, entity>)
             {
                 if (!fn(e))
@@ -3372,18 +3469,59 @@ public:
         }
     }
 
+    // Reorders the partition itself — mirrored into EVERY owner, visible to
+    // every view of this bond and to the owners' dense prefixes. cmp compares
+    // entities (entity, entity); the sort<T> form compares an OWNED
+    // component's values. The optional algorithm follows world::sort's
+    // contract. Packed owners swap payloads (outstanding T* into the
+    // partition die); stable owners permute bookkeeping only. Refused while
+    // any listed pool iterates; a tombstoned or empty view is a no-op.
+    template <class Compare, class Algorithm = detail::std_sort>
+        requires std::invocable<Compare&, entity, entity>
+    void sort(Compare cmp, Algorithm&& algo = {})
+    {
+        sort_partition(
+            [&](std::uint32_t a, std::uint32_t b)
+            {
+                return static_cast<bool>(
+                    cmp(bases_[first_owned]->entity_at(a), bases_[first_owned]->entity_at(b)));
+            },
+            std::forward<Algorithm>(algo));
+    }
+
+    template <class T, class Compare, class Algorithm = detail::std_sort>
+    void sort(Compare cmp, Algorithm&& algo = {})
+    {
+        constexpr std::size_t slot = sort_slot_of<T>();
+        static_assert(slot < sizeof...(Ts),
+                      "quiver: bonded sort<T> needs T to be one of the view's OWNED component "
+                      "types (observed maybe<> parts have no partition order)");
+        if constexpr (slot < sizeof...(Ts))
+        {
+            static_assert(!observed_part[slot],
+                          "quiver: bonded sort<T> cannot order by an observed maybe<> part");
+            static_assert(!detail::is_tag_v<detail::bare<T>>,
+                          "quiver: T uses tag storage and carries no values to compare; sort by "
+                          "(entity, entity) instead");
+            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(bases_[slot]);
+            sort_partition([&](std::uint32_t a, std::uint32_t b)
+                           { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); },
+                           std::forward<Algorithm>(algo));
+        }
+    }
+
     // Lock-owning range for structured bindings; pinned like selection ranges.
-    template <class Self = bonded_view>
+    template <class Self = bonded_view_t>
     class basic_range
     {
     public:
         using row = decltype(std::tuple_cat(std::declval<std::tuple<entity>>(),
-                                            std::declval<const Self&>().row_parts(0)));
+                                            std::declval<const Self&>().row_parts(0, 0)));
 
         explicit basic_range(const Self& view) noexcept
             : view_(view),
               locks_(view_.bases_),
-              size_(view_.count())
+              size_(view_.bond_ != nullptr ? view_.bond_->paired : 0)
         {
         }
 
@@ -3406,17 +3544,22 @@ public:
 
             [[nodiscard]] row operator*() const
             {
-                return std::tuple_cat(std::tuple<entity>(view_->bases_[0]->entity_at(pos_)),
-                                      view_->row_parts(pos_));
+                const entity e = view_->bases_[Self::first_owned]->entity_at(pos_);
+                return std::tuple_cat(std::tuple<entity>(e), view_->row_parts(pos_, e.index()));
             }
 
             iterator& operator++() noexcept
             {
                 ++pos_;
+                seek();
                 return *this;
             }
 
-            void operator++(int) noexcept { ++pos_; }
+            void operator++(int) noexcept
+            {
+                ++pos_;
+                seek();
+            }
 
             [[nodiscard]] friend bool operator==(const iterator& it,
                                                  std::default_sentinel_t) noexcept
@@ -3426,6 +3569,21 @@ public:
 
         private:
             friend class basic_range;
+
+            // Advance past rows the excludes filter out.
+            void seek() noexcept
+            {
+                if constexpr (sizeof...(Xs) > 0)
+                {
+                    while (
+                        pos_ < end_ &&
+                        !view_->passes(view_->bases_[Self::first_owned]->entity_at(pos_).index()))
+                    {
+                        ++pos_;
+                    }
+                }
+            }
+
             const Self* view_ = nullptr;
             std::uint32_t pos_ = 0;
             std::uint32_t end_ = 0;
@@ -3435,6 +3593,7 @@ public:
         {
             iterator it(&view_, 0);
             it.end_ = static_cast<std::uint32_t>(size_);
+            it.seek();
             return it;
         }
 
@@ -3450,17 +3609,101 @@ public:
 
 private:
     friend class world;
+    template <class Excludes2, class... Us>
+    friend class bonded_view_t;
 
-    bonded_view(std::array<detail::pool_base*, sizeof...(Ts)> pools,
-                const detail::group_core* bond) noexcept
+    // Slot of T among the listed types (matching through const), for sort<T>.
+    template <class T>
+    static consteval std::size_t sort_slot_of()
+    {
+        constexpr std::array<bool, sizeof...(Ts)> match{
+            std::same_as<detail::bare<detail::maybe_inner<Ts>>, detail::bare<T>>...};
+        for (std::size_t i = 0; i < match.size(); ++i)
+        {
+            if (match[i])
+            {
+                return i;
+            }
+        }
+        return sizeof...(Ts);
+    }
+
+    // The shared sort engine: gather-permute [0, paired) and mirror every
+    // swap into every OWNER pool (observed pools are not partition members).
+    template <class PosCompare, class Algorithm>
+    void sort_partition(PosCompare cmp, Algorithm&& algo)
+    {
+        static_assert((!std::is_const_v<detail::maybe_inner<Ts>> && ...),
+                      "quiver: sort on an all-const bonded view (const world) — sorting "
+                      "reorders the owners' payloads");
+        if (bond_ == nullptr || bond_->paired < 2)
+        {
+            return;
+        }
+        if constexpr (checks_enabled)
+        {
+            for (detail::pool_base* pool : bases_)
+            {
+                if (pool != nullptr && pool->locked())
+                {
+                    detail::violate_pool("bonded sort during iteration over pool", pool->name());
+                    return;
+                }
+            }
+        }
+        const std::uint32_t n = bond_->paired;
+        std::pmr::vector<std::uint32_t> perm(n, bases_[first_owned]->memory_);
+        for (std::uint32_t i = 0; i < n; ++i)
+        {
+            perm[i] = i;
+        }
+        algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
+        const auto swap_all = [&](std::uint32_t a, std::uint32_t b) noexcept
+        {
+            for (std::size_t slot = 0; slot < sizeof...(Ts); ++slot)
+            {
+                if (!observed_part[slot])
+                {
+                    bases_[slot]->mirror_swap(a, b);
+                }
+            }
+        };
+        for (std::uint32_t i = 0; i < n; ++i)
+        {
+            std::uint32_t curr = i;
+            std::uint32_t next = perm[curr];
+            while (next != i)
+            {
+                swap_all(curr, next);
+                perm[curr] = curr;
+                curr = next;
+                next = perm[curr];
+            }
+            perm[curr] = curr;
+        }
+    }
+
+    bonded_view_t(std::array<detail::pool_base*, sizeof...(Ts)> pools,
+                  std::array<detail::pool_base*, sizeof...(Xs)> excludes,
+                  const detail::group_core* bond) noexcept
         : bases_(pools),
+          excludes_(excludes),
           bond_(bond)
     {
     }
 
     std::array<detail::pool_base*, sizeof...(Ts)> bases_{};
+    std::array<detail::pool_base*, sizeof...(Xs)> excludes_{};
     const detail::group_core* bond_ = nullptr;
 };
+
+// The public spelling: bonded_view<A, B>, or bonded_view<except<C>, A, B>
+// when an exclude filter is part of the type. world::bonded deduces this for
+// you; spell it out only when storing a view as a member.
+template <class First, class... Rest>
+using bonded_view = std::conditional_t<detail::is_except<First>::value,
+                                       bonded_view_t<First, Rest...>,
+                                       bonded_view_t<except<>, First, Rest...>>;
 
 // ----------------------------------------------------------------------------
 // Runtime queries
@@ -5092,14 +5335,17 @@ public:
         {
             return;
         }
-        // Refused in EVERY build: reordering one side of a bond would silently
-        // break the mirrored partition. Unbond first, or sort the partner-free
-        // remainder by ordering adds.
+        // Refused in EVERY build: reordering one owner of a bond would
+        // silently break the mirrored partition. Order the partition itself
+        // with bonded(...).sort(...), or unbond first.
         if (pool->bond() != nullptr)
         {
             if constexpr (checks_enabled)
             {
-                detail::violate_pool("sort on a bonded pool (unbond first); pool", pool->name());
+                detail::violate_pool(
+                    "sort on an owned (bonded) pool — use bonded(...).sort(...) for "
+                    "in-partition order, or unbond first; pool",
+                    pool->name());
             }
             return;
         }
@@ -5200,7 +5446,7 @@ public:
 
     template <class... Ts>  // const-qualify for read-only payload parts
         requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    bonded_view<Ts...> bond()
+    bonded_view_t<except<>, Ts...> bond()
     {
         static_assert(detail::all_distinct<detail::bare<Ts>...>,
                       "quiver: duplicate component type in bond<...>");
@@ -5336,50 +5582,76 @@ public:
         return true;
     }
 
-    // The standing bond's view; argument order need not match bond()'s, but
-    // the FULL owned set must be listed. Without a standing bond: checked
-    // violation, empty view.
-    template <class... Ts>
-        requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    [[nodiscard]] bonded_view<Ts...> bonded()
+    // The standing bond's view. Plain-listed types must be the FULL owned
+    // set, in any order; maybe<>-marked types are OBSERVED extras probed per
+    // row (T* parts, null when absent — partition membership does not imply
+    // observed membership); except<> filters rows. Without a standing bond
+    // over exactly the plain-listed set: checked violation, empty view.
+    template <class... Ts, class... Xs>
+        requires(sizeof...(Ts) >= 2)
+    [[nodiscard]] bonded_view_t<except<Xs...>, Ts...> bonded(except<Xs...>)
     {
-        const std::array<detail::pool_base*, sizeof...(Ts)> pools{peek_pool<detail::bare<Ts>>()...};
-        const detail::group_core* bond = standing_bond(pools);
-        if (bond == nullptr)
+        constexpr std::size_t n = sizeof...(Ts);
+        constexpr std::array<bool, n> observed{detail::is_maybe_v<Ts>...};
+        const std::array<detail::pool_base*, n> pools{
+            peek_pool<detail::bare<detail::maybe_inner<Ts>>>()...};
+        const detail::group_core* bond = nullptr;
+        bool listed_exactly = true;
+        std::size_t owned_listed = 0;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            if (observed[i])
+            {
+                continue;  // observed pools may be missing: null = absent parts
+            }
+            ++owned_listed;
+            if (pools[i] == nullptr || pools[i]->bond_ == nullptr ||
+                (bond != nullptr && pools[i]->bond_ != bond))
+            {
+                listed_exactly = false;
+                break;
+            }
+            bond = pools[i]->bond_;
+        }
+        listed_exactly = listed_exactly && bond != nullptr && bond->owner_count == owned_listed;
+        if (!listed_exactly)
         {
             if constexpr (checks_enabled)
             {
                 detail::violate(
-                    "bonded<Ts...>() without a standing bond over exactly that set; "
-                    "call bond<Ts...>()");
+                    "bonded view must plain-list the standing owned set in full (any order); "
+                    "mark observed extras maybe<>, or use select for subset queries");
             }
             return {};
         }
-        return bonded_view<Ts...>(pools, bond);
+        const std::array<detail::pool_base*, sizeof...(Xs)> excludes{peek_pool<Xs>()...};
+        return bonded_view_t<except<Xs...>, Ts...>(pools, excludes, bond);
     }
 
-    // Const worlds yield all-const views.
     template <class... Ts>
-        requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    [[nodiscard]] bonded_view<const detail::bare<Ts>...> bonded() const
+        requires(sizeof...(Ts) >= 2)
+    [[nodiscard]] bonded_view_t<except<>, Ts...> bonded()
+    {
+        return bonded<Ts...>(except<>{});
+    }
+
+    // Const worlds yield all-const views (observed parts become
+    // maybe<const T>, hence const T* row parts).
+    template <class... Ts, class... Xs>
+        requires(sizeof...(Ts) >= 2)
+    [[nodiscard]] auto bonded(except<Xs...> tag) const
     {
         // The view only reads through these pointers (const payload parts).
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         auto* self = const_cast<world*>(this);
-        const std::array<detail::pool_base*, sizeof...(Ts)> pools{
-            self->peek_pool<detail::bare<Ts>>()...};
-        const detail::group_core* bond = standing_bond(pools);
-        if (bond == nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate(
-                    "bonded<Ts...>() without a standing bond over exactly that set; "
-                    "call bond<Ts...>()");
-            }
-            return {};
-        }
-        return bonded_view<const detail::bare<Ts>...>(pools, bond);
+        return self->template bonded<typename detail::as_const_part<Ts>::type...>(tag);
+    }
+
+    template <class... Ts>
+        requires(sizeof...(Ts) >= 2)
+    [[nodiscard]] auto bonded() const
+    {
+        return bonded<Ts...>(except<>{});
     }
 
     // ----------------------------------------------------------------- hooks
