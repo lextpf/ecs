@@ -7,6 +7,13 @@
 
 #include "test_harness.hpp"
 
+// Never registered in any world: observed maybe<Unseen> parts must be null,
+// not an error.
+struct Unseen
+{
+    int v = 0;
+};
+
 void test_bond_n_ary()
 {
     section("bond<A, B, C>: N-way mirrored partitions");
@@ -323,5 +330,250 @@ void test_bond_n_ary_unbond()
     auto fresh = w.bond<Pos, Vel, Hp>();
     CHECK(fresh.count() == 1);
     CHECK(view.count() == 0);
+    CHECK_VALID(w);
+}
+
+void test_bond_observed_views()
+{
+    section("bonded views: observed maybe<> parts and except<> filters");
+    ecs::world w;
+
+    // Owned pair; Hp is OBSERVED (not part of the group identity), TagA
+    // filters.
+    w.bond<Pos, Vel>();
+    int idx = 0;
+    ecs::entity tagged = ecs::no_entity;
+    ecs::entity with_hp = ecs::no_entity;
+    for (; idx < 6; ++idx)
+    {
+        const ecs::entity e = w.spawn(Pos{idx}, Vel{idx * 10});
+        if (idx % 2 == 0)
+        {
+            w.add<Hp>(e, Hp{idx * 100});
+            with_hp = e;
+        }
+        if (idx == 3)
+        {
+            w.add<TagA>(e);
+            tagged = e;
+        }
+    }
+
+    // The observed part arrives as a pointer, null when absent — exactly the
+    // selection maybe<> convention. Membership in the partition does NOT
+    // imply membership in observed pools.
+    const auto view = w.bonded<Pos, Vel, ecs::maybe<Hp>>();
+    CHECK(view.count() == 6);
+    int with = 0;
+    int without = 0;
+    view.each(
+        [&](ecs::entity, Pos& p, Vel&, Hp* hp)
+        {
+            if (hp != nullptr)
+            {
+                ++with;
+                CHECK(hp->hp == p.x * 100);
+            }
+            else
+            {
+                ++without;
+            }
+        });
+    CHECK(with == 3);
+    CHECK(without == 3);
+
+    // except<> filters rows out of the walk, count, and contains.
+    const auto guarded = w.bonded<Pos, Vel, ecs::maybe<Hp>>(ecs::except<TagA>{});
+    CHECK(guarded.count() == 5);
+    CHECK(!guarded.contains(tagged));
+    CHECK(guarded.contains(with_hp));
+    int rows = 0;
+    guarded.each([&](ecs::entity e, Pos&, Vel&, Hp*) { rows += (e == tagged) ? 100 : 1; });
+    CHECK(rows == 5);
+
+    // range() carries the same parts and filters.
+    int range_with = 0;
+    int range_rows = 0;
+    for (auto [e, p, v, hp] : guarded.range())
+    {
+        ++range_rows;
+        range_with += (hp != nullptr) ? 1 : 0;
+    }
+    CHECK(range_rows == 5);
+    CHECK(range_with == 3);
+
+    // An observed pool that never registered yields all-null parts, not an
+    // error (and never filters).
+    const auto cold = w.bonded<Pos, Vel, ecs::maybe<Unseen>>();
+    int null_parts = 0;
+    cold.each([&](Pos&, Vel&, Unseen* t) { null_parts += (t == nullptr) ? 1 : 0; });
+    CHECK(null_parts == 6);
+
+    // A const world serves the same views, all-const.
+    const ecs::world& cw = w;
+    const auto cview = cw.bonded<Pos, Vel, ecs::maybe<Hp>>(ecs::except<TagA>{});
+    int cwith = 0;
+    cview.each([&](const Pos&, const Vel&, const Hp* hp) { cwith += (hp != nullptr) ? 1 : 0; });
+    CHECK(cwith == 3);
+
+#if QUIVER_CHECKS
+    {
+        // The full owned set must be listed plain. A wrong plain set is a
+        // runtime violation with an empty view; fewer than two plain types
+        // is a compile-time wall:
+        //   w.bonded<Pos, ecs::maybe<Hp>>();  // static_assert: owned set is plain
+        violation_scope guard;
+        const auto extra_plain = w.bonded<Pos, Vel, Hp>();  // Hp listed plain, not owned
+        CHECK(violations_seen == 1);
+        CHECK(extra_plain.count() == 0);
+    }
+#endif
+
+    CHECK_VALID(w);
+}
+
+void test_bond_partition_sort()
+{
+    section("bonded views: in-partition sort, mirrored into every owner");
+    ecs::world w;
+    w.bond<Pos, Vel, Stable>();
+    auto view = w.bonded<Pos, Vel, Stable>();
+
+    // Members in scrambled order, plus non-members on every side to prove
+    // the tail stays untouched.
+    for (int i = 0; i < 8; ++i)
+    {
+        const ecs::entity e = w.spawn(Pos{100 - i}, Vel{i});
+        if (i < 6)
+        {
+            w.add<Stable>(e, Stable{100 - i});  // i 6,7 stay outside the partition
+        }
+    }
+    CHECK(view.count() == 6);
+
+    // Stable owners never move payloads: capture a pointer through the sort.
+    const ecs::entity probe = view.entity_at(0);
+    const Stable* pinned = w.find<Stable>(probe);
+
+    // Sort the partition by an owned component's values, stable algorithm.
+    view.sort<Pos>([](const Pos& l, const Pos& r) { return l.x < r.x; }, stable_algo{});
+    CHECK(view.count() == 6);
+    CHECK(w.find<Stable>(probe) == pinned);
+    CHECK_VALID(w);
+
+    // The order is visible in the view AND in every owner's dense prefix.
+    {
+        auto pa = w.find_pool<Pos>();
+        auto pb = w.find_pool<Vel>();
+        auto pc = w.find_pool<Stable>();
+        int prev = -1;
+        bool ordered = true;
+        bool mirrored = true;
+        for (std::uint32_t pos = 0; pos < 6; ++pos)
+        {
+            const ecs::entity e = view.entity_at(pos);
+            ordered = ordered && w.get<Pos>(e).x > prev;
+            prev = w.get<Pos>(e).x;
+            mirrored = mirrored && pa.entity_at(pos) == e && pb.entity_at(pos) == e &&
+                       pc.entity_at(pos) == e;
+        }
+        CHECK(ordered);
+        CHECK(mirrored);
+    }
+
+    // Entities OUTSIDE the partition kept their membership (and the pools
+    // their integrity).
+    CHECK(w.select<Pos>().count() == 8);
+    CHECK((w.select<Pos>(ecs::except<Stable>{}).count() == 2));
+    CHECK_VALID(w);
+
+    // The entity-comparator form sorts too.
+    view.sort([](ecs::entity l, ecs::entity r) { return l.index() > r.index(); });
+    {
+        std::uint32_t prev_index = 0xFFFFFFFFu;
+        bool descending = true;
+        for (std::uint32_t pos = 0; pos < 6; ++pos)
+        {
+            descending = descending && view.entity_at(pos).index() < prev_index;
+            prev_index = view.entity_at(pos).index();
+        }
+        CHECK(descending);
+    }
+    CHECK_VALID(w);
+
+#if QUIVER_CHECKS
+    {
+        // Refused while any owner iterates.
+        violation_scope guard;
+        w.select<Vel>().each(
+            [&](ecs::entity, Vel&)
+            {
+                view.sort([](ecs::entity l, ecs::entity r) { return l.index() < r.index(); });
+                return false;
+            });
+        CHECK(violations_seen == 1);
+    }
+#endif
+
+    // Lifetime balance: payload swaps in packed owners move values, never
+    // duplicate them.
+    {
+        ecs::world w2;
+        w2.bond<Counted, Hp>();
+        auto pairs = w2.bonded<Counted, Hp>();
+        for (int i = 0; i < 8; ++i)
+        {
+            w2.spawn(Counted{8 - i}, Hp{i});
+        }
+        const int live_before = Counted::live;
+        pairs.sort<Counted>([](const Counted& l, const Counted& r) { return l.value < r.value; });
+        CHECK(Counted::live == live_before);
+        int prev = -1;
+        bool ordered = true;
+        pairs.each(
+            [&](Counted& c, Hp&)
+            {
+                ordered = ordered && c.value > prev;
+                prev = c.value;
+            });
+        CHECK(ordered);
+        CHECK_VALID(w2);
+    }
+}
+
+void test_bond_view_count()
+{
+    section("bonded views: count() against a brute-force oracle");
+    ecs::world w;
+    w.bond<Pos, Vel>();
+    for (int i = 0; i < 32; ++i)
+    {
+        const ecs::entity e = w.spawn(Pos{i});
+        if (i % 2 == 0)
+        {
+            w.add<Vel>(e, Vel{i});
+        }
+        if (i % 3 == 0)
+        {
+            w.add<TagA>(e);
+        }
+        if (i % 5 == 0)
+        {
+            w.add<TagB>(e);
+        }
+    }
+
+    std::size_t oracle = 0;
+    w.select<Pos, Vel>(ecs::except<TagA, TagB>{}).each([&](Pos&, Vel&) { ++oracle; });
+
+    const auto filtered = w.bonded<Pos, Vel>(ecs::except<TagA, TagB>{});
+    CHECK(filtered.count() == oracle);
+
+    std::size_t walked = 0;
+    filtered.each([&](Pos&, Vel&) { ++walked; });
+    CHECK(walked == oracle);
+
+    // The unfiltered view stays O(1)-exact.
+    CHECK((w.bonded<Pos, Vel>().count() == 16));
     CHECK_VALID(w);
 }
