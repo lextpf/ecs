@@ -65,6 +65,7 @@ using quiver::set_violation_handler;
 using quiver::violation_handler;
 // queries
 using quiver::bonded_view;
+using quiver::bonded_view_t;
 using quiver::except;
 using quiver::maybe;
 using quiver::selection;
