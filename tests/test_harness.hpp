@@ -229,3 +229,9 @@ void test_bond_n_ary_unbond();
 void test_bond_observed_views();
 void test_bond_partition_sort();
 void test_bond_view_count();
+
+// tests_queries.cpp (M4: any_of combinators)
+void test_any_of_basics();
+void test_any_of_driving();
+void test_any_of_composition();
+void test_any_of_violations();  // defined (and called) under QUIVER_CHECKS only
