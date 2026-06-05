@@ -81,12 +81,14 @@ using quiver::apply_result;
 using quiver::blueprint;
 using quiver::command_buffer;
 using quiver::duplicate_result;
-// hooks + trackers
+// hooks + trackers + watchers
+using quiver::changed;
 using quiver::component_hook;
 using quiver::hook_token;
 using quiver::scoped_hook;
 using quiver::track;
 using quiver::tracker;
+using quiver::watcher;
 using quiver::operator|;
 using quiver::operator&;
 // archives
