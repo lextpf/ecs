@@ -7296,6 +7296,288 @@ private:
 };
 
 // ----------------------------------------------------------------------------
+// Watchers
+//
+// A watcher monitors a CONDITION SET — entities holding every component in
+// its types<> list and none in its except<> list — and collects,
+// deduplicated, the entities that BEGAN matching since the last drain (and,
+// with changed<C> triggers, those whose C was replaced through
+// replace/put/amend WHILE matching). Entities that stop matching before the
+// drain are evicted, so matched() is live truth at drain time. That is the
+// deliberate divergence from the tracker: tracker<T> is a per-pool event
+// log whose removed() keeps history; a watcher is a membership monitor.
+//
+//   quiver::watcher<quiver::types<Burning, Health>> entered(world);
+//   quiver::watcher<quiver::types<Burning>, quiver::except<Shielded>> raw(world);
+//   quiver::watcher<quiver::types<Burning>, quiver::changed<Health>> hurt(world);
+//   for (quiver::entity e : hurt.matched()) { ... }
+//   hurt.clear();
+//
+// Watchers see EDGES: members that predate construction do not enter until
+// a fresh edge re-collects them. Only the named pools gain hook entries
+// (untouched pools keep their one-pointer test); watchers are pinned (the
+// hooks hold `this`) and must be destroyed before their world.
+// ----------------------------------------------------------------------------
+
+// Trigger marker: collect entities whose T was replaced (via
+// replace/put/amend) while the watcher's condition set held.
+template <class T>
+struct changed
+{
+};
+
+namespace detail
+{
+template <class S>
+struct watcher_spec
+{
+    static constexpr bool is_includes = false;
+    static constexpr bool is_excludes = false;
+    static constexpr bool is_trigger = false;
+    using list = types<>;
+};
+
+template <class... Is>
+struct watcher_spec<types<Is...>>
+{
+    static constexpr bool is_includes = true;
+    static constexpr bool is_excludes = false;
+    static constexpr bool is_trigger = false;
+    using list = types<Is...>;
+};
+
+template <class... Es>
+struct watcher_spec<except<Es...>>
+{
+    static constexpr bool is_includes = false;
+    static constexpr bool is_excludes = true;
+    static constexpr bool is_trigger = false;
+    using list = types<Es...>;
+};
+
+template <class C>
+struct watcher_spec<changed<C>>
+{
+    static constexpr bool is_includes = false;
+    static constexpr bool is_excludes = false;
+    static constexpr bool is_trigger = true;
+    using list = types<C>;
+};
+
+template <class List>
+struct list_size;
+
+template <class... Us>
+struct list_size<types<Us...>>
+{
+    static constexpr std::size_t value = sizeof...(Us);
+};
+
+template <class A, class B>
+struct lists_disjoint;
+
+template <class... As, class... Bs>
+struct lists_disjoint<types<As...>, types<Bs...>>
+{
+    static constexpr bool value = (!type_among<As, Bs...> && ...);
+};
+
+template <class List>
+struct watcher_conditions_ok;
+
+template <class... Is>
+struct watcher_conditions_ok<types<Is...>>
+{
+    static_assert((component<Is> && ...),
+                  "quiver: watcher condition types must be plain, non-const component types");
+    static_assert(all_distinct<Is...>, "quiver: duplicate component type in a watcher list");
+    static constexpr bool value = true;
+};
+
+template <class List>
+struct watcher_triggers_ok;
+
+template <class... Cs>
+struct watcher_triggers_ok<types<Cs...>>
+{
+    static_assert((component<Cs> && ...),
+                  "quiver: changed<T> takes a plain, non-const component type");
+    static_assert((!is_tag_v<Cs> && ...),
+                  "quiver: changed<T> on a tag is inert — tags carry no data and are never "
+                  "replaced");
+    static_assert(all_distinct<Cs...>, "quiver: duplicate changed<> trigger");
+    static constexpr bool value = true;
+};
+}  // namespace detail
+
+template <class... Specs>
+class watcher
+{
+    static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_includes}) ==
+                      1,
+                  "quiver: a watcher takes exactly one types<...> condition list");
+    static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_excludes}) <=
+                      1,
+                  "quiver: at most one except<...> list per watcher");
+    static_assert(((detail::watcher_spec<Specs>::is_includes ||
+                    detail::watcher_spec<Specs>::is_excludes ||
+                    detail::watcher_spec<Specs>::is_trigger) &&
+                   ...),
+                  "quiver: watcher specs are types<...>, except<...>, and changed<T>");
+
+    using include_list = joined_t<std::conditional_t<detail::watcher_spec<Specs>::is_includes,
+                                                     typename detail::watcher_spec<Specs>::list,
+                                                     types<>>...>;
+    using exclude_list = joined_t<std::conditional_t<detail::watcher_spec<Specs>::is_excludes,
+                                                     typename detail::watcher_spec<Specs>::list,
+                                                     types<>>...>;
+    using trigger_list = joined_t<std::conditional_t<detail::watcher_spec<Specs>::is_trigger,
+                                                     typename detail::watcher_spec<Specs>::list,
+                                                     types<>>...>;
+
+    static_assert(detail::list_size<include_list>::value >= 1,
+                  "quiver: a watcher needs at least one condition component");
+    static_assert(detail::watcher_conditions_ok<include_list>::value);
+    static_assert(detail::watcher_conditions_ok<exclude_list>::value);
+    static_assert(detail::watcher_triggers_ok<trigger_list>::value);
+    static_assert(detail::lists_disjoint<include_list, exclude_list>::value,
+                  "quiver: a component type appears in both the watcher's types<...> and "
+                  "except<...> lists");
+
+    static constexpr std::size_t hook_count = (detail::list_size<include_list>::value * 2) +
+                                              (detail::list_size<exclude_list>::value * 2) +
+                                              detail::list_size<trigger_list>::value;
+
+public:
+    explicit watcher(world& w, std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+        : seen_(memory),
+          matched_(memory)
+    {
+        std::size_t k = 0;
+        connect_includes(w, k, include_list{});
+        connect_excludes(w, k, exclude_list{});
+        connect_triggers(w, k, trigger_list{});
+    }
+
+    watcher(const watcher&) = delete;  // pinned: the hooks hold `this`
+    watcher(watcher&&) = delete;
+    watcher& operator=(const watcher&) = delete;
+    watcher& operator=(watcher&&) = delete;
+    ~watcher() = default;  // scoped_hooks disconnect
+
+    // Deduplicated; every entry currently matches the condition set.
+    [[nodiscard]] std::span<const entity> matched() const noexcept { return matched_; }
+    [[nodiscard]] std::size_t count() const noexcept { return matched_.size(); }
+    [[nodiscard]] bool empty() const noexcept { return matched_.empty(); }
+
+    [[nodiscard]] bool contains(entity e) const noexcept
+    {
+        const std::uint32_t pos = seen_.get(e.index());
+        return pos != detail::npos32 && matched_[pos] == e;
+    }
+
+    void clear() noexcept
+    {
+        for (const entity e : matched_)
+        {
+            seen_.erase(e.index());
+        }
+        matched_.clear();
+    }
+
+private:
+    template <class... Is>
+    void connect_includes(world& w, std::size_t& k, types<Is...>)
+    {
+        ((hooks_[k] = scoped_hook(w, w.on_add<Is>(&watcher::probe_edge, this)),
+          hooks_[k + 1] = scoped_hook(w, w.on_remove<Is>(&watcher::evict_edge, this)),
+          k += 2),
+         ...);
+    }
+
+    template <class... Es>
+    void connect_excludes(world& w, std::size_t& k, types<Es...>)
+    {
+        ((hooks_[k] = scoped_hook(w, w.on_add<Es>(&watcher::evict_edge, this)),
+          hooks_[k + 1] = scoped_hook(w, w.on_remove<Es>(&watcher::unshielded_edge<Es>, this)),
+          k += 2),
+         ...);
+    }
+
+    template <class... Cs>
+    void connect_triggers(world& w, std::size_t& k, types<Cs...>)
+    {
+        ((hooks_[k++] = scoped_hook(w, w.on_replace<Cs>(&watcher::probe_edge, this))), ...);
+    }
+
+    static void probe_edge(world& w, entity e, void* user)
+    {
+        auto* self = static_cast<watcher*>(user);
+        if (matches<void>(w, e))
+        {
+            self->insert(e);
+        }
+    }
+
+    // An exclude's on_remove fires BEFORE the component leaves: probe as if
+    // it were already gone.
+    template <class SkipX>
+    static void unshielded_edge(world& w, entity e, void* user)
+    {
+        auto* self = static_cast<watcher*>(user);
+        if (matches<SkipX>(w, e))
+        {
+            self->insert(e);
+        }
+    }
+
+    static void evict_edge(world&, entity e, void* user) { static_cast<watcher*>(user)->evict(e); }
+
+    template <class SkipX>
+    [[nodiscard]] static bool matches(world& w, entity e)
+    {
+        const bool held = []<class... Is>(types<Is...>, world& ww, entity ee)
+        { return (ww.template has<Is>(ee) && ...); }(include_list{}, w, e);
+        if (!held)
+        {
+            return false;
+        }
+        return []<class... Es>(types<Es...>, world& ww, entity ee)
+        { return ((std::same_as<Es, SkipX> || !ww.template has<Es>(ee)) && ...); }(
+            exclude_list{}, w, e);
+    }
+
+    void insert(entity e)
+    {
+        if (seen_.get(e.index()) != detail::npos32)
+        {
+            return;  // already collected
+        }
+        seen_.ensure(e.index());  // nofail set below
+        matched_.push_back(e);
+        seen_.set_existing(e.index(), static_cast<std::uint32_t>(matched_.size() - 1));
+    }
+
+    void evict(entity e) noexcept
+    {
+        const std::uint32_t pos = seen_.get(e.index());
+        if (pos == detail::npos32)
+        {
+            return;
+        }
+        const entity last = matched_.back();
+        matched_[pos] = last;
+        seen_.set_existing(last.index(), pos);
+        matched_.pop_back();
+        seen_.erase(e.index());
+    }
+
+    detail::sparse_index seen_;  // entity slot -> matched_ position (dedupe + O(1) evict)
+    std::pmr::vector<entity> matched_;
+    std::array<scoped_hook, hook_count> hooks_;
+};
+
+// ----------------------------------------------------------------------------
 // Archives: pack / unpack / graft
 //
 // quiver owns ordering and identity; YOUR archive owns the encoding. A writer
