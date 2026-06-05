@@ -383,6 +383,56 @@ int main()
                               }));
     }
 
+    // --- any_of combinators ----------------------------------------------------
+    {
+        ecs::world w;
+        w.reserve_entities(entity_count);
+        std::vector<ecs::entity> entities(entity_count);
+        for (std::size_t i = 0; i < entity_count; ++i)
+        {
+            entities[i] = w.spawn();
+            if (i % 2 == 0)
+            {
+                w.add<Transform>(entities[i], Transform{1, 1});
+            }
+            if (i % 3 == 0)
+            {
+                w.add<Velocity>(entities[i], Velocity{1, 1});
+            }
+        }
+        const std::size_t union_size = 66'666;  // |A ∪ B| for the op count
+        const auto either = w.select<ecs::any_of<Transform, Velocity>>();
+        report("any_of<2> union drive",
+               best_ns_per_op(union_size,
+                              [&]
+                              {
+                                  std::uint64_t n = 0;
+                                  either.each([&](ecs::entity, Transform*, Velocity*) { ++n; });
+                                  sink += n;
+                              }));
+        report("two selects back-to-back (the workaround)",
+               best_ns_per_op(union_size,
+                              [&]
+                              {
+                                  std::uint64_t n = 0;
+                                  w.select<Transform>().each([&](ecs::entity, Transform&) { ++n; });
+                                  w.select<Velocity>(ecs::except<Transform>{})
+                                      .each([&](ecs::entity, Velocity&) { ++n; });
+                                  sink += n;
+                              }));
+        report("has_any probe loop",
+               best_ns_per_op(entity_count,
+                              [&]
+                              {
+                                  std::uint64_t n = 0;
+                                  for (const ecs::entity e : entities)
+                                  {
+                                      n += w.has_any<Transform, Velocity>(e) ? 1 : 0;
+                                  }
+                                  sink += n;
+                              }));
+    }
+
     // --- bonded groups (N-ary) -------------------------------------------------
     {
         ecs::world w;
