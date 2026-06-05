@@ -2347,6 +2347,19 @@ struct maybe
 {
 };
 
+// OR-alternatives inside select(): an any_of<A, B, ...> element matches
+// entities holding AT LEAST ONE alternative. The callback receives one
+// (const-propagated) pointer per non-tag alternative, of which at least one
+// is non-null per row; tag alternatives filter without contributing an
+// argument. One type-level combinator, not a query language: alternatives
+// are plain (possibly const) component types — no nesting, no negation.
+//   world.select<Transform, quiver::any_of<Cat, Dog>>().each(
+//       [](Transform& t, Cat* c, Dog* d) { /* c or d is non-null */ });
+template <class... Alternatives>
+struct any_of
+{
+};
+
 namespace detail
 {
 template <class T>
@@ -2369,21 +2382,111 @@ inline constexpr bool is_maybe_v = maybe_traits<T>::is_maybe;
 template <class T>
 using maybe_inner = maybe_traits<T>::inner;
 
-// The callback-argument tuple fragment contributed by one select<> element:
-// nothing for tags, a (const-propagated) pointer for maybe<T>, a reference
-// otherwise. Shared by each() and the range iterator's value_type.
+// any_of introspection: width is the number of pool slots an element
+// occupies in a selection's flattened include array (1 for everything else).
 template <class T>
-using sel_part_t = std::conditional_t<
-    is_maybe_v<T>,
-    std::tuple<std::conditional_t<std::is_const_v<maybe_inner<T>>,
-                                  const bare<maybe_inner<T>>*,
-                                  bare<maybe_inner<T>>*>>,
-    std::conditional_t<
-        is_tag_v<T>,
-        std::tuple<>,
-        std::tuple<std::conditional_t<std::is_const_v<T>, const bare<T>&, bare<T>&>>>>;
+struct any_of_traits
+{
+    static constexpr bool is_group = false;
+    static constexpr std::size_t width = 1;
+    using alts = types<T>;
+};
 
-// Const-world mapping: plain types gain const, maybe wrappers gain it inside.
+template <class... As>
+struct any_of_traits<any_of<As...>>
+{
+    static constexpr bool is_group = true;
+    static constexpr std::size_t width = sizeof...(As);
+    using alts = types<As...>;
+};
+
+template <class T>
+inline constexpr bool is_any_of_v = any_of_traits<T>::is_group;
+
+// Per-group validity, reported with named static_asserts at the use site.
+template <class T>
+struct group_ok : std::true_type
+{
+};
+
+template <class... As>
+struct group_ok<any_of<As...>> : std::true_type
+{
+    static_assert(sizeof...(As) >= 2, "quiver: any_of<> needs at least two alternatives");
+    static_assert((component<bare<As>> && ...),
+                  "quiver: any_of<> alternatives must be plain component types "
+                  "(const-qualified is fine)");
+    static_assert((!is_maybe_v<bare<As>> && ...) && (!is_any_of_v<bare<As>> && ...),
+                  "quiver: any_of<> alternatives cannot nest maybe<> or any_of<>");
+    static_assert(all_distinct<bare<As>...>, "quiver: duplicate alternative in any_of<>");
+};
+
+// The flattened inner component list one element contributes (for global
+// distinctness and exclude-overlap checks).
+template <class T>
+struct flat_inners
+{
+    using type = types<bare<maybe_inner<T>>>;
+};
+
+template <class... As>
+struct flat_inners<any_of<As...>>
+{
+    using type = types<bare<As>...>;
+};
+
+template <class List>
+struct list_distinct;
+
+template <class... Us>
+struct list_distinct<types<Us...>>
+{
+    static constexpr bool value = all_distinct<Us...>;
+};
+
+template <class List, class... Xs>
+struct list_none_among;
+
+template <class... Us, class... Xs>
+struct list_none_among<types<Us...>, Xs...>
+{
+    static constexpr bool value = (!type_among<Us, Xs...> && ...);
+};
+
+// The callback-argument tuple fragment contributed by one select<> element:
+// nothing for tags, a (const-propagated) pointer for maybe<T>, one pointer
+// per non-tag alternative for any_of<>, a reference otherwise. Shared by
+// each() and the range iterator's value_type.
+template <class T>
+struct sel_part
+{
+    using type = std::conditional_t<
+        is_maybe_v<T>,
+        std::tuple<std::conditional_t<std::is_const_v<maybe_inner<T>>,
+                                      const bare<maybe_inner<T>>*,
+                                      bare<maybe_inner<T>>*>>,
+        std::conditional_t<
+            is_tag_v<T>,
+            std::tuple<>,
+            std::tuple<std::conditional_t<std::is_const_v<T>, const bare<T>&, bare<T>&>>>>;
+};
+
+template <class... As>
+struct sel_part<any_of<As...>>
+{
+    using type = decltype(std::tuple_cat(
+        std::declval<std::conditional_t<
+            is_tag_v<bare<As>>,
+            std::tuple<>,
+            std::tuple<
+                std::conditional_t<std::is_const_v<As>, const bare<As>*, bare<As>*>>>>()...));
+};
+
+template <class T>
+using sel_part_t = sel_part<T>::type;
+
+// Const-world mapping: plain types gain const, maybe wrappers gain it
+// inside, any_of alternatives each gain it.
 template <class T>
 struct as_const_part
 {
@@ -2394,6 +2497,12 @@ template <class T>
 struct as_const_part<maybe<T>>
 {
     using type = maybe<const bare<T>>;
+};
+
+template <class... As>
+struct as_const_part<any_of<As...>>
+{
+    using type = any_of<const bare<As>...>;
 };
 }  // namespace detail
 
@@ -2435,9 +2544,17 @@ template <class... Ts, class... Xs>
 class selection_t<except<Xs...>, Ts...>
 {
     static_assert(sizeof...(Ts) > 0, "quiver: select() needs at least one component type");
-    static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
+    static_assert(((detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> ||
+                    component<detail::bare<detail::maybe_inner<Ts>>>) &&
+                   ...),
                   "quiver: select() component types must be plain object types "
                   "(no references, pointers-to-const, arrays, or cv-qualified types)");
+    static_assert((detail::group_ok<detail::bare<detail::maybe_inner<Ts>>>::value && ...));
+    static_assert((!(detail::is_maybe_v<Ts> &&
+                     detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) &&
+                   ...),
+                  "quiver: maybe<any_of<...>> is meaningless — any_of alternatives already "
+                  "arrive as nullable pointers");
     static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
                   "quiver: maybe<T> of a tag component carries no data to point at; tags are "
                   "filter-only — include the tag directly or use has<T>");
@@ -2446,28 +2563,80 @@ class selection_t<except<Xs...>, Ts...>
                   "drive iteration");
     static_assert((component<Xs> && ...),
                   "quiver: except<> types must be plain, non-const component types");
-    static_assert(detail::all_distinct<detail::maybe_inner<Ts>...>,
-                  "quiver: duplicate component type in select<...>");
+    static_assert(
+        detail::list_distinct<joined_t<
+            typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>>::value,
+        "quiver: duplicate component type in select<...> (any_of alternatives count)");
     static_assert(detail::all_distinct<Xs...>, "quiver: duplicate component type in except<...>");
-    static_assert((!detail::type_among<detail::maybe_inner<Ts>, Xs...> && ...),
-                  "quiver: a component type appears in both select<...> and except<...>");
+    static_assert(
+        detail::list_none_among<
+            joined_t<typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>,
+            Xs...>::value,
+        "quiver: a component type appears in both select<...> and except<...> "
+        "(any_of alternatives count)");
 
     // Per-element flags/positions, indexable at runtime alongside includes_.
     static constexpr std::array<bool, sizeof...(Ts)> optional_include{detail::is_maybe_v<Ts>...};
+    static constexpr std::array<bool, sizeof...(Ts)> group_include{
+        detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>...};
+    static constexpr std::size_t group_count =
+        (std::size_t{0} + ... +
+         std::size_t{detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>});
+    static constexpr bool has_plain_include =
+        ((!detail::is_maybe_v<Ts> && !detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) ||
+         ...);
+
+    // The flattened include array: an any_of element contributes one pool
+    // slot per alternative; everything else contributes one slot. With no
+    // any_of in the selection, the mapping is the identity and every loop
+    // below collapses to the historical single-slot-per-element shape.
+    static constexpr std::array<std::size_t, sizeof...(Ts)> element_width{
+        detail::any_of_traits<detail::bare<detail::maybe_inner<Ts>>>::width...};
+    static constexpr std::size_t flat_count =
+        (std::size_t{0} + ... +
+         detail::any_of_traits<detail::bare<detail::maybe_inner<Ts>>>::width);
+
+    static consteval std::array<std::size_t, sizeof...(Ts)> build_offsets()
+    {
+        std::array<std::size_t, sizeof...(Ts)> out{};
+        std::size_t at = 0;
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
+        {
+            out[i] = at;
+            at += element_width[i];
+        }
+        return out;
+    }
+
+    static constexpr std::array<std::size_t, sizeof...(Ts)> flat_offset = build_offsets();
 
     static consteval std::size_t find_first_required()
     {
         for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
-            if (!optional_include[i])
+            if (!optional_include[i] && !group_include[i])
             {
                 return i;
             }
         }
-        return 0;  // unreachable: the not-all-maybe static_assert above
+        return sizeof...(Ts);  // pure-any_of selection: no plain element
     }
 
     static constexpr std::size_t first_required = find_first_required();
+
+    static consteval std::size_t find_first_group()
+    {
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
+        {
+            if (group_include[i])
+            {
+                return i;
+            }
+        }
+        return sizeof...(Ts);
+    }
+
+    static constexpr std::size_t first_group = find_first_group();
 
     // Slot of T among Ts... (matching through const and maybe<> spellings);
     // sizeof...(Ts) when absent. Drives driven_by's static checks.
@@ -2491,7 +2660,7 @@ class selection_t<except<Xs...>, Ts...>
     // here, which is what makes concurrent const iteration safe there.
     struct iteration_lock
     {
-        explicit iteration_lock(const std::array<detail::pool_base*, sizeof...(Ts)>& pools) noexcept
+        explicit iteration_lock(const std::array<detail::pool_base*, flat_count>& pools) noexcept
             : pools_(pools)
         {
             if constexpr (checks_enabled)
@@ -2523,7 +2692,7 @@ class selection_t<except<Xs...>, Ts...>
         iteration_lock(const iteration_lock&) = delete;
         iteration_lock& operator=(const iteration_lock&) = delete;
 
-        const std::array<detail::pool_base*, sizeof...(Ts)>& pools_;
+        const std::array<detail::pool_base*, flat_count>& pools_;
     };
 
 public:
@@ -2572,50 +2741,73 @@ public:
     }
 
     // O(1) for a single included pool without excludes; otherwise walks the
-    // driver pool.
+    // driver pool (or the alternative union when one drives).
     [[nodiscard]] std::size_t count() const noexcept
     {
-        const detail::pool_base* driver = smallest();
-        if (driver == nullptr)
+        if constexpr (group_count == 0)
         {
-            return 0;
-        }
-        if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
-        {
-            return driver->size();
+            const detail::pool_base* driver = smallest();
+            if (driver == nullptr)
+            {
+                return 0;
+            }
+            if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
+            {
+                return driver->size();
+            }
+            else
+            {
+                std::size_t n = 0;
+                for (std::size_t pos = 0; pos < driver->size(); ++pos)
+                {
+                    n += matches_rest(driver->entity_at(pos).index(), driver) ? 1 : 0;
+                }
+                return n;
+            }
         }
         else
         {
             std::size_t n = 0;
-            for (std::size_t pos = 0; pos < driver->size(); ++pos)
-            {
-                n += matches_rest(driver->entity_at(pos).index(), driver) ? 1 : 0;
-            }
+            entities([&](entity) { ++n; });
             return n;
         }
     }
 
     [[nodiscard]] bool empty() const noexcept
     {
-        const detail::pool_base* driver = smallest();
-        if (driver == nullptr || driver->size() == 0)
+        if constexpr (group_count == 0)
         {
-            return true;
-        }
-        if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
-        {
-            return false;
+            const detail::pool_base* driver = smallest();
+            if (driver == nullptr || driver->size() == 0)
+            {
+                return true;
+            }
+            if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
+            {
+                return false;
+            }
+            else
+            {
+                for (std::size_t pos = 0; pos < driver->size(); ++pos)
+                {
+                    if (matches_rest(driver->entity_at(pos).index(), driver))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
         }
         else
         {
-            for (std::size_t pos = 0; pos < driver->size(); ++pos)
-            {
-                if (matches_rest(driver->entity_at(pos).index(), driver))
+            bool any = false;
+            entities(
+                [&](entity)
                 {
+                    any = true;
                     return false;
-                }
-            }
-            return true;
+                });
+            return !any;
         }
     }
 
@@ -2624,17 +2816,40 @@ public:
     {
         // Pools only ever hold live entities, and a slot index maps to at most
         // one live entity, so an exact dense match doubles as a liveness test.
-        detail::pool_base* first = includes_[first_required];
-        if (first == nullptr)
+        if constexpr (first_required < sizeof...(Ts))
         {
+            detail::pool_base* first = includes_[flat_offset[first_required]];
+            if (first == nullptr)
+            {
+                return false;
+            }
+            const std::uint32_t pos = first->position_of(e.index());
+            if (pos == detail::npos32 || first->entity_at(pos) != e)
+            {
+                return false;
+            }
+            return matches_rest(e.index(), first);
+        }
+        else
+        {
+            // Pure-any_of selection: the exact dense match may sit in ANY
+            // alternative of the first group.
+            const std::size_t off = flat_offset[first_group];
+            for (std::size_t k = 0; k < element_width[first_group]; ++k)
+            {
+                detail::pool_base* alt = includes_[off + k];
+                if (alt == nullptr)
+                {
+                    continue;
+                }
+                const std::uint32_t pos = alt->position_of(e.index());
+                if (pos != detail::npos32 && alt->entity_at(pos) == e)
+                {
+                    return matches_rest(e.index(), alt);
+                }
+            }
             return false;
         }
-        const std::uint32_t pos = first->position_of(e.index());
-        if (pos == detail::npos32 || first->entity_at(pos) != e)
-        {
-            return false;
-        }
-        return matches_rest(e.index(), first);
     }
 
     // The first matching entity, or no_entity — the singleton-query idiom:
@@ -2675,9 +2890,12 @@ public:
             static_assert(!optional_include[slot],
                           "quiver: driven_by<T> cannot drive from a maybe<> component — "
                           "optional pools never drive iteration");
+            static_assert(!group_include[slot],
+                          "quiver: driven_by<T> cannot name an any_of<> group — union driving "
+                          "is automatic; force a PLAIN include instead");
         }
         selection_t out = *this;
-        out.driver_override_ = static_cast<std::uint8_t>(slot);
+        out.driver_override_ = static_cast<std::uint8_t>(flat_offset[slot]);
         return out;
     }
 
@@ -2806,7 +3024,13 @@ public:
 
     using range_t = basic_range<>;  // nameable for stored ranges; see range()
 
-    [[nodiscard]] auto range() const noexcept { return basic_range<>(*this); }
+    [[nodiscard]] auto range() const noexcept
+    {
+        static_assert(group_count == 0 || has_plain_include,
+                      "quiver: range() needs at least one plain include to drive; iterate "
+                      "pure any_of selections with each()/entities()");
+        return basic_range<>(*this);
+    }
 
     // ------------------------------------------------------------- splitting
     //
@@ -2938,6 +3162,9 @@ public:
 
     [[nodiscard]] auto split(std::size_t parts) const noexcept
     {
+        static_assert(group_count == 0 || has_plain_include,
+                      "quiver: split() needs at least one plain include to carve; iterate "
+                      "pure any_of selections with each()/entities()");
         return basic_split<selection_t>(*this, parts);
     }
 
@@ -2945,18 +3172,18 @@ private:
     friend class world;
     friend struct test_access;
 
-    explicit selection_t(std::array<detail::pool_base*, sizeof...(Ts)> includes,
+    explicit selection_t(std::array<detail::pool_base*, flat_count> includes,
                          std::array<detail::pool_base*, sizeof...(Xs)> excludes) noexcept
         : includes_(includes),
           excludes_(excludes)
     {
     }
 
-    // The pool actually iterated; null when any include pool is missing
-    // (possible for selections built from a const world).
-    // The driver is the smallest REQUIRED pool — or the driven_by<T> choice
-    // when set; maybe<> pools never drive and a missing one never
-    // disqualifies the selection.
+    // The PLAIN driver pool: the smallest required non-group include — or
+    // the driven_by<T> choice when set; null when a plain include pool is
+    // missing (const world) or when the selection has no plain includes at
+    // all (pure any_of: the union drives instead, in run()). maybe<> pools
+    // never drive and a missing one never disqualifies the selection.
     [[nodiscard]] detail::pool_base* smallest() const noexcept
     {
         if (driver_override_ != no_driver_override)
@@ -2964,13 +3191,13 @@ private:
             return includes_[driver_override_];  // null = empty selection
         }
         detail::pool_base* best = nullptr;
-        for (std::size_t i = 0; i < includes_.size(); ++i)
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
-            if (optional_include[i])
+            if (optional_include[i] || group_include[i])
             {
                 continue;
             }
-            detail::pool_base* pool = includes_[i];
+            detail::pool_base* pool = includes_[flat_offset[i]];
             if (pool == nullptr)
             {
                 return nullptr;
@@ -2986,13 +3213,44 @@ private:
     [[nodiscard]] bool matches_rest(std::uint32_t index,
                                     const detail::pool_base* driver) const noexcept
     {
-        for (std::size_t i = 0; i < includes_.size(); ++i)
+        return matches_from(index, driver, sizeof...(Ts));
+    }
+
+    // The full predicate, optionally skipping one element (the union-driving
+    // group satisfies itself by construction).
+    [[nodiscard]] bool matches_from(std::uint32_t index,
+                                    const detail::pool_base* driver,
+                                    std::size_t skip_element) const noexcept
+    {
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
-            if (optional_include[i])
+            if (optional_include[i] || i == skip_element)
             {
                 continue;  // maybe<> never filters
             }
-            detail::pool_base* pool = includes_[i];
+            if constexpr (group_count > 0)
+            {
+                if (group_include[i])
+                {
+                    bool satisfied = false;
+                    const std::size_t off = flat_offset[i];
+                    for (std::size_t k = 0; k < element_width[i]; ++k)
+                    {
+                        detail::pool_base* alt = includes_[off + k];
+                        if (alt != nullptr && (alt == driver || alt->contains(index)))
+                        {
+                            satisfied = true;
+                            break;
+                        }
+                    }
+                    if (!satisfied)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            detail::pool_base* pool = includes_[flat_offset[i]];
             if (pool != driver && (pool == nullptr || !pool->contains(index)))
             {
                 return false;
@@ -3011,15 +3269,101 @@ private:
     template <class F, class Invoke>
     void run(F& fn, Invoke&& invoke) const
     {
-        detail::pool_base* driver = smallest();
-        if (driver == nullptr)
+        if constexpr (group_count == 0)
         {
-            return;
+            detail::pool_base* driver = smallest();
+            if (driver == nullptr)
+            {
+                return;
+            }
+            const iteration_lock lock(includes_);
+            // Locked pools cannot change size, so a forward walk visits every
+            // matching entity exactly once.
+            run_span(fn, invoke, driver, 0, driver->size());
         }
-        const iteration_lock lock(includes_);
-        // Locked pools cannot change size, so a forward walk visits every
-        // matching entity exactly once.
-        run_span(fn, invoke, driver, 0, driver->size());
+        else
+        {
+            // A missing PLAIN include pool is an empty selection, as ever.
+            detail::pool_base* driver = smallest();
+            if constexpr (has_plain_include)
+            {
+                if (driver == nullptr)
+                {
+                    return;
+                }
+            }
+            // The cheapest union among the groups (a group whose every
+            // alternative pool is missing or empty matches nothing).
+            std::size_t best_union = static_cast<std::size_t>(-1);
+            std::size_t best_group_elem = sizeof...(Ts);
+            for (std::size_t i = 0; i < sizeof...(Ts); ++i)
+            {
+                if (!group_include[i])
+                {
+                    continue;
+                }
+                std::size_t sum = 0;
+                const std::size_t off = flat_offset[i];
+                for (std::size_t k = 0; k < element_width[i]; ++k)
+                {
+                    sum += includes_[off + k] != nullptr ? includes_[off + k]->size() : 0;
+                }
+                if (sum == 0)
+                {
+                    return;  // unsatisfiable group: nothing matches
+                }
+                if (sum < best_union)
+                {
+                    best_union = sum;
+                    best_group_elem = i;
+                }
+            }
+            // Pick the cheaper walk: the plain driver or the smallest union
+            // (a driven_by override always forces the plain pool).
+            if (driver != nullptr &&
+                (driver_override_ != no_driver_override || driver->size() <= best_union))
+            {
+                const iteration_lock lock(includes_);
+                run_span(fn, invoke, driver, 0, driver->size());
+                return;
+            }
+            // Union drive: walk each alternative's dense array; an entity
+            // already seen through an EARLIER alternative is skipped (O(1)
+            // sparse probes — exact dedup, since pools hold each live entity
+            // at most once).
+            const iteration_lock lock(includes_);
+            const std::size_t off = flat_offset[best_group_elem];
+            for (std::size_t k = 0; k < element_width[best_group_elem]; ++k)
+            {
+                detail::pool_base* alt = includes_[off + k];
+                if (alt == nullptr)
+                {
+                    continue;
+                }
+                for (std::size_t pos = 0; pos < alt->size(); ++pos)
+                {
+                    const entity e = alt->entity_at(pos);
+                    bool seen_earlier = false;
+                    for (std::size_t j = 0; j < k; ++j)
+                    {
+                        detail::pool_base* prev = includes_[off + j];
+                        if (prev != nullptr && prev->contains(e.index()))
+                        {
+                            seen_earlier = true;
+                            break;
+                        }
+                    }
+                    if (seen_earlier || !matches_from(e.index(), nullptr, best_group_elem))
+                    {
+                        continue;
+                    }
+                    if (!invoke(fn, e, e.index()))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     // The bounded loop body of run(); split parts call it with the umbrella
@@ -3047,10 +3391,14 @@ private:
     template <std::size_t I, class T>
     [[nodiscard]] detail::sel_part_t<T> ref_tuple(std::uint32_t index) const
     {
-        if constexpr (detail::is_maybe_v<T>)
+        if constexpr (detail::is_any_of_v<detail::bare<detail::maybe_inner<T>>>)
+        {
+            return group_parts<detail::bare<detail::maybe_inner<T>>>(flat_offset[I], index);
+        }
+        else if constexpr (detail::is_maybe_v<T>)
         {
             using inner = detail::bare<detail::maybe_inner<T>>;
-            auto* pool = static_cast<pool_of_t<inner>*>(includes_[I]);
+            auto* pool = static_cast<pool_of_t<inner>*>(includes_[flat_offset[I]]);
             return detail::sel_part_t<T>{pool == nullptr ? nullptr : pool->at(index)};
         }
         else if constexpr (detail::is_tag_v<T>)
@@ -3059,8 +3407,35 @@ private:
         }
         else
         {
-            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[I]);
+            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[flat_offset[I]]);
             return detail::sel_part_t<T>{*pool->at(index)};
+        }
+    }
+
+    // One pointer per non-tag alternative, each fetched independently (the
+    // matching machinery already guaranteed at least one is non-null).
+    template <class Group>
+    [[nodiscard]] detail::sel_part_t<Group> group_parts(std::size_t off, std::uint32_t index) const
+    {
+        return [&]<std::size_t... Ks, class... As>(std::index_sequence<Ks...>, types<As...>)
+        { return std::tuple_cat(this->template alternative_part<As>(off + Ks, index)...); }(
+            std::make_index_sequence<detail::any_of_traits<Group>::width>{},
+            typename detail::any_of_traits<Group>::alts{});
+    }
+
+    template <class A>
+    [[nodiscard]] auto alternative_part(std::size_t slot, std::uint32_t index) const
+    {
+        if constexpr (detail::is_tag_v<detail::bare<A>>)
+        {
+            return std::tuple<>{};
+        }
+        else
+        {
+            using pointer =
+                std::conditional_t<std::is_const_v<A>, const detail::bare<A>*, detail::bare<A>*>;
+            auto* pool = static_cast<pool_of_t<detail::bare<A>>*>(includes_[slot]);
+            return std::tuple<pointer>(pool == nullptr ? nullptr : pool->at(index));
         }
     }
 
@@ -3114,8 +3489,10 @@ private:
     }
 
     static constexpr std::uint8_t no_driver_override = 0xFF;
+    static_assert(flat_count < no_driver_override,
+                  "quiver: selections cap at 254 flattened include slots");
 
-    std::array<detail::pool_base*, sizeof...(Ts)> includes_{};
+    std::array<detail::pool_base*, flat_count> includes_{};
     std::array<detail::pool_base*, sizeof...(Xs)> excludes_{};
     std::uint8_t driver_override_ = no_driver_override;
 };
@@ -3192,6 +3569,8 @@ template <class... Ts, class... Xs>  // const-qualify elements for read-only pay
 class bonded_view_t<except<Xs...>, Ts...>
 {
     static_assert(sizeof...(Ts) >= 2, "quiver: a bonded view spans at least two pools");
+    static_assert((!detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> && ...),
+                  "quiver: bonds own pools, not alternatives — any_of<> belongs in select");
     static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
                   "quiver: bonded view component types must be plain object types");
     static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
@@ -5452,6 +5831,8 @@ public:
                       "quiver: duplicate component type in bond<...>");
         static_assert((!detail::is_maybe_v<detail::bare<Ts>> && ...),
                       "quiver: maybe<> marks optional selection parts and cannot be bonded");
+        static_assert((!detail::is_any_of_v<detail::bare<Ts>> && ...),
+                      "quiver: bonds own pools, not alternatives — any_of<> belongs in select");
         // derived_from, not same_as: custom pools derived from the packed
         // built-in swap exactly the same way and need the same wall.
         static_assert(((!std::derived_from<pool_of_t<detail::bare<Ts>>,
@@ -5787,16 +6168,16 @@ public:
             // NOLINTNEXTLINE(readability-redundant-typename)
             using result = selection_t<except<Xs...>, typename detail::as_const_part<Ts>::type...>;
             // Missing include pools propagate as null -> an empty selection.
-            return result{{self.template pool_base_of<detail::bare<detail::maybe_inner<Ts>>>()...},
+            return result{self.template flat_include_pools<Ts...>(),
                           {self.template pool_base_of<Xs>()...}};
         }
         else
         {
             using result = selection_t<except<Xs...>, Ts...>;
-            // maybe<T> contributes its inner type's pool; registering it keeps
-            // the selection's pointer array complete (a never-added maybe
-            // stays empty).
-            return result{{&self.template ensure_pool<detail::bare<detail::maybe_inner<Ts>>>()...},
+            // maybe<T> contributes its inner type's pool, any_of<As...> one
+            // pool per alternative; registering keeps the selection's pointer
+            // array complete (a never-added member stays empty).
+            return result{self.template flat_include_pools<Ts...>(),
                           {&self.template ensure_pool<Xs>()...}};
         }
     }
@@ -6349,6 +6730,53 @@ private:
     {
         const auto* pool = peek_pool<T>();
         return pool != nullptr && pool->contains(index);
+    }
+
+    // Builds a selection's flattened include array: one pool per element,
+    // except any_of elements which contribute one pool per alternative.
+    // Non-const worlds register pools; const worlds leave missing ones null.
+    template <class... Es, class Self>
+    [[nodiscard]] auto flat_include_pools(this Self&& self)
+    {
+        constexpr std::size_t n =
+            (std::size_t{0} + ... +
+             detail::any_of_traits<detail::bare<detail::maybe_inner<Es>>>::width);
+        std::array<detail::pool_base*, n> out{};
+        std::size_t at = 0;
+        (self.template fill_flat<Es>(out, at), ...);
+        return out;
+    }
+
+    template <class E, std::size_t N, class Self>
+    void fill_flat(this Self&& self, std::array<detail::pool_base*, N>& out, std::size_t& at)
+    {
+        using core = detail::bare<detail::maybe_inner<E>>;
+        constexpr bool from_const = std::is_const_v<std::remove_reference_t<Self>>;
+        if constexpr (detail::is_any_of_v<core>)
+        {
+            [&]<class... As>(types<As...>)
+            {
+                if constexpr (from_const)
+                {
+                    ((out[at++] = self.template pool_base_of<detail::bare<As>>()), ...);
+                }
+                else
+                {
+                    ((out[at++] = &self.template ensure_pool<detail::bare<As>>()), ...);
+                }
+            }(typename detail::any_of_traits<core>::alts{});
+        }
+        else
+        {
+            if constexpr (from_const)
+            {
+                out[at++] = self.template pool_base_of<core>();
+            }
+            else
+            {
+                out[at++] = &self.template ensure_pool<core>();
+            }
+        }
     }
 
     // The group whose owned set is EXACTLY the given pools (any order); null
