@@ -3900,6 +3900,12 @@ int main()
     test_bond_observed_views();
     test_bond_partition_sort();
     test_bond_view_count();
+    test_any_of_basics();
+    test_any_of_driving();
+    test_any_of_composition();
+#if QUIVER_CHECKS
+    test_any_of_violations();
+#endif
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
