@@ -3906,6 +3906,12 @@ int main()
 #if QUIVER_CHECKS
     test_any_of_violations();
 #endif
+    test_watcher_entered();
+    test_watcher_changed();
+    test_watcher_lifetime();
+#if QUIVER_CHECKS
+    test_watcher_violations();
+#endif
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
