@@ -107,6 +107,15 @@ using quiver::const_entity_ref;
 using quiver::entity_ref;
 using quiver::globals_mark;
 using quiver::pipeline;
+// any + reflection
+using quiver::any;
+using quiver::field;
+using quiver::method;
+using quiver::reflect;
+using quiver::reflect_all;
+using quiver::reflect_builder;
+using quiver::reflection;
+using quiver::reflection_of;
 // MSVC (as of 17.14) does not surface the header's std::hash<entity>
 // specialization from the global module fragment to importers; use
 // quiver::entity_hash with unordered containers in module builds.
