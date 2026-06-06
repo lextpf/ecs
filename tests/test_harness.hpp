@@ -241,3 +241,10 @@ void test_watcher_entered();
 void test_watcher_changed();
 void test_watcher_lifetime();
 void test_watcher_violations();  // defined (and called) under QUIVER_CHECKS only
+
+// tests_meta.cpp (M6/M8: any, reflection, meta×ECS bridge)
+void test_any_basics();
+void test_reflection_registry();
+void test_reflection_fields();
+void test_reflection_methods();
+void test_reflection_construct();
