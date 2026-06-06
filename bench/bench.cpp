@@ -433,6 +433,37 @@ int main()
                               }));
     }
 
+    // --- watcher overhead --------------------------------------------------------
+    {
+        ecs::world w;
+        constexpr std::size_t churn = 10'000;
+        std::vector<ecs::entity> entities(churn);
+        for (auto& e : entities)
+        {
+            e = w.spawn(Transform{1, 1});
+        }
+        const auto churn_once = [&]
+        {
+            for (const ecs::entity e : entities)
+            {
+                w.add<Velocity>(e, Velocity{1, 1});
+            }
+            for (const ecs::entity e : entities)
+            {
+                w.remove<Velocity>(e);
+            }
+        };
+        report("add+remove churn, unwatched", best_ns_per_op(churn * 2, churn_once));
+        ecs::watcher<ecs::types<Transform, Velocity>> moving(w);
+        report("add+remove churn, watched (2 conds)",
+               best_ns_per_op(churn * 2,
+                              [&]
+                              {
+                                  churn_once();
+                                  moving.clear();
+                              }));
+    }
+
     // --- bonded groups (N-ary) -------------------------------------------------
     {
         ecs::world w;
