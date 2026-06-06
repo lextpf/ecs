@@ -235,3 +235,9 @@ void test_any_of_basics();
 void test_any_of_driving();
 void test_any_of_composition();
 void test_any_of_violations();  // defined (and called) under QUIVER_CHECKS only
+
+// tests_reactive.cpp (M5: watcher condition monitors)
+void test_watcher_entered();
+void test_watcher_changed();
+void test_watcher_lifetime();
+void test_watcher_violations();  // defined (and called) under QUIVER_CHECKS only
