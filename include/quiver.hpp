@@ -8254,6 +8254,788 @@ void command_buffer::erased_remove(world& w, entity target)
 }
 
 // ----------------------------------------------------------------------------
+// any — a type-erased value with small-buffer optimization
+//
+// RTTI-free: identity is hash_of<T>, the same 64-bit name hash pools and
+// archives key on. The vtable is a static per-type table of plain function
+// pointers — no virtual classes, debugger-plain. Payloads up to three words
+// with ordinary alignment live inline; everything else (and every
+// over-aligned type) takes one aligned heap allocation. ref() makes a
+// NON-OWNING view: writes alias the original, destruction leaves it alone,
+// and copies of a ref are more refs. Copying an any whose payload is not
+// copy-constructible is a checked violation that yields an empty any.
+// as<T>() is the get-style accessor (aborts on mismatch in checked builds);
+// try_as<T>() is the find-style one (null on mismatch).
+// ----------------------------------------------------------------------------
+
+class any
+{
+    static constexpr std::size_t sbo_bytes = 3 * sizeof(void*);
+
+    union storage
+    {
+        void* remote;
+        alignas(std::max_align_t) std::byte local[sbo_bytes];
+    };
+
+    template <class T>
+    static constexpr bool fits_inline =
+        sizeof(T) <= sbo_bytes && alignof(T) <= alignof(std::max_align_t) &&
+        std::is_nothrow_move_constructible_v<T>;
+
+    enum class place : std::uint8_t
+    {
+        local,
+        remote,
+        ref,
+    };
+
+    struct vtable_t
+    {
+        std::uint64_t hash;
+        place where;
+        void (*destroy)(any&) noexcept;
+        void (*copy)(any& dst, const any& src);     // null: payload not copyable
+        void (*move)(any& dst, any& src) noexcept;  // src left empty
+        void* (*address)(const any&) noexcept;
+    };
+
+    template <class T, place Where>
+    static const vtable_t* table() noexcept
+    {
+        static constexpr vtable_t vt{
+            hash_of<T>(),
+            Where,
+            // destroy
+            +[](any& self) noexcept
+            {
+                if constexpr (Where == place::local)
+                {
+                    std::destroy_at(static_cast<T*>(static_cast<void*>(self.store_.local)));
+                }
+                else if constexpr (Where == place::remote)
+                {
+                    T* payload = static_cast<T*>(self.store_.remote);
+                    std::destroy_at(payload);
+                    ::operator delete(payload, std::align_val_t{alignof(T)});
+                }
+            },
+            // copy (refs copy as refs; owned payloads deep-copy when they can)
+            []() -> void (*)(any&, const any&)
+            {
+                if constexpr (Where == place::ref)
+                {
+                    return +[](any& dst, const any& src)
+                    {
+                        dst.vt_ = src.vt_;
+                        dst.store_.remote = src.store_.remote;
+                    };
+                }
+                else if constexpr (std::copy_constructible<T>)
+                {
+                    return +[](any& dst, const any& src)
+                    { dst.emplace_value<T>(*static_cast<const T*>(src.vt_->address(src))); };
+                }
+                else
+                {
+                    return nullptr;
+                }
+            }(),
+            // move
+            +[](any& dst, any& src) noexcept
+            {
+                if constexpr (Where == place::local)
+                {
+                    std::construct_at(
+                        static_cast<T*>(static_cast<void*>(dst.store_.local)),
+                        std::move(*static_cast<T*>(static_cast<void*>(src.store_.local))));
+                    dst.vt_ = src.vt_;
+                    src.vt_->destroy(src);
+                }
+                else  // remote and ref: steal the pointer
+                {
+                    dst.store_.remote = src.store_.remote;
+                    dst.vt_ = src.vt_;
+                }
+                src.vt_ = nullptr;
+            },
+            // address
+            +[](const any& self) noexcept -> void*
+            {
+                if constexpr (Where == place::local)
+                {
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                    return const_cast<std::byte*>(self.store_.local);
+                }
+                else
+                {
+                    return self.store_.remote;
+                }
+            },
+        };
+        return &vt;
+    }
+
+    template <class T, class... Args>
+    void emplace_value(Args&&... args)
+    {
+        if constexpr (fits_inline<T>)
+        {
+            std::construct_at(static_cast<T*>(static_cast<void*>(store_.local)),
+                              std::forward<Args>(args)...);
+            vt_ = table<T, place::local>();
+        }
+        else
+        {
+            void* raw = ::operator new(sizeof(T), std::align_val_t{alignof(T)});
+            try
+            {
+                store_.remote =
+                    std::construct_at(static_cast<T*>(raw), std::forward<Args>(args)...);
+            }
+            catch (...)
+            {
+                ::operator delete(raw, std::align_val_t{alignof(T)});
+                throw;
+            }
+            vt_ = table<T, place::remote>();
+        }
+    }
+
+public:
+    any() noexcept = default;  // empty
+
+    // The owning maker (any's analogue of add: explicit, never implicit).
+    template <class T, class... Args>
+    [[nodiscard]] static any make(Args&&... args)
+    {
+        static_assert(std::same_as<T, detail::bare<T>>,
+                      "quiver: any::make<T> takes a plain, unqualified value type");
+        any out;
+        out.emplace_value<T>(std::forward<Args>(args)...);
+        return out;
+    }
+
+    // The non-owning view maker.
+    template <class T>
+    [[nodiscard]] static any ref(T& object) noexcept
+    {
+        static_assert(std::same_as<T, detail::bare<T>>,
+                      "quiver: any::ref<T> views a plain, unqualified value type");
+        any out;
+        out.store_.remote = &object;
+        out.vt_ = table<T, place::ref>();
+        return out;
+    }
+
+    any(const any& other)
+    {
+        if (other.vt_ == nullptr)
+        {
+            return;
+        }
+        if (other.vt_->copy == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "copy of an any holding a non-copyable payload (the copy is "
+                    "empty; move it or pass any::ref)");
+            }
+            return;
+        }
+        other.vt_->copy(*this, other);
+    }
+
+    any(any&& other) noexcept
+    {
+        if (other.vt_ != nullptr)
+        {
+            other.vt_->move(*this, other);
+        }
+    }
+
+    any& operator=(const any& other)
+    {
+        if (this != &other)
+        {
+            any copy(other);
+            reset();
+            if (copy.vt_ != nullptr)
+            {
+                copy.vt_->move(*this, copy);
+            }
+        }
+        return *this;
+    }
+
+    any& operator=(any&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            if (other.vt_ != nullptr)
+            {
+                other.vt_->move(*this, other);
+            }
+        }
+        return *this;
+    }
+
+    ~any() { reset(); }
+
+    void reset() noexcept
+    {
+        if (vt_ != nullptr)
+        {
+            vt_->destroy(*this);
+            vt_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] bool holds() const noexcept { return vt_ != nullptr; }
+    explicit operator bool() const noexcept { return holds(); }
+
+    // hash_of<T> of the payload; 0 when empty.
+    [[nodiscard]] std::uint64_t type_hash() const noexcept
+    {
+        return vt_ != nullptr ? vt_->hash : 0;
+    }
+
+    // find-style access: null on empty or type mismatch.
+    template <class T>
+    [[nodiscard]] T* try_as() noexcept
+    {
+        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
+                   ? static_cast<T*>(vt_->address(*this))
+                   : nullptr;
+    }
+
+    template <class T>
+    [[nodiscard]] const T* try_as() const noexcept
+    {
+        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
+                   ? static_cast<const T*>(vt_->address(*this))
+                   : nullptr;
+    }
+
+    // get-style access: aborts on mismatch (a reference must be produced).
+    template <class T>
+    [[nodiscard]] T& as()
+    {
+        T* payload = try_as<T>();
+        if (payload == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "as<T> on an any holding a different type (or nothing); "
+                    "try_as<T> is the safe form");
+            }
+            std::abort();  // cannot produce a reference
+        }
+        return *payload;
+    }
+
+    template <class T>
+    [[nodiscard]] const T& as() const
+    {
+        const T* payload = try_as<T>();
+        if (payload == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "as<T> on an any holding a different type (or nothing); "
+                    "try_as<T> is the safe form");
+            }
+            std::abort();
+        }
+        return *payload;
+    }
+
+    // Raw payload bytes for tooling (null when empty); the pointer obeys the
+    // payload's own lifetime rules.
+    [[nodiscard]] void* data() noexcept { return vt_ != nullptr ? vt_->address(*this) : nullptr; }
+    [[nodiscard]] const void* data() const noexcept
+    {
+        return vt_ != nullptr ? vt_->address(*this) : nullptr;
+    }
+
+private:
+    const vtable_t* vt_ = nullptr;
+    storage store_{};
+};
+
+// ----------------------------------------------------------------------------
+// Reflection — a process-wide, RTTI-free runtime type registry
+//
+// Registration is a fluent builder driven entirely by compile-time member
+// pointers; lookups are lock-free binary searches keyed by hash_of<T> (the
+// SAME identity archives and pools use, so reflection, serialization, and
+// runtime pools agree on what a type is called). Register at startup —
+// registration is externally synchronized, like world construction. Every
+// runtime operation is fault-tolerant, editor-grade: mismatches answer with
+// empty handles, empty anys, or false — never an abort.
+//
+//   quiver::reflect<Transform>()
+//       .field<&Transform::x>("x")
+//       .field<&Transform::y>("y")
+//       .method<&Transform::translate>("translate")
+//       .construct<float, float>();
+//
+//   if (auto r = quiver::reflection_of("Transform")) { ... }
+// ----------------------------------------------------------------------------
+
+namespace detail
+{
+struct field_node
+{
+    std::string_view name;
+    std::uint64_t owner_hash;
+    std::uint64_t type_hash;
+    any (*get)(const void* object);
+    bool (*set)(void* object, const any& value);
+};
+
+struct method_node
+{
+    std::string_view name;
+    std::uint64_t owner_hash;
+    bool is_const;
+    any (*invoke)(void* object, std::span<any> args);
+};
+
+struct ctor_node
+{
+    std::size_t arity;
+    any (*construct)(std::span<any> args);
+};
+
+struct type_node
+{
+    std::uint64_t hash = 0;
+    std::string_view name;
+    std::size_t size_bytes = 0;
+    std::size_t align = 0;
+    std::vector<field_node> fields;
+    std::vector<method_node> methods;
+    std::vector<ctor_node> ctors;
+};
+
+// Sorted by hash; nodes are heap-stable so handles survive registrations.
+inline std::vector<std::unique_ptr<type_node>>& reflection_registry()
+{
+    static std::vector<std::unique_ptr<type_node>> nodes;
+    return nodes;
+}
+
+[[nodiscard]] inline type_node* find_type_node(std::uint64_t hash) noexcept
+{
+    auto& nodes = reflection_registry();
+    const auto it = std::lower_bound(nodes.begin(),
+                                     nodes.end(),
+                                     hash,
+                                     [](const std::unique_ptr<type_node>& node, std::uint64_t h)
+                                     { return node->hash < h; });
+    return it != nodes.end() && (*it)->hash == hash ? it->get() : nullptr;
+}
+
+// Member-pointer introspection for the builder.
+template <class M>
+struct member_object_traits;
+
+template <class C, class M>
+struct member_object_traits<M C::*>
+{
+    using owner = C;
+    using value = M;
+};
+
+template <class F>
+struct member_function_traits;
+
+template <class C, class R, class... As>
+struct member_function_traits<R (C::*)(As...)>
+{
+    using owner = C;
+    using result = R;
+    using args = types<As...>;
+    static constexpr bool is_const = false;
+};
+
+template <class C, class R, class... As>
+struct member_function_traits<R (C::*)(As...) const>
+{
+    using owner = C;
+    using result = R;
+    using args = types<As...>;
+    static constexpr bool is_const = true;
+};
+}  // namespace detail
+
+// A valid-or-empty handle over one registered data member.
+class field
+{
+public:
+    field() = default;
+
+    explicit operator bool() const noexcept { return node_ != nullptr; }
+    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
+    [[nodiscard]] std::uint64_t type_hash() const noexcept { return node_->type_hash; }
+
+    // Copies the member out of an any holding the owner type; empty any on
+    // mismatch.
+    [[nodiscard]] any get(const any& object) const
+    {
+        if (node_ == nullptr || object.type_hash() != node_->owner_hash)
+        {
+            return {};
+        }
+        return node_->get(object.data());
+    }
+
+    // Writes the member into an any holding the owner type; false on any
+    // mismatch, leaving the value untouched.
+    bool set(any& object, const any& value) const
+    {
+        if (node_ == nullptr || object.type_hash() != node_->owner_hash)
+        {
+            return false;
+        }
+        return node_->set(object.data(), value);
+    }
+
+private:
+    friend class reflection;
+
+    explicit field(const detail::field_node* node) noexcept
+        : node_(node)
+    {
+    }
+
+    const detail::field_node* node_ = nullptr;
+};
+
+// A valid-or-empty handle over one registered member function.
+class method
+{
+public:
+    method() = default;
+
+    explicit operator bool() const noexcept { return node_ != nullptr; }
+    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
+
+    // Invokes with arguments unpacked from anys; the result rides back in
+    // one (empty for void). Wrong object type, arity, or argument types:
+    // empty any, no call.
+    any invoke(any& object, std::span<any> args) const
+    {
+        if (node_ == nullptr || object.type_hash() != node_->owner_hash)
+        {
+            return {};
+        }
+        return node_->invoke(object.data(), args);
+    }
+
+    // Const objects accept const member functions only.
+    any invoke(const any& object, std::span<any> args) const
+    {
+        if (node_ == nullptr || !node_->is_const || object.type_hash() != node_->owner_hash)
+        {
+            return {};
+        }
+        // Const member call through the object's address: safe by is_const.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+        return node_->invoke(const_cast<void*>(object.data()), args);
+    }
+
+private:
+    friend class reflection;
+
+    explicit method(const detail::method_node* node) noexcept
+        : node_(node)
+    {
+    }
+
+    const detail::method_node* node_ = nullptr;
+};
+
+// A valid-or-empty handle over one registered type.
+class reflection
+{
+public:
+    reflection() = default;
+
+    explicit operator bool() const noexcept { return node_ != nullptr; }
+    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
+    [[nodiscard]] std::uint64_t hash() const noexcept { return node_->hash; }
+    [[nodiscard]] std::size_t size_bytes() const noexcept { return node_->size_bytes; }
+    [[nodiscard]] std::size_t align() const noexcept { return node_->align; }
+
+    [[nodiscard]] field find_field(std::string_view name) const noexcept
+    {
+        if (node_ != nullptr)
+        {
+            for (const detail::field_node& f : node_->fields)
+            {
+                if (f.name == name)
+                {
+                    return field(&f);
+                }
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] method find_method(std::string_view name) const noexcept
+    {
+        if (node_ != nullptr)
+        {
+            for (const detail::method_node& m : node_->methods)
+            {
+                if (m.name == name)
+                {
+                    return method(&m);
+                }
+            }
+        }
+        return {};
+    }
+
+    // Walks fields in registration order: fn(const quiver::field&).
+    template <class F>
+    void each_field(F&& fn) const
+    {
+        if (node_ != nullptr)
+        {
+            for (const detail::field_node& f : node_->fields)
+            {
+                fn(field(&f));
+            }
+        }
+    }
+
+    // Constructs an instance through the first registered constructor whose
+    // arity and argument types match; empty any when none do.
+    [[nodiscard]] any construct(std::span<any> args) const
+    {
+        if (node_ != nullptr)
+        {
+            for (const detail::ctor_node& c : node_->ctors)
+            {
+                if (c.arity != args.size())
+                {
+                    continue;
+                }
+                any made = c.construct(args);
+                if (made.holds())
+                {
+                    return made;
+                }
+            }
+        }
+        return {};
+    }
+
+private:
+    template <class T>
+    friend class reflect_builder;
+    friend reflection reflection_of(std::uint64_t hash) noexcept;
+
+    explicit reflection(const detail::type_node* node) noexcept
+        : node_(node)
+    {
+    }
+
+    const detail::type_node* node_ = nullptr;
+};
+
+[[nodiscard]] inline reflection reflection_of(std::uint64_t hash) noexcept
+{
+    return reflection(detail::find_type_node(hash));
+}
+
+[[nodiscard]] inline reflection reflection_of(std::string_view name) noexcept
+{
+    // Names hash with the same fnv1a that hash_of<T> uses, so the name
+    // lookup IS the hash lookup.
+    return reflection_of(detail::fnv1a(name));
+}
+
+template <class T>
+[[nodiscard]] reflection reflection_of() noexcept
+{
+    return reflection_of(hash_of<detail::bare<T>>());
+}
+
+template <class T>
+class reflect_builder;
+
+template <class T>
+reflect_builder<T> reflect();
+
+// The fluent registrar. Duplicate registration of the same type is a checked
+// violation; the builder then appends to the existing node.
+template <class T>
+class reflect_builder
+{
+public:
+    template <auto Member>
+    reflect_builder& field(std::string_view name)
+    {
+        using traits = detail::member_object_traits<decltype(Member)>;
+        static_assert(std::same_as<typename traits::owner, T>,
+                      "quiver: field<&U::m> must name a member of the reflected type");
+        using value = typename traits::value;
+        node_->fields.push_back(detail::field_node{
+            name,
+            hash_of<T>(),
+            hash_of<detail::bare<value>>(),
+            +[](const void* object) -> any
+            { return any::make<detail::bare<value>>(static_cast<const T*>(object)->*Member); },
+            +[](void* object, const any& incoming) -> bool
+            {
+                const auto* payload = incoming.template try_as<detail::bare<value>>();
+                if (payload == nullptr)
+                {
+                    return false;
+                }
+                static_cast<T*>(object)->*Member = *payload;
+                return true;
+            },
+        });
+        return *this;
+    }
+
+    template <auto Method>
+    reflect_builder& method(std::string_view name)
+    {
+        using traits = detail::member_function_traits<decltype(Method)>;
+        static_assert(std::same_as<typename traits::owner, T>,
+                      "quiver: method<&U::fn> must name a member of the reflected type");
+        node_->methods.push_back(detail::method_node{
+            name,
+            hash_of<T>(),
+            traits::is_const,
+            &invoke_thunk<Method>,
+        });
+        return *this;
+    }
+
+    template <class... Args>
+    reflect_builder& construct()
+    {
+        static_assert(std::constructible_from<T, Args...>,
+                      "quiver: construct<Args...> must name a real constructor of T");
+        node_->ctors.push_back(detail::ctor_node{
+            sizeof...(Args),
+            +[](std::span<any> args) -> any
+            {
+                return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> any
+                {
+                    const bool typed =
+                        ((args[Is].template try_as<detail::bare<Args>>() != nullptr) && ...);
+                    if (!typed)
+                    {
+                        return {};
+                    }
+                    return any::make<T>(*args[Is].template try_as<detail::bare<Args>>()...);
+                }(std::index_sequence_for<Args...>{});
+            },
+        });
+        return *this;
+    }
+
+private:
+    friend reflect_builder<T> reflect<T>();
+
+    template <auto Method>
+    static any invoke_thunk(void* object, std::span<any> args)
+    {
+        using traits = detail::member_function_traits<decltype(Method)>;
+        return [&]<class... As>(types<As...>) -> any
+        {
+            if (args.size() != sizeof...(As))
+            {
+                return {};
+            }
+            return [&]<std::size_t... Is>(std::index_sequence<Is...>) -> any
+            {
+                const bool typed =
+                    ((args[Is].template try_as<detail::bare<As>>() != nullptr) && ...);
+                if (!typed)
+                {
+                    return {};
+                }
+                using result = typename traits::result;
+                if constexpr (std::is_void_v<result>)
+                {
+                    (static_cast<T*>(object)->*Method)(
+                        *args[Is].template try_as<detail::bare<As>>()...);
+                    return {};
+                }
+                else
+                {
+                    return any::make<detail::bare<result>>((static_cast<T*>(object)->*Method)(
+                        *args[Is].template try_as<detail::bare<As>>()...));
+                }
+            }(std::index_sequence_for<As...>{});
+        }(typename traits::args{});
+    }
+
+    explicit reflect_builder(detail::type_node* node) noexcept
+        : node_(node)
+    {
+    }
+
+    detail::type_node* node_;
+};
+
+// Registers T (idempotent identity: name from name_of<T>/quiver_label) and
+// returns the builder for fields, methods, and constructors.
+template <class T>
+reflect_builder<T> reflect()
+{
+    static_assert(std::same_as<T, detail::bare<T>>,
+                  "quiver: reflect<T> takes a plain, unqualified type");
+    constexpr std::uint64_t hash = hash_of<T>();
+    if (detail::type_node* standing = detail::find_type_node(hash); standing != nullptr)
+    {
+        if constexpr (checks_enabled)
+        {
+            detail::violate_pool("reflect<T> on an already registered type", name_of<T>());
+        }
+        return reflect_builder<T>(standing);
+    }
+    auto& nodes = detail::reflection_registry();
+    const auto at = std::lower_bound(nodes.begin(),
+                                     nodes.end(),
+                                     hash,
+                                     [](const std::unique_ptr<detail::type_node>& node,
+                                        std::uint64_t h) { return node->hash < h; });
+    auto node = std::make_unique<detail::type_node>();
+    node->hash = hash;
+    node->name = name_of<T>();
+    node->size_bytes = sizeof(T);
+    node->align = alignof(T);
+    detail::type_node* raw = node.get();
+    nodes.insert(at, std::move(node));
+    return reflect_builder<T>(raw);
+}
+
+// Manifest-driven identity registration: one call per types<> list.
+// Idempotent — already registered types are skipped, not violations.
+template <class... Ts>
+void reflect_all(types<Ts...>)
+{
+    ((detail::find_type_node(hash_of<detail::bare<Ts>>()) == nullptr
+          ? static_cast<void>(reflect<detail::bare<Ts>>())
+          : void()),
+     ...);
+}
+
+// ----------------------------------------------------------------------------
 // Checked-build test backdoor: deliberately corrupts internal state so a test
 // suite can prove validate() detects real damage, and exposes iteration-lock
 // counters. Not part of the API contract.
