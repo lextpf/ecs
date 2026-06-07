@@ -55,14 +55,14 @@ world.duplicate(boss);  world.sort<Sprite>(by_atlas);
 | **Save/load/merge built in** | `pack`/`unpack` round-trip exact entity ids through YOUR archive callables (encoding stays yours); `graft` merges archives into live worlds with fresh ids and *explicit* entity-handle relinking via `quiver_relink`/`relink_traits` — never guessed from member shapes. |
 | **Spawn tooling** | `blueprint` recipes stamped any number of times, `duplicate()` whole-entity cloning, `obtain()` get-or-add, `entity_ref` forwarding handles, `globals()` world singletons as plain components. |
 | **Storage policies** | `packed` (default, fastest), `stable` (pointer-stable chunks, accepts non-movable types, tunable via `chunk_capacity<T>`), `tag` (automatic for empty types). `sort<T>` / `sort_along<F, L>` control iteration order — with an injectable algorithm (`sort<T>(cmp, algo)`, e.g. `std::stable_sort`) — and stable pools sort without invalidating pointers. |
-| **Abstracts well** | A published custom-storage seam: specialize `pool_of<T>` (derive a built-in pool and override the cold virtuals, or build from scratch on `basic_pool` — the test suite ships a complete boxed-pool example) and every layer — selections, hooks, bonds, archives — drives your backend unchanged. Pin portable component identity with `quiver_label`/`component_label<T>` (cross-compiler archive keys); read/write any component type-erased via `pool_ref::raw()`. A full compile-time toolkit (`types<>`/`values<>` list algebra, `for_each_type`) powers component **manifests**: `using Saved = types<...>` drives `select`, `pack`/`unpack`/`graft`, and editor loops from one declaration, and every selection exports its lists back (`included`/`excluded`). |
+| **Abstracts well** | A published custom-storage seam: specialize `pool_of<T>` (derive a built-in pool and override the cold virtuals, or build from scratch on `basic_pool` — the test suite ships a complete boxed-pool example) and every layer — selections, hooks, bonds, archives — drives your backend unchanged. Pin portable component identity with `quiver_label`/`component_label<T>` (cross-compiler archive keys); read/write any component type-erased via `pool_ref::raw()`. A full RTTI-free **reflection registry** (`reflect<T>()` fields/methods/constructors, `reflection_of(hash_of-keyed)`) plus `quiver::any` (SBO type-erased value with owning and ref modes) powers editors and property grids — every runtime mismatch answers empty, never aborts. A full compile-time toolkit (`types<>`/`values<>` list algebra, `for_each_type`) powers component **manifests**: `using Saved = types<...>` drives `select`, `pack`/`unpack`/`graft`, and editor loops from one declaration, and every selection exports its lists back (`included`/`excluded`). |
 | **Memory-aware** | `std::pmr::memory_resource*` accepted by world/buffers/trackers — no template ceremony; `footprint()` and per-pool byte counts report honest totals. |
 | **Trustable** | `validate()` audits every internal invariant — including bond partitions — and the tests prove it detects corruption; misuse routes through a replaceable violation handler. |
 | **C++23 native** | Deducing-this collapses the const/non-const API surface, `std::move_only_function` stages, `std::expected` faults, and an experimental `import quiver;` named module (`-DQUIVER_MODULE=ON`). |
 
-What it is **not**: a framework. No scheduler, no reflection, no serializer,
-no scene graph. See [DESIGN.md](DESIGN.md) for the full rationale, the
-invalidation table, and the API originality checklist.
+What it is **not**: a framework. No scheduler, no renderer, no scene graph,
+no RTTI. See [DESIGN.md](DESIGN.md) for the full rationale, the invalidation
+table, and the API originality checklist.
 
 ## Getting started
 
