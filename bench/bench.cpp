@@ -477,6 +477,49 @@ int main()
                                   }
                                   sink += static_cast<std::uint64_t>(acc);
                               }));
+
+        // The structural bridge: add/remove by hash vs the typed verbs.
+        ecs::world w;
+        constexpr std::size_t churn = 10'000;
+        std::vector<ecs::entity> entities(churn);
+        for (auto& e : entities)
+        {
+            e = w.spawn();
+        }
+        report("add via reflection (add_to)",
+               best_ns_per_op(
+                   churn,
+                   [&]
+                   {
+                       for (const ecs::entity e : entities)
+                       {
+                           r.add_to(w, e, ecs::any::make<Transform>(Transform{1, 1}));
+                       }
+                   },
+                   [&]
+                   {
+                       for (const ecs::entity e : entities)
+                       {
+                           w.remove<Transform>(e);
+                       }
+                   }));
+        report("add<Transform> (typed baseline)",
+               best_ns_per_op(
+                   churn,
+                   [&]
+                   {
+                       for (const ecs::entity e : entities)
+                       {
+                           w.add<Transform>(e, Transform{1, 1});
+                       }
+                   },
+                   [&]
+                   {
+                       for (const ecs::entity e : entities)
+                       {
+                           w.remove<Transform>(e);
+                       }
+                   }));
     }
 
     // --- watcher overhead --------------------------------------------------------
