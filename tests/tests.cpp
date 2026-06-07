@@ -3912,6 +3912,11 @@ int main()
 #if QUIVER_CHECKS
     test_watcher_violations();
 #endif
+    test_any_basics();
+    test_reflection_registry();
+    test_reflection_fields();
+    test_reflection_methods();
+    test_reflection_construct();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
