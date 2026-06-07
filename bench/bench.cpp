@@ -29,6 +29,8 @@ struct Transform
 {
     float x = 0;
     float y = 0;
+
+    [[nodiscard]] float sum() const { return x + y; }
 };
 
 struct Velocity
@@ -430,6 +432,50 @@ int main()
                                       n += w.has_any<Transform, Velocity>(e) ? 1 : 0;
                                   }
                                   sink += n;
+                              }));
+    }
+
+    // --- reflection dispatch -----------------------------------------------------
+    {
+        ecs::reflect<Transform>().field<&Transform::x>("x").method<&Transform::sum>("sum");
+        const ecs::reflection r = ecs::reflection_of<Transform>();
+        const ecs::field fx = r.find_field("x");
+        const ecs::method sum = r.find_method("sum");
+        Transform t{1, 2};
+        ecs::any obj = ecs::any::ref(t);
+        constexpr std::size_t hits = 100'000;
+        report("field get via reflection",
+               best_ns_per_op(hits,
+                              [&]
+                              {
+                                  float acc = 0;
+                                  for (std::size_t i = 0; i < hits; ++i)
+                                  {
+                                      acc += fx.get(obj).as<float>();
+                                  }
+                                  sink += static_cast<std::uint64_t>(acc);
+                              }));
+        report("method invoke via reflection",
+               best_ns_per_op(hits,
+                              [&]
+                              {
+                                  float acc = 0;
+                                  for (std::size_t i = 0; i < hits; ++i)
+                                  {
+                                      acc += sum.invoke(obj, {}).as<float>();
+                                  }
+                                  sink += static_cast<std::uint64_t>(acc);
+                              }));
+        report("direct member read (baseline)",
+               best_ns_per_op(hits,
+                              [&]
+                              {
+                                  float acc = 0;
+                                  for (std::size_t i = 0; i < hits; ++i)
+                                  {
+                                      acc += t.x;
+                                  }
+                                  sink += static_cast<std::uint64_t>(acc);
                               }));
     }
 
