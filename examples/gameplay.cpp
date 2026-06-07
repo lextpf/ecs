@@ -11,6 +11,8 @@
 //   5. reinforcements: graft a squad archive into the live world with
 //      entity-handle relinking
 //   6. the inspector: runtime queries, footprint, validate
+//   7. the property grid: reflection-driven field reads and structural
+//      verbs by hash (the editor path)
 //
 // Everything prints deterministically; run it after changes and diff.
 // ============================================================================
@@ -368,6 +370,54 @@ int main()
                     fp.component_bytes,
                     fp.index_bytes);
         std::printf("validate: %s\n", world.validate() ? "OK" : "FAULT");
+    }
+
+    std::puts("=== act 7: the property grid ===");
+    {
+        // Reflection identity == pool identity (the same name hash), so a
+        // registered subset of components becomes an editor property grid:
+        // enumerate with components_of, resolve each pool's hash, and read
+        // fields straight from the live component bytes.
+        ecs::reflect<Health>().field<&Health::value>("value");
+        ecs::reflect<SpriteRef>().field<&SpriteRef::atlas_index>("atlas_index");
+
+        const ecs::entity player = world.select<const PlayerTag>().first();
+        world.components_of(player,
+                            [&](const ecs::pool_info& info)
+                            {
+                                const ecs::reflection type = ecs::reflection_of(info.name_hash);
+                                if (!type)
+                                {
+                                    return;  // unregistered: not for this grid
+                                }
+                                void* bytes = world.find_pool(info.id).raw(player);
+                                type.each_field(
+                                    [&](const ecs::field& f)
+                                    {
+                                        const ecs::any value = f.get_at(bytes);
+                                        long long shown = 0;
+                                        if (const int* i = value.try_as<int>())
+                                        {
+                                            shown = *i;
+                                        }
+                                        else if (const auto* u = value.try_as<std::uint32_t>())
+                                        {
+                                            shown = *u;
+                                        }
+                                        std::printf("  %.*s.%.*s = %lld\n",
+                                                    static_cast<int>(type.name().size()),
+                                                    type.name().data(),
+                                                    static_cast<int>(f.name().size()),
+                                                    f.name().data(),
+                                                    shown);
+                                    });
+                            });
+
+        // Structural verbs work by hash too: a "remove component" button.
+        const ecs::reflection sprite = ecs::reflection_of<SpriteRef>();
+        std::printf("remove SpriteRef via reflection: %s\n",
+                    sprite.remove_from(world, player) ? "ok" : "refused");
+        std::printf("still has SpriteRef: %s\n", sprite.present_on(world, player) ? "yes" : "no");
     }
     return world.validate() ? 0 : 1;
 }
