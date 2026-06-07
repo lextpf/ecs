@@ -8612,6 +8612,16 @@ struct ctor_node
     any (*construct)(std::span<any> args);
 };
 
+// The meta×ECS bridge: structural verbs by hash, captured when reflect<T>()
+// sees a component type. Alive-gated and presence-gated so editor calls
+// refuse with false instead of tripping checked violations.
+struct ecs_bridge
+{
+    bool (*add_to)(world& w, entity e, any& value) = nullptr;
+    bool (*remove_from)(world& w, entity e) = nullptr;
+    bool (*present_on)(const world& w, entity e) = nullptr;
+};
+
 struct type_node
 {
     std::uint64_t hash = 0;
@@ -8621,6 +8631,7 @@ struct type_node
     std::vector<field_node> fields;
     std::vector<method_node> methods;
     std::vector<ctor_node> ctors;
+    ecs_bridge ecs;
 };
 
 // Sorted by hash; nodes are heap-stable so handles survive registrations.
@@ -8704,6 +8715,19 @@ public:
             return false;
         }
         return node_->set(object.data(), value);
+    }
+
+    // Raw-pointer forms for LIVE components (pool_ref::raw bytes): the
+    // caller vouches that object points at the owner type, and the pointer
+    // obeys the pool's invalidation rules like any component reference.
+    [[nodiscard]] any get_at(const void* object) const
+    {
+        return node_ != nullptr ? node_->get(object) : any{};
+    }
+
+    bool set_at(void* object, const any& value) const
+    {
+        return node_ != nullptr && node_->set(object, value);
     }
 
 private:
@@ -8836,6 +8860,28 @@ public:
             }
         }
         return {};
+    }
+
+    // --- the meta×ECS bridge (captured for component types) ---
+    // add_to moves the payload in (an EMPTY any default-constructs, and is
+    // how tags add); every verb is alive- and presence-gated so editor calls
+    // answer false instead of tripping checked violations. Mid-iteration
+    // calls hit the same rules as the typed verbs — editors mutate between
+    // frames.
+    bool add_to(world& w, entity e, any value) const
+    {
+        return node_ != nullptr && node_->ecs.add_to != nullptr && node_->ecs.add_to(w, e, value);
+    }
+
+    bool remove_from(world& w, entity e) const
+    {
+        return node_ != nullptr && node_->ecs.remove_from != nullptr &&
+               node_->ecs.remove_from(w, e);
+    }
+
+    [[nodiscard]] bool present_on(const world& w, entity e) const noexcept
+    {
+        return node_ != nullptr && node_->ecs.present_on != nullptr && node_->ecs.present_on(w, e);
     }
 
 private:
@@ -9019,6 +9065,52 @@ reflect_builder<T> reflect()
     node->name = name_of<T>();
     node->size_bytes = sizeof(T);
     node->align = alignof(T);
+    if constexpr (component<T>)
+    {
+        node->ecs.add_to = +[](world& w, entity e, any& value) -> bool
+        {
+            if (!w.alive(e) || w.has<T>(e))
+            {
+                return false;
+            }
+            if constexpr (detail::is_tag_v<T>)
+            {
+                w.add<T>(e);  // membership is the whole payload
+                return true;
+            }
+            else
+            {
+                if (T* payload = value.try_as<T>(); payload != nullptr)
+                {
+                    if constexpr (std::move_constructible<T>)
+                    {
+                        w.add<T>(e, std::move(*payload));
+                        return true;
+                    }
+                    else
+                    {
+                        return false;  // adds move the payload in
+                    }
+                }
+                if (!value.holds())
+                {
+                    if constexpr (std::default_initializable<T>)
+                    {
+                        w.add<T>(e);  // empty any: default-construct
+                        return true;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+                return false;  // payload of the wrong type
+            }
+        };
+        node->ecs.remove_from =
+            +[](world& w, entity e) -> bool { return w.alive(e) && w.remove<T>(e); };
+        node->ecs.present_on = +[](const world& w, entity e) -> bool { return w.has<T>(e); };
+    }
     detail::type_node* raw = node.get();
     nodes.insert(at, std::move(node));
     return reflect_builder<T>(raw);
