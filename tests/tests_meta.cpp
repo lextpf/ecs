@@ -253,3 +253,103 @@ void test_reflection_construct()
     CHECK(static_cast<bool>(ecs::reflection_of<Pos>()));
     CHECK(ecs::reflection_of<Vel>().size_bytes() == sizeof(Vel));
 }
+
+void test_reflection_ecs_fields()
+{
+    section("reflection x ECS: live-component field access");
+    ecs::world w;
+
+    ecs::reflect_all(ecs::types<Hp, TagA>{});
+    const ecs::entity e = w.spawn(Pos{1}, Hp{70});
+    w.add<TagA>(e);
+
+    // get_at / set_at work on raw component bytes from pool_ref::raw — the
+    // property-grid path. (reflect_all registered identity only; the field
+    // arrives through the duplicate-tolerant builder, which reports under a
+    // counting handler and appends to the standing node.)
+    const ecs::reflection rhp = ecs::reflection_of<Hp>();
+    {
+#if QUIVER_CHECKS
+        violation_scope guard;
+#endif
+        ecs::reflect<Hp>().field<&Hp::hp>("hp");
+    }
+    void* bytes = w.find_pool<Hp>().raw(e);
+    CHECK(bytes != nullptr);
+    const ecs::field fhp = rhp.find_field("hp");
+    CHECK(fhp.get_at(bytes).as<int>() == 70);
+    CHECK(fhp.set_at(bytes, ecs::any::make<int>(55)));
+    CHECK(w.get<Hp>(e).hp == 55);
+    CHECK(!fhp.set_at(bytes, ecs::any::make<float>(1.0f)));  // type miss: untouched
+    CHECK(w.get<Hp>(e).hp == 55);
+
+    // The inspector recipe: components_of x reflection_of enumerates exactly
+    // the registered subset (Pos was registered by an earlier suite;
+    // TagA has no payload and yields no raw pointer).
+    std::size_t reflected = 0;
+    std::size_t tags_seen = 0;
+    w.components_of(e,
+                    [&](const ecs::pool_info& info)
+                    {
+                        const ecs::reflection r = ecs::reflection_of(info.name_hash);
+                        if (!r)
+                        {
+                            return;
+                        }
+                        ++reflected;
+                        void* raw = w.find_pool(info.id).raw(e);
+                        if (raw == nullptr)
+                        {
+                            ++tags_seen;
+                        }
+                    });
+    CHECK(reflected == 3);  // Pos, Hp, TagA all registered by this TU
+    CHECK(tags_seen == 1);  // TagA: membership only
+
+    CHECK_VALID(w);
+}
+
+void test_reflection_ecs_verbs()
+{
+    section("reflection x ECS: add/remove/present by hash");
+    ecs::world w;
+
+    const ecs::reflection rhp = ecs::reflection_of<Hp>();
+    const ecs::reflection rtag = ecs::reflection_of<TagA>();
+    const ecs::entity e = w.spawn(Pos{1});
+
+    // add_to moves the payload in; hooks fire through the same verb.
+    ecs::tracker<Hp> arrivals(w);
+    CHECK(rhp.add_to(w, e, ecs::any::make<Hp>(Hp{9})));
+    CHECK(w.get<Hp>(e).hp == 9);
+    CHECK(arrivals.added().size() == 1);
+    CHECK(rhp.present_on(w, e));
+
+    // Double-add and dead-entity adds refuse with false, never a violation.
+    CHECK(!rhp.add_to(w, e, ecs::any::make<Hp>(Hp{1})));
+    const ecs::entity dead = w.spawn();
+    w.kill(dead);
+    CHECK(!rhp.add_to(w, dead, ecs::any::make<Hp>(Hp{1})));
+    CHECK(!rhp.present_on(w, dead));
+
+    // A wrong payload type refuses; an EMPTY any default-constructs.
+    CHECK(!rhp.add_to(w, w.spawn(), ecs::any::make<int>(5)));
+    const ecs::entity fresh = w.spawn();
+    CHECK(rhp.add_to(w, fresh, ecs::any{}));
+    CHECK(w.get<Hp>(fresh).hp == 0);
+
+    // Tags add through an empty any (membership is the whole payload).
+    CHECK(rtag.add_to(w, e, ecs::any{}));
+    CHECK(w.has<TagA>(e));
+
+    // remove_from mirrors remove.
+    CHECK(rhp.remove_from(w, e));
+    CHECK(!rhp.present_on(w, e));
+    CHECK(!rhp.remove_from(w, e));  // second remove: nothing left
+
+    // Types never registered as reflections still answer (empty handle), and
+    // a non-component registration carries no ECS bridge.
+    CHECK(!ecs::reflection_of("meta.never_registered"));
+
+    CHECK_VALID(w);
+}
