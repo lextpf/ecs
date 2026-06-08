@@ -250,3 +250,6 @@ void test_reflection_methods();
 void test_reflection_construct();
 void test_reflection_ecs_fields();
 void test_reflection_ecs_verbs();
+
+// tests_traits.cpp (M7: entity-traits templating)
+void test_traits_entity_layouts();
