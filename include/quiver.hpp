@@ -1370,7 +1370,11 @@ static_assert(entity_table::max_slots == provisional_bit - 1);
 // is cold-path only: kill / purge / reset / shrink / inspect / validate.
 // ----------------------------------------------------------------------------
 
-class pool_base;
+template <entity_traits Traits>
+class basic_pool_base;
+
+template <entity_traits Traits>
+class basic_single_pool_lock;
 
 // The default sorting algorithm, injectable through world::sort's Algorithm
 // parameter. Replacements must permute the random-access range exactly as a
@@ -1392,8 +1396,11 @@ struct std_sort
 // views degrade to empty instead of dangling. The owner array is bounded so
 // the object stays allocation-free and debugger-plain; pairs (N = 2) are
 // the common case and generate exactly the historical two-pool work.
-struct group_core
+template <entity_traits Traits>
+struct basic_group_core
 {
+    using pool_base = basic_pool_base<Traits>;
+
     static constexpr std::uint32_t max_owners = 8;
 
     std::array<pool_base*, max_owners> owners{};
@@ -1413,14 +1420,23 @@ struct group_core
     }
 };
 
-class pool_base
+using group_core = basic_group_core<default_entity_traits>;
+
+template <entity_traits Traits>
+class basic_pool_base
 {
 public:
-    pool_base(std::pmr::memory_resource* memory,
-              std::string_view name,
-              std::uint64_t name_hash,
-              storage kind,
-              std::size_t item_bytes) noexcept
+    using entity = quiver::basic_entity<Traits>;
+    using entity_table = basic_entity_table<Traits>;
+    using group_core = basic_group_core<Traits>;
+    using pool_base = basic_pool_base;  // the historical body spelling
+    using single_pool_lock = basic_single_pool_lock<Traits>;
+
+    basic_pool_base(std::pmr::memory_resource* memory,
+                    std::string_view name,
+                    std::uint64_t name_hash,
+                    storage kind,
+                    std::size_t item_bytes) noexcept
         : sparse_(memory),
           dense_(memory),
           memory_(memory),
@@ -1431,9 +1447,9 @@ public:
     {
     }
 
-    virtual ~pool_base() = default;
-    pool_base(const pool_base&) = delete;
-    pool_base& operator=(const pool_base&) = delete;
+    virtual ~basic_pool_base() = default;
+    basic_pool_base(const basic_pool_base&) = delete;
+    basic_pool_base& operator=(const basic_pool_base&) = delete;
 
     // --- hot, non-virtual membership ---
 
@@ -1733,7 +1749,8 @@ protected:
     }
 
     friend class quiver::world;
-    friend class single_pool_lock;
+    template <entity_traits>
+    friend class basic_single_pool_lock;
     friend class quiver::runtime_selection;
     template <class Excludes, class... Ts>
     friend class quiver::selection_t;
@@ -1787,12 +1804,15 @@ protected:
     mutable std::uint32_t locks_ = 0;  // running iterations that include this pool
 };
 
+using pool_base = basic_pool_base<default_entity_traits>;
+
 // RAII iteration lock over one pool (children_of and friends). Counter
 // maintenance is compiled out with QUIVER_CHECKS off, like selection locks.
-class single_pool_lock
+template <entity_traits Traits>
+class basic_single_pool_lock
 {
 public:
-    explicit single_pool_lock(const pool_base* pool) noexcept
+    explicit basic_single_pool_lock(const basic_pool_base<Traits>* pool) noexcept
         : pool_(pool)
     {
         if constexpr (checks_enabled)
@@ -1801,7 +1821,7 @@ public:
         }
     }
 
-    ~single_pool_lock()
+    ~basic_single_pool_lock()
     {
         if constexpr (checks_enabled)
         {
@@ -1809,17 +1829,20 @@ public:
         }
     }
 
-    single_pool_lock(const single_pool_lock&) = delete;
-    single_pool_lock& operator=(const single_pool_lock&) = delete;
+    basic_single_pool_lock(const basic_single_pool_lock&) = delete;
+    basic_single_pool_lock& operator=(const basic_single_pool_lock&) = delete;
 
 private:
-    const pool_base* pool_;
+    const basic_pool_base<Traits>* pool_;
 };
+
+using single_pool_lock = basic_single_pool_lock<default_entity_traits>;
 
 // Hook dispatch runs under the pool's iteration lock: a hook structurally
 // mutating its own pool is a reported violation, not UB. Hooks must not throw
 // (several call sites are noexcept).
-inline void pool_base::dispatch_if(const std::vector<hook_entry>* list, entity e)
+template <entity_traits Traits>
+void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, entity e)
 {
     if (list == nullptr || list->empty())
     {
@@ -1837,16 +1860,38 @@ inline void pool_base::dispatch_if(const std::vector<hook_entry>* list, entity e
 }
 
 // Packed: components in one dense vector parallel to the entity array.
-template <component T>
-class packed_pool : public pool_base
+// The Traits default keeps every existing spelling (packed_pool<T>) intact.
+template <component T, entity_traits Traits = default_entity_traits>
+class packed_pool : public basic_pool_base<Traits>
 {
 public:
     static_assert(std::is_move_constructible_v<T>,
                   "quiver: packed storage moves components on add/remove; give T a move "
                   "constructor or select quiver::storage::stable for it");
 
+    using base = basic_pool_base<Traits>;
+    using entity = typename base::entity;
+    using entity_table = typename base::entity_table;
+    using base::contains;
+    using base::entity_at;
+
+protected:
+    using base::attach;
+    using base::check_membership;
+    using base::detach;
+    using base::dense_;
+    using base::fire_add;
+    using base::fire_remove;
+    using base::fire_remove_all;
+    using base::memory_;
+    using base::name_;
+    using base::sort_dense_impl;
+    using base::sparse_;
+    using base::swap_dense;
+
+public:
     explicit packed_pool(std::pmr::memory_resource* memory) noexcept
-        : pool_base(memory, name_of<T>(), hash_of<T>(), storage::packed, sizeof(T)),
+        : base(memory, name_of<T>(), hash_of<T>(), storage::packed, sizeof(T)),
           items_(memory)
     {
     }
@@ -2000,12 +2045,31 @@ private:
 };
 
 // Tag: membership only.
-template <component T>
-class tag_pool : public pool_base
+template <component T, entity_traits Traits = default_entity_traits>
+class tag_pool : public basic_pool_base<Traits>
 {
 public:
+    using base = basic_pool_base<Traits>;
+    using entity = typename base::entity;
+    using entity_table = typename base::entity_table;
+    using base::contains;
+    using base::entity_at;
+
+protected:
+    using base::attach;
+    using base::check_membership;
+    using base::detach;
+    using base::dense_;
+    using base::fire_add;
+    using base::fire_remove;
+    using base::fire_remove_all;
+    using base::sort_dense_impl;
+    using base::sparse_;
+    using base::swap_dense;
+
+public:
     explicit tag_pool(std::pmr::memory_resource* memory) noexcept
-        : pool_base(memory, name_of<T>(), hash_of<T>(), storage::tag, 0)
+        : base(memory, name_of<T>(), hash_of<T>(), storage::tag, 0)
     {
     }
 
@@ -2068,16 +2132,37 @@ public:
 
 // Stable: components in fixed chunks that never move. The dense entity array
 // is mirrored by a dense slot array; a free list recycles vacated slots.
-template <component T>
-class stable_pool : public pool_base
+template <component T, entity_traits Traits = default_entity_traits>
+class stable_pool : public basic_pool_base<Traits>
 {
+public:
+    using base = basic_pool_base<Traits>;
+    using entity = typename base::entity;
+    using entity_table = typename base::entity_table;
+    using base::contains;
+    using base::entity_at;
+
+protected:
+    using base::attach;
+    using base::check_membership;
+    using base::detach;
+    using base::dense_;
+    using base::fire_add;
+    using base::fire_remove;
+    using base::fire_remove_all;
+    using base::memory_;
+    using base::name_;
+    using base::sort_dense_impl;
+    using base::sparse_;
+    using base::swap_dense;
+
 public:
     // Per-component via quiver::chunk_capacity<T>; defaults to ~4 KiB chunks.
     static constexpr std::size_t chunk_items = chunk_capacity<T>;
     static_assert(chunk_items > 0, "quiver: chunk_capacity<T> must be at least 1");
 
     explicit stable_pool(std::pmr::memory_resource* memory) noexcept
-        : pool_base(memory, name_of<T>(), hash_of<T>(), storage::stable, sizeof(T)),
+        : base(memory, name_of<T>(), hash_of<T>(), storage::stable, sizeof(T)),
           slot_of_(memory),
           chunks_(memory),
           free_slots_(memory)
@@ -2330,11 +2415,13 @@ private:
     std::size_t slot_count_ = 0;  // slots handed out so far (used + free)
 };
 
-template <component T>
-using pool_for = std::conditional_t<
-    storage_policy<T> == storage::tag,
-    tag_pool<T>,
-    std::conditional_t<storage_policy<T> == storage::stable, stable_pool<T>, packed_pool<T>>>;
+template <component T, entity_traits Traits = default_entity_traits>
+using pool_for =
+    std::conditional_t<storage_policy<T> == storage::tag,
+                       tag_pool<T, Traits>,
+                       std::conditional_t<storage_policy<T> == storage::stable,
+                                          stable_pool<T, Traits>,
+                                          packed_pool<T, Traits>>>;
 }  // namespace detail
 
 // ----------------------------------------------------------------------------
@@ -2375,26 +2462,30 @@ using pool_for = std::conditional_t<
 
 using basic_pool = detail::pool_base;
 
-template <component T>
-using packed_pool_of = detail::packed_pool<T>;
-template <component T>
-using stable_pool_of = detail::stable_pool<T>;
-template <component T>
-using tag_pool_of = detail::tag_pool<T>;
+// Every seam name carries a defaulted Traits parameter, so existing
+// specializations and derivations keep their spellings; a `template <>
+// struct pool_of<T> { ... };` specializes the default-traits pool exactly
+// as before.
+template <component T, entity_traits Traits = default_entity_traits>
+using packed_pool_of = detail::packed_pool<T, Traits>;
+template <component T, entity_traits Traits = default_entity_traits>
+using stable_pool_of = detail::stable_pool<T, Traits>;
+template <component T, entity_traits Traits = default_entity_traits>
+using tag_pool_of = detail::tag_pool<T, Traits>;
 
-template <class T>
+template <class T, entity_traits Traits = default_entity_traits>
 struct pool_of
 {
-    using type = detail::pool_for<T>;
+    using type = detail::pool_for<T, Traits>;
 };
 
-template <class T>
-using pool_of_t = pool_of<T>::type;  // alias-declarations are typename-optional in C++20
+template <class T, entity_traits Traits = default_entity_traits>
+using pool_of_t = pool_of<T, Traits>::type;  // alias-declarations: typename-optional in C++20
 
 // What world registration requires of a pool_of specialization.
-template <class P>
-concept component_pool =
-    std::derived_from<P, basic_pool> && std::constructible_from<P, std::pmr::memory_resource*>;
+template <class P, class Traits = default_entity_traits>
+concept component_pool = std::derived_from<P, detail::basic_pool_base<Traits>> &&
+                         std::constructible_from<P, std::pmr::memory_resource*>;
 
 namespace detail
 {
@@ -9221,7 +9312,10 @@ struct test_access
     template <component T>
     static void corrupt_sparse(world& w, entity e)
     {
-        w.peek_pool<T>()->sparse_.set(e.index(), detail::npos32 - 1);
+        // Through the BASE pointer: test_access is the base's friend, and the
+        // derived pools' using-declarations are their own access path.
+        static_cast<detail::pool_base*>(w.peek_pool<T>())->sparse_.set(e.index(),
+                                                                       detail::npos32 - 1);
     }
 
     static void corrupt_generation(world& w, entity e) { ++w.table_.generation_[e.index()]; }
@@ -9229,7 +9323,7 @@ struct test_access
     template <component T>
     static std::uint32_t lock_count(const world& w)
     {
-        const auto* pool = w.peek_pool<T>();
+        const detail::pool_base* pool = w.peek_pool<T>();
         return pool == nullptr ? 0 : pool->locks_;
     }
 
@@ -9238,7 +9332,7 @@ struct test_access
     template <component T>
     static void corrupt_bond(world& w)
     {
-        auto* pool = w.peek_pool<T>();
+        detail::pool_base* pool = w.peek_pool<T>();
         pool->swap_dense(0, 1);  // dense+sparse stay consistent; the mirror breaks
     }
 };
