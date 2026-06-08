@@ -86,6 +86,7 @@
 #include <cstdlib>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <new>
@@ -391,54 +392,119 @@ template <auto V, auto... Vs>
 namespace detail
 {
 inline constexpr std::uint32_t npos32 = 0xFFFFFFFFu;
-// The 32+32 handle layout is FIXED, and four mechanisms are welded to it.
-// Anyone forking for a different layout must redesign all four:
-//   1. bit 31 of the index marks provisional handles issued by
-//      command_buffer::spawn(), so real slot indices stay below 2^31;
-//   2. provisional handles carry their buffer's nonce in the generation field
-//      (world::apply refuses foreign/pre-clear provisionals through it);
-//   3. entity_table::max_slots is therefore 2^31 - 1;
-//   4. entity::bits() defines the stable 64-bit hash/serialization encoding.
+// The default 32+32 handle layout has four mechanisms welded to it; under
+// entity TRAITS those welds become the documented per-traits contract:
+//   1. one index bit above index_bits marks provisional handles issued by
+//      command_buffer::spawn() (the traits concept RESERVES that spare bit),
+//      so real slot indices stay below 2^index_bits;
+//   2. provisional handles carry their buffer's nonce in the generation
+//      field (world::apply refuses foreign/pre-clear provisionals through
+//      it; narrower generation types narrow the nonce, which is misuse
+//      detection, not security);
+//   3. entity_table::max_slots is therefore 2^index_bits - 1;
+//   4. bits() packs index and generation into one stable 64-bit encoding
+//      for hashing and serialization (the traits concept caps the total at
+//      64 bits).
 inline constexpr std::uint32_t provisional_bit = 0x80000000u;
 }  // namespace detail
 
-class entity
+// The handle layout contract. Widths choose field TYPES, not shift math —
+// a basic_entity stays two plain fields, readable in any debugger, at every
+// width. The defaults are quiver's classic 31-bit slots + 32-bit
+// generations in 8 bytes.
+struct default_entity_traits
+{
+    using index_type = std::uint32_t;
+    using generation_type = std::uint32_t;
+    static constexpr std::uint32_t index_bits = 31;
+};
+
+template <class Traits>
+concept entity_traits =
+    std::unsigned_integral<typename Traits::index_type> &&
+    std::unsigned_integral<typename Traits::generation_type> && (Traits::index_bits >= 1) &&
+    // One spare index bit is RESERVED for the provisional flag (weld #1).
+    (Traits::index_bits <
+     static_cast<std::uint32_t>(std::numeric_limits<typename Traits::index_type>::digits)) &&
+    // bits() must pack losslessly into 64 (weld #4).
+    (Traits::index_bits + static_cast<std::uint32_t>(
+                              std::numeric_limits<typename Traits::generation_type>::digits) <=
+     64);
+
+namespace detail
+{
+// The per-traits constants the welds generalize to. For the default traits
+// these reproduce npos32 / provisional_bit / 2^31-1 exactly.
+template <entity_traits Traits>
+struct entity_limits
+{
+    using index_type = typename Traits::index_type;
+    static constexpr index_type npos = std::numeric_limits<index_type>::max();
+    static constexpr index_type provisional_bit = index_type{1} << Traits::index_bits;
+    static constexpr index_type max_slots = provisional_bit - 1;
+};
+}  // namespace detail
+
+template <entity_traits Traits>
+class basic_entity
 {
 public:
-    static constexpr std::uint32_t index_bits = 31;  // bit 31: provisional flag
-    static constexpr std::uint32_t generation_bits =
-        32;  // carries the buffer nonce in provisionals
+    using traits_type = Traits;
+    using index_type = typename Traits::index_type;
+    using generation_type = typename Traits::generation_type;
 
-    constexpr entity() noexcept = default;  // == no_entity
+    static constexpr std::uint32_t index_bits = Traits::index_bits;  // above: provisional flag
+    static constexpr std::uint32_t generation_bits = static_cast<std::uint32_t>(
+        std::numeric_limits<generation_type>::digits);  // carries the buffer nonce in provisionals
 
-    constexpr entity(std::uint32_t index, std::uint32_t generation) noexcept
+    constexpr basic_entity() noexcept = default;  // == the null handle
+
+    constexpr basic_entity(index_type index, generation_type generation) noexcept
         : index_(index),
           generation_(generation)
     {
     }
 
-    [[nodiscard]] constexpr std::uint32_t index() const noexcept { return index_; }
-    [[nodiscard]] constexpr std::uint32_t generation() const noexcept { return generation_; }
+    [[nodiscard]] constexpr index_type index() const noexcept { return index_; }
+    [[nodiscard]] constexpr generation_type generation() const noexcept { return generation_; }
 
     // Stable 64-bit encoding, handy for hashing and serialization.
     [[nodiscard]] constexpr std::uint64_t bits() const noexcept
     {
-        return (static_cast<std::uint64_t>(index_) << 32) | generation_;
+        return (static_cast<std::uint64_t>(index_) << generation_bits) |
+               static_cast<std::uint64_t>(generation_);
     }
 
-    // True for any handle other than no_entity (says nothing about liveness;
-    // ask world::alive for that).
-    constexpr explicit operator bool() const noexcept { return index_ != detail::npos32; }
+    // True for any handle other than the null handle (says nothing about
+    // liveness; ask world::alive for that).
+    constexpr explicit operator bool() const noexcept
+    {
+        return index_ != detail::entity_limits<Traits>::npos;
+    }
 
-    friend constexpr bool operator==(entity, entity) noexcept = default;
-    friend constexpr auto operator<=>(entity, entity) noexcept = default;
+    friend constexpr bool operator==(basic_entity, basic_entity) noexcept = default;
+    friend constexpr auto operator<=>(basic_entity, basic_entity) noexcept = default;
 
 private:
-    std::uint32_t index_ = detail::npos32;
-    std::uint32_t generation_ = 0;
+    index_type index_ = detail::entity_limits<Traits>::npos;
+    generation_type generation_ = 0;
 };
 
+// The classic handle: 8 bytes, 31-bit slots, 32-bit generations. Everything
+// in this header that is not yet basic_-templated runs on this alias.
+using entity = basic_entity<default_entity_traits>;
+
 inline constexpr entity no_entity{};
+
+// The alias-identity pins: the traits machinery must reproduce the historic
+// layout and encoding bit for bit.
+static_assert(sizeof(entity) == 8);
+static_assert(entity::index_bits == 31 && entity::generation_bits == 32);
+static_assert(entity{5, 7}.bits() == ((std::uint64_t{5} << 32) | 7));
+static_assert(!entity{} && entity{0, 0}.index() == 0);
+static_assert(detail::entity_limits<default_entity_traits>::npos == detail::npos32);
+static_assert(detail::entity_limits<default_entity_traits>::provisional_bit ==
+              detail::provisional_bit);
 
 namespace detail
 {
@@ -9162,24 +9228,27 @@ struct test_access
 };
 #endif
 
-// Named hasher mirroring std::hash<entity>. Exists for module builds, where
-// some toolchains do not surface global-module-fragment std::hash
-// specializations to importers: std::unordered_set<entity, entity_hash>
-// works everywhere.
-struct entity_hash
+// Named hasher mirroring std::hash<basic_entity<...>>. Exists for module
+// builds, where some toolchains do not surface global-module-fragment
+// std::hash specializations to importers:
+// std::unordered_set<entity, entity_hash> works everywhere.
+template <entity_traits Traits>
+struct basic_entity_hash
 {
-    [[nodiscard]] std::size_t operator()(entity e) const noexcept
+    [[nodiscard]] std::size_t operator()(basic_entity<Traits> e) const noexcept
     {
         return std::hash<std::uint64_t>{}(e.bits());
     }
 };
 
+using entity_hash = basic_entity_hash<default_entity_traits>;
+
 }  // namespace quiver
 
-template <>
-struct std::hash<quiver::entity>
+template <quiver::entity_traits Traits>
+struct std::hash<quiver::basic_entity<Traits>>
 {
-    [[nodiscard]] std::size_t operator()(quiver::entity e) const noexcept
+    [[nodiscard]] std::size_t operator()(quiver::basic_entity<Traits> e) const noexcept
     {
         return std::hash<std::uint64_t>{}(e.bits());
     }
