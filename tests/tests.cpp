@@ -3919,6 +3919,7 @@ int main()
     test_reflection_construct();
     test_reflection_ecs_fields();
     test_reflection_ecs_verbs();
+    test_traits_entity_layouts();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed == 0 ? 0 : 1;
