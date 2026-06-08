@@ -508,9 +508,11 @@ static_assert(detail::entity_limits<default_entity_traits>::provisional_bit ==
 
 namespace detail
 {
-[[nodiscard]] constexpr bool is_provisional(entity e) noexcept
+template <entity_traits Traits>
+[[nodiscard]] constexpr bool is_provisional(basic_entity<Traits> e) noexcept
 {
-    return (e.index() & provisional_bit) != 0 && e.index() != npos32;
+    return (e.index() & entity_limits<Traits>::provisional_bit) != 0 &&
+           e.index() != entity_limits<Traits>::npos;
 }
 }  // namespace detail
 
@@ -1098,12 +1100,24 @@ private:
 // slot is no longer free. Amortized O(1), and no free-list surgery on restore.
 // ----------------------------------------------------------------------------
 
-class entity_table
+template <entity_traits Traits>
+class basic_entity_table
 {
 public:
-    static constexpr std::uint32_t max_slots = 0x7FFFFFFFu;
+    // World-side slot plumbing is 32-bit; wider HANDLES exist standalone
+    // (basic_entity puts no ceiling on index_type), but a table minting them
+    // is the staged remainder of the traits conversion.
+    static_assert(std::numeric_limits<typename Traits::index_type>::digits <= 32,
+                  "quiver: worlds support entity index types up to 32 bits");
 
-    explicit entity_table(std::pmr::memory_resource* memory) noexcept
+    using entity = quiver::basic_entity<Traits>;
+    using index_type = typename Traits::index_type;
+    using generation_type = typename Traits::generation_type;
+
+    static constexpr std::uint32_t max_slots =
+        static_cast<std::uint32_t>(entity_limits<Traits>::max_slots);
+
+    explicit basic_entity_table(std::pmr::memory_resource* memory) noexcept
         : generation_(memory),
           free_flag_(memory),
           free_stack_(memory)
@@ -1111,7 +1125,7 @@ public:
     }
 
     // Moved-from tables are empty and reusable (scalar counters reset too).
-    entity_table(entity_table&& other) noexcept
+    basic_entity_table(basic_entity_table&& other) noexcept
         : generation_(std::move(other.generation_)),
           free_flag_(std::move(other.free_flag_)),
           free_stack_(std::move(other.free_stack_)),
@@ -1122,7 +1136,7 @@ public:
     // Not noexcept: assigning between tables on different memory resources
     // falls back to element-wise moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
-    entity_table& operator=(entity_table&& other)
+    basic_entity_table& operator=(basic_entity_table&& other)
     {
         if (this != &other)
         {
@@ -1137,9 +1151,9 @@ public:
         return *this;
     }
 
-    entity_table(const entity_table&) = delete;
-    entity_table& operator=(const entity_table&) = delete;
-    ~entity_table() = default;
+    basic_entity_table(const basic_entity_table&) = delete;
+    basic_entity_table& operator=(const basic_entity_table&) = delete;
+    ~basic_entity_table() = default;
 
     // O(1) amortized. Never touches component pools (that is what makes bare
     // spawn() legal during iteration).
@@ -1154,21 +1168,21 @@ public:
                 // Pop + claim leaves size+live unchanged: slack is preserved.
                 free_flag_[index] = 0;
                 ++live_;
-                return entity{index, generation_[index]};
+                return entity(static_cast<index_type>(index), generation_[index]);
             }
             // Stale entry: the slot was claimed by restore() after being freed.
         }
         const auto index = static_cast<std::uint32_t>(generation_.size());
-        if (index >= max_slots)  // unconditional: index bit 31 is reserved
+        if (index >= max_slots)  // unconditional: the provisional index bit is reserved
         {
-            violate("entity table is full (2^31 - 1 slots)");
+            violate("entity table is full (2^index_bits - 1 slots)");
             std::abort();  // fatal even with a returning handler: no valid handle exists
         }
         generation_.push_back(0);
         free_flag_.push_back(0);
         ++live_;
         ensure_destroy_slack();  // pay for the future destroy here, where we allocate anyway
-        return entity{index, 0};
+        return entity(static_cast<index_type>(index), 0);
     }
 
     // O(1). The generation bump is what invalidates outstanding handles.
@@ -1177,7 +1191,7 @@ public:
     // NOLINTNEXTLINE(bugprone-exception-escape) -- nofail push_back: slack invariant above
     void destroy(std::uint32_t index) noexcept
     {
-        ++generation_[index];  // wraps mod 2^32 by design
+        ++generation_[index];  // wraps mod 2^generation_bits by design
         free_flag_[index] = 1;
         free_stack_.push_back(index);
         --live_;
@@ -1195,7 +1209,7 @@ public:
         return index < generation_.size() && free_flag_[index] == 0;
     }
 
-    [[nodiscard]] std::uint32_t generation_at(std::uint32_t index) const noexcept
+    [[nodiscard]] generation_type generation_at(std::uint32_t index) const noexcept
     {
         return generation_[index];
     }
@@ -1281,7 +1295,7 @@ public:
 
     [[nodiscard]] std::size_t bytes() const noexcept
     {
-        return (generation_.capacity() * sizeof(std::uint32_t)) + free_flag_.capacity() +
+        return (generation_.capacity() * sizeof(generation_type)) + free_flag_.capacity() +
                (free_stack_.capacity() * sizeof(std::uint32_t));
     }
 
@@ -1337,13 +1351,15 @@ private:
         }
     }
 
-    std::pmr::vector<std::uint32_t> generation_;
+    std::pmr::vector<generation_type> generation_;
     std::pmr::vector<std::uint8_t> free_flag_;  // 1 = free
     std::pmr::vector<std::uint32_t> free_stack_;
     std::size_t live_ = 0;
 };
 
-// Invariant 3 of the fixed handle layout (see the comment at provisional_bit).
+using entity_table = basic_entity_table<default_entity_traits>;
+
+// Invariant 3 of the handle layout (see the comment at provisional_bit).
 static_assert(entity_table::max_slots == provisional_bit - 1);
 
 // ----------------------------------------------------------------------------
