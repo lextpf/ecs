@@ -19,8 +19,12 @@ export module quiver;
 export namespace quiver
 {
 // core
+using quiver::basic_entity;
+using quiver::basic_entity_hash;
 using quiver::checks_enabled;
+using quiver::default_entity_traits;
 using quiver::entity;
+using quiver::entity_traits;
 using quiver::no_entity;
 using quiver::world;
 // compile-time toolkit
