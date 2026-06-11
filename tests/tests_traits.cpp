@@ -187,6 +187,69 @@ void test_traits_compact_world()
     CHECK_VALID(fresh);
 }
 
+void test_traits_wide_world()
+{
+    section("entity traits: a wide 48:16 world end-to-end");
+    using wide_world = ecs::basic_world<wide_traits>;
+    wide_world w;
+
+    // The verbs run on 8-byte handles with 48-bit slots.
+    const wide_entity e = w.spawn(Pos{1}, Vel{10});
+    const wide_entity f = w.spawn(Pos{2});
+    CHECK(w.alive(e) && w.alive(f));
+    CHECK(w.get<Pos>(e).x == 1);
+
+    std::size_t rows = 0;
+    w.select<Pos>().each([&](wide_entity ent, Pos&) { rows += w.alive(ent) ? 1 : 0; });
+    CHECK(rows == 2);
+
+    // Bonds mirror-partition at the wide width.
+    w.bond<Pos, Vel>();
+    CHECK((w.bonded<Pos, Vel>().count() == 1));
+
+    // Command buffers mint provisionals at the traits' spare bit (bit 48).
+    ecs::basic_command_buffer<wide_traits> cmd;
+    const wide_entity prov = cmd.spawn(Pos{3}, Hp{7});
+    CHECK((prov.index() & (std::uint64_t{1} << 48)) != 0);
+    const auto applied = w.apply(cmd);
+    CHECK(applied.applied == 3);
+    CHECK(w.select<Pos>().count() == 3);
+
+    // restore_entity claims a slot far past 2^16; the paged sparse index
+    // touches one 32 KiB page for it, and current_handle round-trips the
+    // wide slot. (Slots are dense per high-water mark — keep it modest.)
+    const wide_entity far{std::uint64_t{1} << 20, std::uint16_t{5}};
+    CHECK(w.restore_entity(far).has_value());
+    CHECK(w.alive(far));
+    CHECK(w.current_handle(far.index()) == far);
+    w.add<Pos>(far, Pos{9});
+    CHECK(w.get<Pos>(far).x == 9);
+    w.kill(far);
+    CHECK(!w.alive(far));
+
+    // Archives round-trip under the wide layout stamp.
+    byte_writer out;
+    ecs::pack<Pos, Vel, Hp>(w, out);
+    wide_world fresh;
+    byte_reader in{&out.data};
+    CHECK((ecs::unpack<Pos, Vel, Hp>(fresh, in).has_value()));
+    CHECK(fresh.live_count() == w.live_count());
+
+    // A compact stream refuses to load into a wide world.
+    ecs::basic_world<compact_traits> compact;
+    compact.spawn(Pos{4});
+    byte_writer compact_out;
+    ecs::pack<Pos>(compact, compact_out);
+    wide_world wrong;
+    byte_reader compact_in{&compact_out.data};
+    const auto refused = ecs::unpack<Pos>(wrong, compact_in);
+    CHECK(!refused.has_value());
+    CHECK(refused.error().code == ecs::fault_code::archive_mismatch);
+
+    CHECK_VALID(w);
+    CHECK_VALID(fresh);
+}
+
 void test_traits_relink()
 {
     section("entity traits: graft relinks under custom layouts");

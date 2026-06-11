@@ -4006,6 +4006,7 @@ int main()
     test_reflection_ecs_verbs();
     test_traits_entity_layouts();
     test_traits_compact_world();
+    test_traits_wide_world();
     test_traits_relink();
 
     std::printf("%d checks, %d failed\n", checks_run, checks_failed);
