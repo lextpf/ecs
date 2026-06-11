@@ -1958,6 +1958,22 @@ static void test_blueprint()
         CHECK(braced.size() == 1);
     }
     CHECK(Counted::total_ctors == Counted::total_dtors);
+
+    // Batch stamping: spawn(recipe, count) stamps count entities; the
+    // callback form hands each one back after its full stamp.
+    ecs::blueprint swarm{Pos{8}};
+    const std::size_t before = w.select<Pos>().count();
+    w.spawn(swarm, 4);
+    CHECK(w.select<Pos>().count() == before + 4);
+
+    std::vector<ecs::entity> drones;
+    w.spawn(swarm, 3, [&](ecs::entity e) { drones.push_back(e); });
+    CHECK(drones.size() == 3);
+    w.get<Pos>(drones[1]).x = 80;  // post-stamp tweaks stay per-entity
+    CHECK(w.get<Pos>(drones[0]).x == 8 && w.get<Pos>(drones[2]).x == 8);
+
+    w.spawn(swarm, 0);  // a zero-count batch is a no-op
+    CHECK(w.select<Pos>().count() == before + 7);
     CHECK_VALID(w);
 }
 

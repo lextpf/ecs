@@ -5546,6 +5546,30 @@ public:
         return e;
     }
 
+    // Stamps a recipe count times; a zero count is a no-op. Recipe ops are
+    // type-erased, so pools grow on demand — pre-size big batches with
+    // reserve<T>(n) per recorded component. Same iteration rules as spawn
+    // with components. O(count * recorded components).
+    void spawn(const blueprint& recipe, std::size_t count)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            spawn(recipe);
+        }
+    }
+
+    // The same, handing each entity back after its full stamp — the hook for
+    // post-stamp tweaks and handle collection.
+    template <class F>
+        requires std::invocable<F&, basic_entity<Traits>>
+    void spawn(const blueprint& recipe, std::size_t count, F&& fn)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            fn(spawn(recipe));
+        }
+    }
+
     // Spawns a copy of src: every copy-constructible component is duplicated
     // (parent/child links are NOT — clones start as unlinked roots), and
     // components that cannot be copied are counted in `skipped`. Structural
