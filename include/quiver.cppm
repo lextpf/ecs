@@ -21,6 +21,7 @@ export namespace quiver
 // core
 using quiver::basic_entity;
 using quiver::basic_entity_hash;
+using quiver::basic_world;
 using quiver::checks_enabled;
 using quiver::default_entity_traits;
 using quiver::entity;
@@ -70,28 +71,37 @@ using quiver::violation_handler;
 // queries
 using quiver::any_of;
 using quiver::bonded_view;
+using quiver::basic_bonded_view;
 using quiver::bonded_view_t;
 using quiver::except;
 using quiver::maybe;
 using quiver::selection;
+using quiver::basic_selection;
 using quiver::selection_t;
 // runtime queries + inspection
 using quiver::memory_footprint;
 using quiver::pool_info;
+using quiver::basic_pool_ref;
 using quiver::pool_ref;
+using quiver::basic_runtime_selection;
 using quiver::runtime_selection;
 // deferred work + spawn tooling
 using quiver::apply_result;
+using quiver::basic_blueprint;
 using quiver::blueprint;
+using quiver::basic_command_buffer;
 using quiver::command_buffer;
 using quiver::duplicate_result;
 // hooks + trackers + watchers
 using quiver::changed;
+using quiver::basic_component_hook;
 using quiver::component_hook;
 using quiver::hook_token;
+using quiver::basic_scoped_hook;
 using quiver::scoped_hook;
 using quiver::track;
 using quiver::tracker;
+using quiver::basic_watcher;
 using quiver::watcher;
 using quiver::operator|;
 using quiver::operator&;
@@ -101,6 +111,7 @@ using quiver::archive_reader_for;
 using quiver::archive_writer;
 using quiver::archive_writer_for;
 using quiver::graft;
+using quiver::basic_graft_map;
 using quiver::graft_map;
 using quiver::pack;
 using quiver::relink_traits;
@@ -110,6 +121,7 @@ using quiver::basic_entity_ref;
 using quiver::const_entity_ref;
 using quiver::entity_ref;
 using quiver::globals_mark;
+using quiver::basic_pipeline;
 using quiver::pipeline;
 // any + reflection
 using quiver::any;

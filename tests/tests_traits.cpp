@@ -81,3 +81,76 @@ void test_traits_entity_layouts()
     CHECK(seen.contains(c));
     CHECK(std::hash<wide_entity>{}(w) == std::hash<std::uint64_t>{}(w.bits()));
 }
+
+void test_traits_compact_world()
+{
+    section("entity traits: a compact 15:16 world end-to-end");
+    using compact_world = ecs::basic_world<compact_traits>;
+    compact_world w;
+
+    // The verbs run on 4-byte handles; component types are shared across
+    // worlds of different traits (type ids are process-wide).
+    const compact_entity e = w.spawn();
+    CHECK(w.alive(e));
+    w.add<Pos>(e, Pos{1});
+    CHECK(w.get<Pos>(e).x == 1);
+    w.amend<Pos>(e, [](Pos& p) { p.x = 11; });
+
+    const compact_entity f = w.spawn();
+    w.add<Pos>(f, Pos{2});
+    w.add<Vel>(f, Vel{20});
+
+    // Selections hand back the world's own entity type.
+    std::size_t rows = 0;
+    w.select<Pos>().each([&](compact_entity ent, Pos&) { rows += w.alive(ent) ? 1 : 0; });
+    CHECK(rows == 2);
+    CHECK((w.has_all<Pos, Vel>(f)));
+
+    // Bonds mirror-partition exactly as in the classic world.
+    w.bond<Pos, Vel>();
+    CHECK((w.bonded<Pos, Vel>().count() == 1));
+
+    // Command buffers mint provisionals at the traits' spare bit (bit 15).
+    ecs::basic_command_buffer<compact_traits> cmd;
+    const compact_entity prov = cmd.spawn();
+    CHECK((prov.index() & (std::uint16_t{1} << 15)) != 0);
+    cmd.add<Pos>(prov, Pos{3});
+    cmd.add<Hp>(e, Hp{5});
+    const auto applied = w.apply(cmd);
+    CHECK(applied.applied == 3);
+    CHECK(w.select<Pos>().count() == 3);
+
+    // Kill recycles the slot and bumps the 16-bit generation.
+    const compact_entity g = w.spawn();
+    const auto slot = g.index();
+    w.kill(g);
+    const compact_entity g2 = w.spawn();
+    CHECK(g2.index() == slot);
+    CHECK(g2.generation() == static_cast<std::uint16_t>(g.generation() + 1));
+    CHECK(!w.alive(g));
+    CHECK(w.alive(g2));
+
+    // Archives round-trip under the compact layout stamp.
+    byte_writer out;
+    ecs::pack<Pos, Vel, Hp>(w, out);
+    ecs::basic_world<compact_traits> fresh;
+    byte_reader in{&out.data};
+    CHECK((ecs::unpack<Pos, Vel, Hp>(fresh, in).has_value()));
+    CHECK(fresh.live_count() == w.live_count());
+    fresh.bond<Pos, Vel>();  // bonds are per-world state: rebuild over loaded rows
+    CHECK((fresh.bonded<Pos, Vel>().count() == 1));
+
+    // A stream packed with DIFFERENT traits refuses with archive_mismatch.
+    ecs::world classic;
+    classic.spawn(Pos{9});
+    byte_writer classic_out;
+    ecs::pack<Pos>(classic, classic_out);
+    ecs::basic_world<compact_traits> wrong;
+    byte_reader classic_in{&classic_out.data};
+    const auto refused = ecs::unpack<Pos>(wrong, classic_in);
+    CHECK(!refused.has_value());
+    CHECK(refused.error().code == ecs::fault_code::archive_mismatch);
+
+    CHECK_VALID(w);
+    CHECK_VALID(fresh);
+}

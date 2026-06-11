@@ -111,22 +111,30 @@ namespace quiver
 
 inline constexpr bool checks_enabled = (QUIVER_CHECKS != 0);
 
-class world;
-class command_buffer;
+template <class Traits>
+class basic_world;
+template <class Traits>
+class basic_command_buffer;
+template <class Traits>
+class basic_blueprint;
+template <class Traits>
+class basic_pool_ref;
+template <class Traits>
+class basic_runtime_selection;
+template <class Traits>
+class basic_scoped_hook;
 template <class W>
 class basic_entity_ref;
-using entity_ref = basic_entity_ref<world>;
-using const_entity_ref = basic_entity_ref<const world>;
-class runtime_selection;
-template <class Excludes, class... Ts>
-class bonded_view_t;
-template <class Excludes, class... Ts>
-class selection_t;
+template <class Traits, class Excludes, class... Ts>
+class basic_bonded_view;
+template <class Traits, class Excludes, class... Ts>
+class basic_selection;
 struct test_access;  // checked-build test backdoor; defined only when QUIVER_CHECKS is on
 
 namespace detail
 {
-struct kin;  // internal parent/child link component; managed via adopt/orphan/kill only
+template <class Traits>
+struct basic_kin;  // internal parent/child link component; managed via adopt/orphan/kill
 }
 
 // ----------------------------------------------------------------------------
@@ -902,7 +910,10 @@ struct globals_mark
 //   world.on_add<T, &Phys::body>(&phys)    — member function on an instance
 // ----------------------------------------------------------------------------
 
-using component_hook = void (*)(world&, entity, void* user);
+template <class Traits>
+using basic_component_hook = void (*)(basic_world<Traits>&, basic_entity<Traits>, void* user);
+
+using component_hook = basic_component_hook<default_entity_traits>;
 
 struct hook_token
 {
@@ -917,9 +928,11 @@ namespace detail
 // Adapts a compile-time callable (free function, capture-less function
 // object) to the component_hook convention. Candidates may take
 // (world&, entity) or just (entity).
-template <auto Candidate>
-consteval component_hook free_hook_thunk()
+template <class Traits, auto Candidate>
+consteval basic_component_hook<Traits> free_hook_thunk()
 {
+    using world = basic_world<Traits>;
+    using entity = basic_entity<Traits>;
     if constexpr (std::invocable<decltype(Candidate), world&, entity>)
     {
         return +[](world& w, entity e, void*) { std::invoke(Candidate, w, e); };
@@ -936,9 +949,11 @@ consteval component_hook free_hook_thunk()
 // Adapts a member function (or any callable taking the instance first) plus
 // an instance pointer. Constness flows through Inst: connecting through a
 // const instance only compiles for const-invocable candidates.
-template <auto Candidate, class Inst>
-consteval component_hook bound_hook_thunk()
+template <class Traits, auto Candidate, class Inst>
+consteval basic_component_hook<Traits> bound_hook_thunk()
 {
+    using world = basic_world<Traits>;
+    using entity = basic_entity<Traits>;
     if constexpr (std::invocable<decltype(Candidate), Inst&, world&, entity>)
     {
         return +[](world& w, entity e, void* user)
@@ -1431,6 +1446,8 @@ public:
     using group_core = basic_group_core<Traits>;
     using pool_base = basic_pool_base;  // the historical body spelling
     using single_pool_lock = basic_single_pool_lock<Traits>;
+    using world = quiver::basic_world<Traits>;
+    using component_hook = quiver::basic_component_hook<Traits>;
 
     basic_pool_base(std::pmr::memory_resource* memory,
                     std::string_view name,
@@ -1748,14 +1765,16 @@ protected:
         return result;
     }
 
-    friend class quiver::world;
+    template <class>
+    friend class quiver::basic_world;
     template <entity_traits>
     friend class basic_single_pool_lock;
-    friend class quiver::runtime_selection;
-    template <class Excludes, class... Ts>
-    friend class quiver::selection_t;
-    template <class Excludes, class... Ts>
-    friend class quiver::bonded_view_t;
+    template <class>
+    friend class quiver::basic_runtime_selection;
+    template <class, class, class...>
+    friend class quiver::basic_selection;
+    template <class, class, class...>
+    friend class quiver::basic_bonded_view;
     friend struct quiver::test_access;  // declared unconditionally; defined only under checks
 
     struct hook_entry
@@ -1794,7 +1813,7 @@ protected:
     std::pmr::vector<entity> dense_;
     std::unique_ptr<hook_lists> hooks_;  // null until the first hook connects
     group_core* bond_ = nullptr;         // null unless this pool is owned by a bond
-    quiver::world* owner_ = nullptr;     // set at registration; hooks receive it
+    world* owner_ = nullptr;             // set at registration; hooks receive it
     std::pmr::memory_resource* memory_;  // scaling allocations route through this
     std::string_view name_;
     std::uint64_t name_hash_;
@@ -1878,8 +1897,8 @@ public:
 protected:
     using base::attach;
     using base::check_membership;
-    using base::detach;
     using base::dense_;
+    using base::detach;
     using base::fire_add;
     using base::fire_remove;
     using base::fire_remove_all;
@@ -2058,8 +2077,8 @@ public:
 protected:
     using base::attach;
     using base::check_membership;
-    using base::detach;
     using base::dense_;
+    using base::detach;
     using base::fire_add;
     using base::fire_remove;
     using base::fire_remove_all;
@@ -2145,8 +2164,8 @@ public:
 protected:
     using base::attach;
     using base::check_membership;
-    using base::detach;
     using base::dense_;
+    using base::detach;
     using base::fire_add;
     using base::fire_remove;
     using base::fire_remove_all;
@@ -2416,12 +2435,11 @@ private:
 };
 
 template <component T, entity_traits Traits = default_entity_traits>
-using pool_for =
-    std::conditional_t<storage_policy<T> == storage::tag,
-                       tag_pool<T, Traits>,
-                       std::conditional_t<storage_policy<T> == storage::stable,
-                                          stable_pool<T, Traits>,
-                                          packed_pool<T, Traits>>>;
+using pool_for = std::conditional_t<storage_policy<T> == storage::tag,
+                                    tag_pool<T, Traits>,
+                                    std::conditional_t<storage_policy<T> == storage::stable,
+                                                       stable_pool<T, Traits>,
+                                                       packed_pool<T, Traits>>>;
 }  // namespace detail
 
 // ----------------------------------------------------------------------------
@@ -2699,23 +2717,26 @@ namespace detail
 {
 // Callback shapes accepted by each(): with or without the leading entity, and
 // optionally returning something bool-like (false = stop iterating).
-template <class F, class Tuple>
+template <class F, class Entity, class Tuple>
 struct callback_traits;
 
-template <class F, class... Refs>
-struct callback_traits<F, std::tuple<Refs...>>
+template <class F, class Entity, class... Refs>
+struct callback_traits<F, Entity, std::tuple<Refs...>>
 {
-    static constexpr bool with_entity = std::invocable<F&, entity, Refs...>;
+    static constexpr bool with_entity = std::invocable<F&, Entity, Refs...>;
     static constexpr bool without_entity = std::invocable<F&, Refs...>;
 };
 }  // namespace detail
 
-template <class Excludes, class... Ts>
-class selection_t;  // primary; only the except<...> specialization exists
-
-template <class... Ts, class... Xs>
-class selection_t<except<Xs...>, Ts...>
+template <class Traits, class... Ts, class... Xs>
+class basic_selection<Traits, except<Xs...>, Ts...>
 {
+    using entity = quiver::basic_entity<Traits>;
+    using pool_base = detail::basic_pool_base<Traits>;
+    using selection_t = basic_selection;  // the historical body spelling
+    template <class T>
+    using pool_of_t = quiver::pool_of_t<T, Traits>;
+
     static_assert(sizeof...(Ts) > 0, "quiver: select() needs at least one component type");
     static_assert(((detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> ||
                     component<detail::bare<detail::maybe_inner<Ts>>>) &&
@@ -2833,12 +2854,12 @@ class selection_t<except<Xs...>, Ts...>
     // here, which is what makes concurrent const iteration safe there.
     struct iteration_lock
     {
-        explicit iteration_lock(const std::array<detail::pool_base*, flat_count>& pools) noexcept
+        explicit iteration_lock(const std::array<pool_base*, flat_count>& pools) noexcept
             : pools_(pools)
         {
             if constexpr (checks_enabled)
             {
-                for (detail::pool_base* pool : pools_)
+                for (pool_base* pool : pools_)
                 {
                     if (pool != nullptr)  // unregistered maybe<> pools
                     {
@@ -2852,7 +2873,7 @@ class selection_t<except<Xs...>, Ts...>
         {
             if constexpr (checks_enabled)
             {
-                for (detail::pool_base* pool : pools_)
+                for (pool_base* pool : pools_)
                 {
                     if (pool != nullptr)
                     {
@@ -2865,7 +2886,7 @@ class selection_t<except<Xs...>, Ts...>
         iteration_lock(const iteration_lock&) = delete;
         iteration_lock& operator=(const iteration_lock&) = delete;
 
-        const std::array<detail::pool_base*, flat_count>& pools_;
+        const std::array<pool_base*, flat_count>& pools_;
     };
 
 public:
@@ -2876,7 +2897,7 @@ public:
     using included = types<Ts...>;
     using excluded = types<Xs...>;
 
-    selection_t() = default;  // empty selection; matches nothing
+    basic_selection() = default;  // empty selection; matches nothing
 
     // Invokes fn for every matching entity. fn is called as fn(entity, refs...)
     // or fn(refs...) — entity-first wins when both compile. refs are the
@@ -2919,7 +2940,7 @@ public:
     {
         if constexpr (group_count == 0)
         {
-            const detail::pool_base* driver = smallest();
+            const pool_base* driver = smallest();
             if (driver == nullptr)
             {
                 return 0;
@@ -2950,7 +2971,7 @@ public:
     {
         if constexpr (group_count == 0)
         {
-            const detail::pool_base* driver = smallest();
+            const pool_base* driver = smallest();
             if (driver == nullptr || driver->size() == 0)
             {
                 return true;
@@ -2991,7 +3012,7 @@ public:
         // one live entity, so an exact dense match doubles as a liveness test.
         if constexpr (first_required < sizeof...(Ts))
         {
-            detail::pool_base* first = includes_[flat_offset[first_required]];
+            pool_base* first = includes_[flat_offset[first_required]];
             if (first == nullptr)
             {
                 return false;
@@ -3010,7 +3031,7 @@ public:
             const std::size_t off = flat_offset[first_group];
             for (std::size_t k = 0; k < element_width[first_group]; ++k)
             {
-                detail::pool_base* alt = includes_[off + k];
+                pool_base* alt = includes_[off + k];
                 if (alt == nullptr)
                 {
                     continue;
@@ -3097,7 +3118,7 @@ public:
             {
                 if (driver_ != nullptr)
                 {
-                    for (detail::pool_base* pool : self_.includes_)
+                    for (pool_base* pool : self_.includes_)
                     {
                         if (pool != nullptr)
                         {
@@ -3114,7 +3135,7 @@ public:
             {
                 if (driver_ != nullptr)
                 {
-                    for (detail::pool_base* pool : self_.includes_)
+                    for (pool_base* pool : self_.includes_)
                     {
                         if (pool != nullptr)
                         {
@@ -3191,7 +3212,7 @@ public:
 
     private:
         Self self_;  // cheap pointer bundle; keeps the range self-contained
-        detail::pool_base* driver_ = nullptr;
+        pool_base* driver_ = nullptr;
         std::size_t size_ = 0;  // sound to cache: locked pools cannot change size
     };
 
@@ -3282,7 +3303,7 @@ public:
         friend class basic_split;
 
         part_t(const selection_t* self,
-               detail::pool_base* driver,
+               pool_base* driver,
                std::size_t begin,
                std::size_t end) noexcept
             : owner_self_(self),
@@ -3293,7 +3314,7 @@ public:
         }
 
         const selection_t* owner_self_ = nullptr;
-        detail::pool_base* driver_ = nullptr;
+        pool_base* driver_ = nullptr;
         std::size_t begin_ = 0;
         std::size_t end_ = 0;
     };
@@ -3327,7 +3348,7 @@ public:
 
     private:
         Self self_;
-        detail::pool_base* driver_;
+        pool_base* driver_;
         iteration_lock lock_;  // references self_.includes_; member order matters
         std::size_t size_;
         std::size_t parts_;
@@ -3342,11 +3363,12 @@ public:
     }
 
 private:
-    friend class world;
+    template <class>
+    friend class basic_world;
     friend struct test_access;
 
-    explicit selection_t(std::array<detail::pool_base*, flat_count> includes,
-                         std::array<detail::pool_base*, sizeof...(Xs)> excludes) noexcept
+    explicit basic_selection(std::array<pool_base*, flat_count> includes,
+                             std::array<pool_base*, sizeof...(Xs)> excludes) noexcept
         : includes_(includes),
           excludes_(excludes)
     {
@@ -3357,20 +3379,20 @@ private:
     // missing (const world) or when the selection has no plain includes at
     // all (pure any_of: the union drives instead, in run()). maybe<> pools
     // never drive and a missing one never disqualifies the selection.
-    [[nodiscard]] detail::pool_base* smallest() const noexcept
+    [[nodiscard]] pool_base* smallest() const noexcept
     {
         if (driver_override_ != no_driver_override)
         {
             return includes_[driver_override_];  // null = empty selection
         }
-        detail::pool_base* best = nullptr;
+        pool_base* best = nullptr;
         for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
             if (optional_include[i] || group_include[i])
             {
                 continue;
             }
-            detail::pool_base* pool = includes_[flat_offset[i]];
+            pool_base* pool = includes_[flat_offset[i]];
             if (pool == nullptr)
             {
                 return nullptr;
@@ -3383,8 +3405,7 @@ private:
         return best;
     }
 
-    [[nodiscard]] bool matches_rest(std::uint32_t index,
-                                    const detail::pool_base* driver) const noexcept
+    [[nodiscard]] bool matches_rest(std::uint32_t index, const pool_base* driver) const noexcept
     {
         return matches_from(index, driver, sizeof...(Ts));
     }
@@ -3392,7 +3413,7 @@ private:
     // The full predicate, optionally skipping one element (the union-driving
     // group satisfies itself by construction).
     [[nodiscard]] bool matches_from(std::uint32_t index,
-                                    const detail::pool_base* driver,
+                                    const pool_base* driver,
                                     std::size_t skip_element) const noexcept
     {
         for (std::size_t i = 0; i < sizeof...(Ts); ++i)
@@ -3409,7 +3430,7 @@ private:
                     const std::size_t off = flat_offset[i];
                     for (std::size_t k = 0; k < element_width[i]; ++k)
                     {
-                        detail::pool_base* alt = includes_[off + k];
+                        pool_base* alt = includes_[off + k];
                         if (alt != nullptr && (alt == driver || alt->contains(index)))
                         {
                             satisfied = true;
@@ -3423,13 +3444,13 @@ private:
                     continue;
                 }
             }
-            detail::pool_base* pool = includes_[flat_offset[i]];
+            pool_base* pool = includes_[flat_offset[i]];
             if (pool != driver && (pool == nullptr || !pool->contains(index)))
             {
                 return false;
             }
         }
-        for (detail::pool_base* pool : excludes_)
+        for (pool_base* pool : excludes_)
         {
             if (pool != nullptr && pool->contains(index))
             {
@@ -3444,7 +3465,7 @@ private:
     {
         if constexpr (group_count == 0)
         {
-            detail::pool_base* driver = smallest();
+            pool_base* driver = smallest();
             if (driver == nullptr)
             {
                 return;
@@ -3457,7 +3478,7 @@ private:
         else
         {
             // A missing PLAIN include pool is an empty selection, as ever.
-            detail::pool_base* driver = smallest();
+            pool_base* driver = smallest();
             if constexpr (has_plain_include)
             {
                 if (driver == nullptr)
@@ -3508,7 +3529,7 @@ private:
             const std::size_t off = flat_offset[best_group_elem];
             for (std::size_t k = 0; k < element_width[best_group_elem]; ++k)
             {
-                detail::pool_base* alt = includes_[off + k];
+                pool_base* alt = includes_[off + k];
                 if (alt == nullptr)
                 {
                     continue;
@@ -3519,7 +3540,7 @@ private:
                     bool seen_earlier = false;
                     for (std::size_t j = 0; j < k; ++j)
                     {
-                        detail::pool_base* prev = includes_[off + j];
+                        pool_base* prev = includes_[off + j];
                         if (prev != nullptr && prev->contains(e.index()))
                         {
                             seen_earlier = true;
@@ -3543,7 +3564,7 @@ private:
     // object already holding the locks.
     template <class F, class Invoke>
     void run_span(
-        F& fn, Invoke&& invoke, detail::pool_base* driver, std::size_t begin, std::size_t end) const
+        F& fn, Invoke&& invoke, pool_base* driver, std::size_t begin, std::size_t end) const
     {
         for (std::size_t pos = begin; pos < end; ++pos)
         {
@@ -3624,7 +3645,7 @@ private:
     bool invoke_with_refs(F& fn, entity e, std::uint32_t index) const
     {
         auto refs = value_refs(index);
-        using traits = detail::callback_traits<F, decltype(refs)>;
+        using traits = detail::callback_traits<F, entity, decltype(refs)>;
         if constexpr (traits::with_entity)
         {
             return finish(fn, std::tuple_cat(std::tuple<entity>{e}, std::move(refs)));
@@ -3665,10 +3686,14 @@ private:
     static_assert(flat_count < no_driver_override,
                   "quiver: selections cap at 254 flattened include slots");
 
-    std::array<detail::pool_base*, flat_count> includes_{};
-    std::array<detail::pool_base*, sizeof...(Xs)> excludes_{};
+    std::array<pool_base*, flat_count> includes_{};
+    std::array<pool_base*, sizeof...(Xs)> excludes_{};
     std::uint8_t driver_override_ = no_driver_override;
 };
+
+// The classic spelling: a default-traits selection.
+template <class Excludes, class... Ts>
+using selection_t = basic_selection<default_entity_traits, Excludes, Ts...>;
 
 namespace detail
 {
@@ -3735,12 +3760,16 @@ inline constexpr bool row_stops<F, std::tuple<Es...>> =
     std::same_as<std::invoke_result_t<F&, Es...>, bool>;
 }  // namespace detail
 
-template <class Excludes, class... Ts>
-class bonded_view_t;  // primary; only the except<...> specialization exists
-
-template <class... Ts, class... Xs>  // const-qualify elements for read-only payload access
-class bonded_view_t<except<Xs...>, Ts...>
+template <class Traits, class... Ts, class... Xs>  // const-qualify for read-only payload access
+class basic_bonded_view<Traits, except<Xs...>, Ts...>
 {
+    using entity = quiver::basic_entity<Traits>;
+    using pool_base = detail::basic_pool_base<Traits>;
+    using group_core = detail::basic_group_core<Traits>;
+    using bonded_view_t = basic_bonded_view;  // the historical body spelling
+    template <class T>
+    using pool_of_t = quiver::pool_of_t<T, Traits>;
+
     static_assert(sizeof...(Ts) >= 2, "quiver: a bonded view spans at least two pools");
     static_assert((!detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> && ...),
                   "quiver: bonds own pools, not alternatives — any_of<> belongs in select");
@@ -3829,7 +3858,7 @@ class bonded_view_t<except<Xs...>, Ts...>
     // (never registered) exclude nothing.
     [[nodiscard]] bool passes(std::uint32_t index) const noexcept
     {
-        for (detail::pool_base* pool : excludes_)
+        for (pool_base* pool : excludes_)
         {
             if (pool != nullptr && pool->contains(index))
             {
@@ -3844,12 +3873,12 @@ class bonded_view_t<except<Xs...>, Ts...>
     // range objects can own a copy of the view safely.
     struct view_locks
     {
-        explicit view_locks(const std::array<detail::pool_base*, sizeof...(Ts)>& pools) noexcept
+        explicit view_locks(const std::array<pool_base*, sizeof...(Ts)>& pools) noexcept
             : pools_(pools)
         {
             if constexpr (checks_enabled)
             {
-                for (detail::pool_base* pool : pools_)
+                for (pool_base* pool : pools_)
                 {
                     if (pool != nullptr)
                     {
@@ -3863,7 +3892,7 @@ class bonded_view_t<except<Xs...>, Ts...>
         {
             if constexpr (checks_enabled)
             {
-                for (detail::pool_base* pool : pools_)
+                for (pool_base* pool : pools_)
                 {
                     if (pool != nullptr)
                     {
@@ -3876,7 +3905,7 @@ class bonded_view_t<except<Xs...>, Ts...>
         view_locks(const view_locks&) = delete;
         view_locks& operator=(const view_locks&) = delete;
 
-        std::array<detail::pool_base*, sizeof...(Ts)> pools_;
+        std::array<pool_base*, sizeof...(Ts)> pools_;
     };
 
 public:
@@ -3887,7 +3916,7 @@ public:
     using excluded = types<Xs...>;
     using pair = owned;  // the historical 2-ary name, kept for manifests
 
-    bonded_view_t() = default;  // empty: matches nothing
+    basic_bonded_view() = default;  // empty: matches nothing
 
     // O(1) without excludes; with excludes the partition is walked and
     // filtered (observed parts never filter).
@@ -4160,9 +4189,10 @@ public:
     [[nodiscard]] auto range() const noexcept { return basic_range<>(*this); }
 
 private:
-    friend class world;
-    template <class Excludes2, class... Us>
-    friend class bonded_view_t;
+    template <class>
+    friend class basic_world;
+    template <class, class, class...>
+    friend class basic_bonded_view;
 
     // Slot of T among the listed types (matching through const), for sort<T>.
     template <class T>
@@ -4194,7 +4224,7 @@ private:
         }
         if constexpr (checks_enabled)
         {
-            for (detail::pool_base* pool : bases_)
+            for (pool_base* pool : bases_)
             {
                 if (pool != nullptr && pool->locked())
                 {
@@ -4235,19 +4265,23 @@ private:
         }
     }
 
-    bonded_view_t(std::array<detail::pool_base*, sizeof...(Ts)> pools,
-                  std::array<detail::pool_base*, sizeof...(Xs)> excludes,
-                  const detail::group_core* bond) noexcept
+    basic_bonded_view(std::array<pool_base*, sizeof...(Ts)> pools,
+                      std::array<pool_base*, sizeof...(Xs)> excludes,
+                      const group_core* bond) noexcept
         : bases_(pools),
           excludes_(excludes),
           bond_(bond)
     {
     }
 
-    std::array<detail::pool_base*, sizeof...(Ts)> bases_{};
-    std::array<detail::pool_base*, sizeof...(Xs)> excludes_{};
-    const detail::group_core* bond_ = nullptr;
+    std::array<pool_base*, sizeof...(Ts)> bases_{};
+    std::array<pool_base*, sizeof...(Xs)> excludes_{};
+    const group_core* bond_ = nullptr;
 };
+
+// The classic spelling: a default-traits bonded view.
+template <class Excludes, class... Ts>
+using bonded_view_t = basic_bonded_view<default_entity_traits, Excludes, Ts...>;
 
 // The public spelling: bonded_view<A, B>, or bonded_view<except<C>, A, B>
 // when an exclude filter is part of the type. world::bonded deduces this for
@@ -4273,10 +4307,14 @@ using bonded_view = std::conditional_t<detail::is_except<First>::value,
 // ----------------------------------------------------------------------------
 
 // A nullable, opaque view of one component pool.
-class pool_ref
+template <class Traits>
+class basic_pool_ref
 {
+    using entity = quiver::basic_entity<Traits>;
+    using pool_base = detail::basic_pool_base<Traits>;
+
 public:
-    pool_ref() = default;
+    basic_pool_ref() = default;
 
     [[nodiscard]] explicit operator bool() const noexcept { return pool_ != nullptr; }
     [[nodiscard]] std::string_view name() const noexcept
@@ -4325,7 +4363,7 @@ public:
         // The runtime layer stores const pointers for const-world
         // compatibility; mutability is the caller's documented contract.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-        return const_cast<detail::pool_base*>(pool_)->item_address(pos);
+        return const_cast<pool_base*>(pool_)->item_address(pos);
     }
 
     // The same, by dense position (0 <= pos < size()): walk a whole pool
@@ -4337,26 +4375,30 @@ public:
             return nullptr;
         }
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-        return const_cast<detail::pool_base*>(pool_)->item_address(static_cast<std::uint32_t>(pos));
+        return const_cast<pool_base*>(pool_)->item_address(static_cast<std::uint32_t>(pos));
     }
 
     // The entity at a dense position (pairs with raw_at).
     [[nodiscard]] entity entity_at(std::size_t pos) const noexcept
     {
-        return pool_ != nullptr && pos < pool_->size() ? pool_->entity_at(pos) : no_entity;
+        return pool_ != nullptr && pos < pool_->size() ? pool_->entity_at(pos) : entity{};
     }
 
 private:
-    friend class world;
-    friend class runtime_selection;
+    template <class>
+    friend class basic_world;
+    template <class>
+    friend class basic_runtime_selection;
 
-    explicit pool_ref(const detail::pool_base* pool) noexcept
+    explicit basic_pool_ref(const pool_base* pool) noexcept
         : pool_(pool)
     {
     }
 
-    const detail::pool_base* pool_ = nullptr;
+    const pool_base* pool_ = nullptr;
 };
+
+using pool_ref = basic_pool_ref<default_entity_traits>;
 
 // A selection assembled at runtime from pool_refs. Entity-only iteration with
 // the same smallest-pool driving, matching, and lock rules as selection_t.
@@ -4364,10 +4406,16 @@ private:
 // not). At least one include is required; an empty pool_ref include makes the
 // selection match nothing (the component was never registered, so no entity
 // can have it).
-class runtime_selection
+template <class Traits>
+class basic_runtime_selection
 {
+    using entity = quiver::basic_entity<Traits>;
+    using pool_base = detail::basic_pool_base<Traits>;
+    using pool_ref = basic_pool_ref<Traits>;
+    using runtime_selection = basic_runtime_selection;  // the historical body spelling
+
 public:
-    runtime_selection() = default;
+    basic_runtime_selection() = default;
 
     runtime_selection& include(pool_ref pool)
     {
@@ -4404,13 +4452,13 @@ public:
     template <class F>
     void entities(F&& fn) const
     {
-        const detail::pool_base* driver = smallest();
+        const pool_base* driver = smallest();
         if (driver == nullptr)
         {
             return;
         }
-        const std::vector<const detail::pool_base*> includes = includes_;
-        const std::vector<const detail::pool_base*> excludes = excludes_;
+        const std::vector<const pool_base*> includes = includes_;
+        const std::vector<const pool_base*> excludes = excludes_;
         const lock_all lock(includes);
         const std::size_t n = driver->size();
         for (std::size_t pos = 0; pos < n; ++pos)
@@ -4469,12 +4517,12 @@ private:
     // exactly, even if the live selection is edited mid-iteration.
     struct lock_all
     {
-        explicit lock_all(const std::vector<const detail::pool_base*>& pools) noexcept
+        explicit lock_all(const std::vector<const pool_base*>& pools) noexcept
             : pools_(pools)
         {
             if constexpr (checks_enabled)
             {
-                for (const detail::pool_base* pool : pools_)
+                for (const pool_base* pool : pools_)
                 {
                     ++pool->locks_;
                 }
@@ -4485,7 +4533,7 @@ private:
         {
             if constexpr (checks_enabled)
             {
-                for (const detail::pool_base* pool : pools_)
+                for (const pool_base* pool : pools_)
                 {
                     --pool->locks_;
                 }
@@ -4495,22 +4543,22 @@ private:
         lock_all(const lock_all&) = delete;
         lock_all& operator=(const lock_all&) = delete;
 
-        const std::vector<const detail::pool_base*>& pools_;
+        const std::vector<const pool_base*>& pools_;
     };
 
-    [[nodiscard]] static bool matches_lists(const std::vector<const detail::pool_base*>& includes,
-                                            const std::vector<const detail::pool_base*>& excludes,
+    [[nodiscard]] static bool matches_lists(const std::vector<const pool_base*>& includes,
+                                            const std::vector<const pool_base*>& excludes,
                                             std::uint32_t index,
-                                            const detail::pool_base* driver) noexcept
+                                            const pool_base* driver) noexcept
     {
-        for (const detail::pool_base* pool : includes)
+        for (const pool_base* pool : includes)
         {
             if (pool != driver && !pool->contains(index))
             {
                 return false;
             }
         }
-        for (const detail::pool_base* pool : excludes)
+        for (const pool_base* pool : excludes)
         {
             if (pool->contains(index))
             {
@@ -4520,14 +4568,14 @@ private:
         return true;
     }
 
-    [[nodiscard]] const detail::pool_base* smallest() const noexcept
+    [[nodiscard]] const pool_base* smallest() const noexcept
     {
         if (impossible_ || includes_.empty())
         {
             return nullptr;
         }
-        const detail::pool_base* best = nullptr;
-        for (const detail::pool_base* pool : includes_)
+        const pool_base* best = nullptr;
+        for (const pool_base* pool : includes_)
         {
             if (best == nullptr || pool->size() < best->size())
             {
@@ -4537,17 +4585,16 @@ private:
         return best;
     }
 
-    [[nodiscard]] bool matches_rest(std::uint32_t index,
-                                    const detail::pool_base* driver) const noexcept
+    [[nodiscard]] bool matches_rest(std::uint32_t index, const pool_base* driver) const noexcept
     {
-        for (const detail::pool_base* pool : includes_)
+        for (const pool_base* pool : includes_)
         {
             if (pool != driver && !pool->contains(index))
             {
                 return false;
             }
         }
-        for (const detail::pool_base* pool : excludes_)
+        for (const pool_base* pool : excludes_)
         {
             if (pool->contains(index))
             {
@@ -4557,10 +4604,12 @@ private:
         return true;
     }
 
-    std::vector<const detail::pool_base*> includes_;
-    std::vector<const detail::pool_base*> excludes_;
+    std::vector<const pool_base*> includes_;
+    std::vector<const pool_base*> excludes_;
     bool impossible_ = false;  // an include named a pool that does not exist
 };
+
+using runtime_selection = basic_runtime_selection<default_entity_traits>;
 
 // ----------------------------------------------------------------------------
 // detail: payload arena
@@ -4710,12 +4759,20 @@ private:
 // a buffer are only meaningful to the world whose handles they are.
 // ----------------------------------------------------------------------------
 
-class command_buffer
+template <class Traits>
+class basic_command_buffer
 {
+    using entity = quiver::basic_entity<Traits>;
+    using world = quiver::basic_world<Traits>;
+    using kin = detail::basic_kin<Traits>;
+    using limits = detail::entity_limits<Traits>;
+    using index_type = typename Traits::index_type;
+    using generation_type = typename Traits::generation_type;
+
 public:
     // The optional memory resource feeds the op list and the payload arena;
     // it must outlive the buffer.
-    explicit command_buffer(
+    explicit basic_command_buffer(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : ops_(memory),
           arena_(memory),
@@ -4726,19 +4783,19 @@ public:
     // The moved-from buffer is equivalent to a freshly constructed one (and
     // gets a new identity, so provisional handles that moved away with the
     // ops cannot be confused with handles it issues later).
-    command_buffer(command_buffer&& other) noexcept
+    basic_command_buffer(basic_command_buffer&& other) noexcept
         : ops_(std::move(other.ops_)),
           arena_(std::move(other.arena_)),
           resolved_(std::move(other.resolved_)),
           ticket_count_(std::exchange(other.ticket_count_, 0)),
-          nonce_(std::exchange(other.nonce_, detail::next_buffer_nonce()))
+          nonce_(std::exchange(other.nonce_, fresh_nonce()))
     {
     }
 
     // Not noexcept: assigning between buffers on different memory resources
     // falls back to element-wise moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
-    command_buffer& operator=(command_buffer&& other)
+    basic_command_buffer& operator=(basic_command_buffer&& other)
     {
         if (this != &other)
         {
@@ -4750,24 +4807,25 @@ public:
             resolved_ = std::move(other.resolved_);
             other.resolved_.clear();
             ticket_count_ = std::exchange(other.ticket_count_, 0);
-            nonce_ = std::exchange(other.nonce_, detail::next_buffer_nonce());
+            nonce_ = std::exchange(other.nonce_, fresh_nonce());
         }
         return *this;
     }
 
-    command_buffer(const command_buffer&) = delete;
-    command_buffer& operator=(const command_buffer&) = delete;
+    basic_command_buffer(const basic_command_buffer&) = delete;
+    basic_command_buffer& operator=(const basic_command_buffer&) = delete;
 
-    ~command_buffer() { destroy_payloads(); }
+    ~basic_command_buffer() { destroy_payloads(); }
 
     // Deferred create. The returned handle is provisional: feed it to later
     // ops in this buffer; apply() spawns the real entity. O(1).
     entity spawn()
     {
-        const entity provisional{detail::provisional_bit | ticket_count_, nonce_};
+        const entity provisional(static_cast<index_type>(limits::provisional_bit | ticket_count_),
+                                 nonce_);
         if constexpr (checks_enabled)
         {
-            if (ticket_count_ >= detail::provisional_bit - 1)
+            if (ticket_count_ >= limits::provisional_bit - 1)
             {
                 detail::violate("command_buffer: provisional ticket overflow");
             }
@@ -4797,7 +4855,7 @@ public:
     template <component T>
     void remove(entity target)
     {
-        static_assert(!std::same_as<T, detail::kin>,
+        static_assert(!std::same_as<T, kin>,
                       "quiver: parent/child links are managed via adopt/orphan/kill");
         reserve_op();
         ops_.push_back(op{op_kind::remove,
@@ -4828,11 +4886,19 @@ public:
         ticket_count_ = 0;
         resolved_.clear();
         arena_.reset();
-        nonce_ = detail::next_buffer_nonce();
+        nonce_ = fresh_nonce();
     }
 
 private:
-    friend class world;
+    template <class>
+    friend class basic_world;
+
+    // The process-wide nonce, truncated to this layout's generation lane
+    // (narrower generations narrow the misuse net, never the mechanism).
+    [[nodiscard]] static generation_type fresh_nonce() noexcept
+    {
+        return static_cast<generation_type>(detail::next_buffer_nonce());
+    }
 
     enum class op_kind : std::uint8_t
     {
@@ -4909,20 +4975,49 @@ private:
         }
     }
 
-    // Defined after world (they call into it).
+    // Bodies live in-class: member templates instantiate at apply() time,
+    // when basic_world<Traits> is complete.
     template <component T, op_kind Kind>
-    static void erased_apply(world& w, entity target, void* payload);
+    static void erased_apply(world& w, entity target, void* payload)
+    {
+        T& value = *static_cast<T*>(payload);
+        if constexpr (Kind == op_kind::add)
+        {
+            w.template add<T>(target, std::move(value));
+        }
+        else
+        {
+            w.template put<T>(target, std::move(value));
+        }
+    }
+
     template <component T, op_kind Kind>
-    static void erased_apply_tag(world& w, entity target);
+    static void erased_apply_tag(world& w, entity target)
+    {
+        if constexpr (Kind == op_kind::add)
+        {
+            w.template add<T>(target);
+        }
+        else
+        {
+            w.template put<T>(target);
+        }
+    }
+
     template <component T>
-    static void erased_remove(world& w, entity target);
+    static void erased_remove(world& w, entity target)
+    {
+        w.template remove<T>(target);
+    }
 
     std::pmr::vector<op> ops_;
     detail::payload_arena arena_;
     std::pmr::vector<entity> resolved_;  // scratch used by world::apply; reused across applies
     std::uint32_t ticket_count_ = 0;
-    std::uint32_t nonce_ = detail::next_buffer_nonce();  // this buffer's identity
+    generation_type nonce_ = fresh_nonce();  // this buffer's identity
 };
+
+using command_buffer = basic_command_buffer<default_entity_traits>;
 
 // ----------------------------------------------------------------------------
 // Blueprint
@@ -4944,19 +5039,24 @@ private:
 // iteration rules as spawn with components.
 // ----------------------------------------------------------------------------
 
-class blueprint
+template <class Traits>
+class basic_blueprint
 {
+    using entity = quiver::basic_entity<Traits>;
+    using world = quiver::basic_world<Traits>;
+    using blueprint = basic_blueprint;  // the historical body spelling
+
 public:
     // The optional memory resource feeds the recipe storage; it must outlive
     // the blueprint.
-    explicit blueprint(
+    explicit basic_blueprint(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : ops_(memory),
           arena_(memory)
     {
     }
 
-    blueprint(blueprint&& other) noexcept
+    basic_blueprint(basic_blueprint&& other) noexcept
         : ops_(std::move(other.ops_)),
           arena_(std::move(other.arena_))
     {
@@ -4966,7 +5066,7 @@ public:
     // Not noexcept: assigning between blueprints on different memory
     // resources falls back to element-wise moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
-    blueprint& operator=(blueprint&& other)
+    basic_blueprint& operator=(basic_blueprint&& other)
     {
         if (this != &other)
         {
@@ -4979,10 +5079,10 @@ public:
         return *this;
     }
 
-    blueprint(const blueprint&) = delete;
-    blueprint& operator=(const blueprint&) = delete;
+    basic_blueprint(const basic_blueprint&) = delete;
+    basic_blueprint& operator=(const basic_blueprint&) = delete;
 
-    ~blueprint() { destroy_payloads(); }
+    ~basic_blueprint() { destroy_payloads(); }
 
     // Records one component for every future stamp. Constructor arguments are
     // evaluated once, here; each spawn copy-constructs from the stored value.
@@ -5046,7 +5146,8 @@ public:
     }
 
 private:
-    friend class world;
+    template <class>
+    friend class basic_world;
 
     struct op
     {
@@ -5075,15 +5176,25 @@ private:
         }
     }
 
-    // Defined after world (they call into it).
+    // Bodies live in-class: member templates instantiate at stamp time, when
+    // basic_world<Traits> is complete.
     template <component T>
-    static void erased_stamp(world& w, entity e);
+    static void erased_stamp(world& w, entity e)
+    {
+        w.template add<T>(e);
+    }
+
     template <component T>
-    static void erased_stamp_value(world& w, entity e, const void* payload);
+    static void erased_stamp_value(world& w, entity e, const void* payload)
+    {
+        w.template add<T>(e, *static_cast<const T*>(payload));  // copy: the recipe is reusable
+    }
 
     std::pmr::vector<op> ops_;
     detail::payload_arena arena_;
 };
+
+using blueprint = basic_blueprint<default_entity_traits>;
 
 // ----------------------------------------------------------------------------
 // World
@@ -5093,12 +5204,15 @@ namespace detail
 {
 // Built-in component backing the optional parent/child links. Stable storage:
 // link surgery holds pointers across sibling-list edits.
-struct kin
+template <class Traits>
+struct basic_kin
 {
-    entity parent = no_entity;
-    entity first_child = no_entity;
-    entity prev_sibling = no_entity;
-    entity next_sibling = no_entity;
+    using entity = quiver::basic_entity<Traits>;
+
+    entity parent{};
+    entity first_child{};
+    entity prev_sibling{};
+    entity next_sibling{};
 
     static constexpr auto quiver_storage = storage::stable;
 };
@@ -5109,8 +5223,10 @@ namespace kin_links
 {
 // Detaches child_k from its parent's sibling list (links only; the record's
 // own fields are the caller's to reset).
-inline void unlink(stable_pool<kin>& pool, kin& child_k) noexcept
+template <class Traits>
+void unlink(stable_pool<basic_kin<Traits>, Traits>& pool, basic_kin<Traits>& child_k) noexcept
 {
+    constexpr quiver::basic_entity<Traits> no_entity{};  // shadows the default-traits constant
     if (child_k.prev_sibling != no_entity)
     {
         pool.at(child_k.prev_sibling.index())->next_sibling = child_k.next_sibling;
@@ -5127,8 +5243,12 @@ inline void unlink(stable_pool<kin>& pool, kin& child_k) noexcept
 
 // Pre-kill surgery: detach e from its parent's list and orphan all of its
 // children, so no other entity ever holds a link to the dying one.
-inline void sever(stable_pool<kin>& pool, entity e) noexcept
+template <class Traits>
+void sever(stable_pool<basic_kin<Traits>, Traits>& pool, quiver::basic_entity<Traits> e) noexcept
 {
+    using entity = quiver::basic_entity<Traits>;
+    using kin = basic_kin<Traits>;
+    constexpr entity no_entity{};  // shadows the default-traits constant
     kin* k = pool.at(e.index());
     if (k == nullptr)
     {
@@ -5150,9 +5270,13 @@ inline void sever(stable_pool<kin>& pool, entity e) noexcept
 }
 
 // Link-graph audit for world::validate().
-[[nodiscard]] inline std::expected<void, fault> check(const stable_pool<kin>& pool,
-                                                      const entity_table& table)
+template <class Traits>
+[[nodiscard]] std::expected<void, fault> check(const stable_pool<basic_kin<Traits>, Traits>& pool,
+                                               const basic_entity_table<Traits>& table)
 {
+    using entity = quiver::basic_entity<Traits>;
+    using kin = basic_kin<Traits>;
+    constexpr entity no_entity{};  // shadows the default-traits constant
     const auto broken = [&](const char* note)
     { return std::unexpected(fault{fault_code::links_broken, pool.name(), note}); };
     for (std::size_t pos = 0; pos < pool.size(); ++pos)
@@ -5198,15 +5322,40 @@ inline void sever(stable_pool<kin>& pool, entity e) noexcept
 }  // namespace kin_links
 }  // namespace detail
 
-class world
+template <class Traits>
+class basic_world
 {
+public:
+    using traits_type = Traits;
+    using entity = quiver::basic_entity<Traits>;
+
+private:
+    using world = basic_world;  // the historical body spelling
+    using entity_table = detail::basic_entity_table<Traits>;
+    using pool_base = detail::basic_pool_base<Traits>;
+    using group_core = detail::basic_group_core<Traits>;
+    using single_pool_lock = detail::basic_single_pool_lock<Traits>;
+    using kin = detail::basic_kin<Traits>;
+    using component_hook = quiver::basic_component_hook<Traits>;
+    using command_buffer = basic_command_buffer<Traits>;
+    using blueprint = basic_blueprint<Traits>;
+    using pool_ref = basic_pool_ref<Traits>;
+    using runtime_selection = basic_runtime_selection<Traits>;
+    using entity_ref = basic_entity_ref<basic_world>;
+    using const_entity_ref = basic_entity_ref<const basic_world>;
+    using limits = detail::entity_limits<Traits>;
+    template <class T>
+    using pool_of_t = quiver::pool_of_t<T, Traits>;
+    static constexpr entity no_entity{};  // shadows the default-traits constant
+
 public:
     // The optional memory resource feeds everything that scales — component
     // payloads, sparse pages, dense arrays, the entity table — with zero
     // template ceremony (signatures never change). It must outlive the world.
     // Bounded structures (the pool objects themselves, hook lists) stay on
     // the global allocator.
-    explicit world(std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
+    explicit basic_world(
+        std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : table_(memory),
           pools_(memory),
           active_(memory),
@@ -5220,13 +5369,13 @@ public:
     // world's pools first: selections built from the destination world dangle
     // exactly as they would on its destruction. Moved-from worlds are empty
     // and reusable.
-    world(world&& other) noexcept
+    basic_world(basic_world&& other) noexcept
         : table_(std::move(other.table_)),
           pools_(std::move(other.pools_)),
           active_(std::move(other.active_)),
           bonds_(std::move(other.bonds_)),  // bond objects are heap-stable: pool
           memory_(other.memory_),           // bond_ pointers stay valid
-          globals_(std::exchange(other.globals_, no_entity))
+          globals_(std::exchange(other.globals_, entity{}))
     {
         other.pools_.clear();  // guarantee the moved-from world is empty
         other.active_.clear();
@@ -5238,7 +5387,7 @@ public:
     // falls back to element-wise moves, which may allocate. With matching
     // resources it is O(1) pointer steals.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
-    world& operator=(world&& other)
+    basic_world& operator=(basic_world&& other)
     {
         if (this != &other)
         {
@@ -5266,14 +5415,14 @@ public:
         return *this;
     }
 
-    world(const world&) = delete;
-    world& operator=(const world&) = delete;
+    basic_world(const basic_world&) = delete;
+    basic_world& operator=(const basic_world&) = delete;
 
     // Pools die with the world; components are destroyed here. Tearing a
     // world down while one of its iterations is running is reported in
     // checked builds (and is unavoidable UB afterwards — a destructor cannot
     // refuse).
-    ~world()
+    ~basic_world()
     {
         if constexpr (checks_enabled)
         {
@@ -5344,7 +5493,7 @@ public:
         }
         if constexpr (checks_enabled)
         {
-            for (detail::pool_base* pool : active_)
+            for (pool_base* pool : active_)
             {
                 if (pool->bond_locked() && pool->contains(src.index()))
                 {
@@ -5356,7 +5505,7 @@ public:
             }
         }
         duplicate_result result{table_.create()};
-        const detail::pool_base* links = peek_pool<detail::kin>();
+        const pool_base* links = peek_pool<kin>();
         // Index loop: on_add hooks fired by the copies may register new pools
         // (growing active_). Hooks observe a partially built clone, in pool
         // registration order; a component a hook already gave the clone is
@@ -5364,7 +5513,7 @@ public:
         // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
         for (std::size_t i = 0; i < active_.size(); ++i)
         {
-            detail::pool_base* pool = active_[i];
+            pool_base* pool = active_[i];
             if (pool == links || !pool->contains(src.index()) ||
                 pool->contains(result.clone.index()))
             {
@@ -5412,7 +5561,7 @@ public:
             // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
             for (std::size_t i = 0; i < active_.size(); ++i)
             {
-                detail::pool_base* pool = active_[i];
+                pool_base* pool = active_[i];
                 if (pool->bond_locked() && pool->contains(index))
                 {
                     detail::violate_pool("kill during iteration over pool (or its bonded partner)",
@@ -5444,7 +5593,7 @@ public:
         {
             return no_entity;
         }
-        return entity{slot, table_.generation_at(slot)};
+        return entity(static_cast<typename Traits::index_type>(slot), table_.generation_at(slot));
     }
 
     // Call-site sugar: a {world, entity} view forwarding the component verbs
@@ -5678,7 +5827,7 @@ public:
     template <component T>
     bool remove(entity e)
     {
-        static_assert(!std::same_as<T, detail::kin>,
+        static_assert(!std::same_as<T, kin>,
                       "quiver: parent/child links are managed via adopt/orphan/kill");
         if (!table_.alive(e))
         {
@@ -5840,7 +5989,7 @@ public:
     template <component T>
     void purge()
     {
-        static_assert(!std::same_as<T, detail::kin>,
+        static_assert(!std::same_as<T, kin>,
                       "quiver: parent/child links are managed via adopt/orphan/kill");
         auto* pool = peek_pool<T>();
         if (pool == nullptr)
@@ -5998,7 +6147,7 @@ public:
 
     template <class... Ts>  // const-qualify for read-only payload parts
         requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    bonded_view_t<except<>, Ts...> bond()
+    basic_bonded_view<Traits, except<>, Ts...> bond()
     {
         static_assert(detail::all_distinct<detail::bare<Ts>...>,
                       "quiver: duplicate component type in bond<...>");
@@ -6009,21 +6158,20 @@ public:
         // derived_from, not same_as: custom pools derived from the packed
         // built-in swap exactly the same way and need the same wall.
         static_assert(((!std::derived_from<pool_of_t<detail::bare<Ts>>,
-                                           detail::packed_pool<detail::bare<Ts>>> ||
+                                           detail::packed_pool<detail::bare<Ts>, Traits>> ||
                         std::is_swappable_v<detail::bare<Ts>>) &&
                        ...),
                       "quiver: bonded packed pools swap components to maintain the partition; "
                       "make every packed side swappable or store it in stable storage");
-        static_assert(sizeof...(Ts) <= detail::group_core::max_owners,
+        static_assert(sizeof...(Ts) <= group_core::max_owners,
                       "quiver: a bond spans at most group_core::max_owners (8) pools");
-        const std::array<detail::pool_base*, sizeof...(Ts)> pools{
-            &ensure_pool<detail::bare<Ts>>()...};
+        const std::array<pool_base*, sizeof...(Ts)> pools{&ensure_pool<detail::bare<Ts>>()...};
         // Idempotent for the SAME standing owned set, in any order.
-        if (detail::group_core* standing = pools[0]->bond_;
+        if (group_core* standing = pools[0]->bond_;
             standing != nullptr && standing->owner_count == sizeof...(Ts))
         {
             bool same = true;
-            for (detail::pool_base* pool : pools)
+            for (pool_base* pool : pools)
             {
                 same = same && standing->owns(pool);
             }
@@ -6032,7 +6180,7 @@ public:
                 return bonded<Ts...>();
             }
         }
-        for (detail::pool_base* pool : pools)
+        for (pool_base* pool : pools)
         {
             if (pool->bond_ != nullptr)
             {
@@ -6045,7 +6193,7 @@ public:
         }
         if constexpr (checks_enabled)
         {
-            for (detail::pool_base* pool : pools)
+            for (pool_base* pool : pools)
             {
                 if (pool->locked())
                 {
@@ -6054,8 +6202,8 @@ public:
                 }
             }
         }
-        bonds_.push_back(std::make_unique<detail::group_core>());
-        detail::group_core* bond = bonds_.back().get();
+        bonds_.push_back(std::make_unique<group_core>());
+        group_core* bond = bonds_.back().get();
         bond->owner_count = sizeof...(Ts);
         for (std::size_t i = 0; i < pools.size(); ++i)
         {
@@ -6063,7 +6211,7 @@ public:
         }
         // One-time partition build: partition the FIRST owner probing all
         // others, then mirror each remaining owner's prefix into its order.
-        detail::pool_base& first = *pools[0];
+        pool_base& first = *pools[0];
         std::uint32_t k = 0;
         const auto n = static_cast<std::uint32_t>(first.size());
         for (std::uint32_t pos = 0; pos < n; ++pos)
@@ -6095,7 +6243,7 @@ public:
             }
         }
         bond->paired = k;
-        for (detail::pool_base* pool : pools)
+        for (pool_base* pool : pools)
         {
             pool->bond_ = bond;  // armed last: the build itself must not re-enter
         }
@@ -6109,15 +6257,15 @@ public:
         requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
     bool unbond()
     {
-        const std::array<detail::pool_base*, sizeof...(Ts)> pools{peek_pool<detail::bare<Ts>>()...};
-        detail::group_core* bond = standing_bond(pools);
+        const std::array<pool_base*, sizeof...(Ts)> pools{peek_pool<detail::bare<Ts>>()...};
+        group_core* bond = standing_bond(pools);
         if (bond == nullptr)
         {
             return false;
         }
         if constexpr (checks_enabled)
         {
-            for (detail::pool_base* pool : pools)
+            for (pool_base* pool : pools)
             {
                 if (pool->locked())
                 {
@@ -6129,7 +6277,7 @@ public:
         bond->owners = {};  // tombstone
         bond->owner_count = 0;
         bond->paired = 0;
-        for (detail::pool_base* pool : pools)
+        for (pool_base* pool : pools)
         {
             pool->bond_ = nullptr;
         }
@@ -6143,13 +6291,13 @@ public:
     // over exactly the plain-listed set: checked violation, empty view.
     template <class... Ts, class... Xs>
         requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] bonded_view_t<except<Xs...>, Ts...> bonded(except<Xs...>)
+    [[nodiscard]] basic_bonded_view<Traits, except<Xs...>, Ts...> bonded(except<Xs...>)
     {
         constexpr std::size_t n = sizeof...(Ts);
         constexpr std::array<bool, n> observed{detail::is_maybe_v<Ts>...};
-        const std::array<detail::pool_base*, n> pools{
+        const std::array<pool_base*, n> pools{
             peek_pool<detail::bare<detail::maybe_inner<Ts>>>()...};
-        const detail::group_core* bond = nullptr;
+        const group_core* bond = nullptr;
         bool listed_exactly = true;
         std::size_t owned_listed = 0;
         for (std::size_t i = 0; i < n; ++i)
@@ -6178,13 +6326,13 @@ public:
             }
             return {};
         }
-        const std::array<detail::pool_base*, sizeof...(Xs)> excludes{peek_pool<Xs>()...};
-        return bonded_view_t<except<Xs...>, Ts...>(pools, excludes, bond);
+        const std::array<pool_base*, sizeof...(Xs)> excludes{peek_pool<Xs>()...};
+        return basic_bonded_view<Traits, except<Xs...>, Ts...>(pools, excludes, bond);
     }
 
     template <class... Ts>
         requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] bonded_view_t<except<>, Ts...> bonded()
+    [[nodiscard]] basic_bonded_view<Traits, except<>, Ts...> bonded()
     {
         return bonded<Ts...>(except<>{});
     }
@@ -6216,7 +6364,7 @@ public:
     template <component T>
     hook_token on_add(component_hook fn, void* user = nullptr)
     {
-        return connect_hook<T>(detail::pool_base::hook_kind::add, fn, user);
+        return connect_hook<T>(pool_base::hook_kind::add, fn, user);
     }
 
     // Compile-time candidate: free function or capture-less callable, taking
@@ -6225,7 +6373,7 @@ public:
     hook_token on_add()
     {
         return connect_hook<T>(
-            detail::pool_base::hook_kind::add, detail::free_hook_thunk<Candidate>(), nullptr);
+            pool_base::hook_kind::add, detail::free_hook_thunk<Traits, Candidate>(), nullptr);
     }
 
     // Member function (or instance-first callable) bound to an instance that
@@ -6235,8 +6383,8 @@ public:
     hook_token on_add(Inst* instance)
     {
         return connect_hook<T>(
-            detail::pool_base::hook_kind::add,
-            detail::bound_hook_thunk<Candidate, Inst>(),
+            pool_base::hook_kind::add,
+            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
             const_cast<void*>(static_cast<const void*>(instance)));
     }
@@ -6246,22 +6394,22 @@ public:
     template <component T>
     hook_token on_remove(component_hook fn, void* user = nullptr)
     {
-        return connect_hook<T>(detail::pool_base::hook_kind::remove, fn, user);
+        return connect_hook<T>(pool_base::hook_kind::remove, fn, user);
     }
 
     template <component T, auto Candidate>
     hook_token on_remove()
     {
         return connect_hook<T>(
-            detail::pool_base::hook_kind::remove, detail::free_hook_thunk<Candidate>(), nullptr);
+            pool_base::hook_kind::remove, detail::free_hook_thunk<Traits, Candidate>(), nullptr);
     }
 
     template <component T, auto Candidate, class Inst>
     hook_token on_remove(Inst* instance)
     {
         return connect_hook<T>(
-            detail::pool_base::hook_kind::remove,
-            detail::bound_hook_thunk<Candidate, Inst>(),
+            pool_base::hook_kind::remove,
+            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
             const_cast<void*>(static_cast<const void*>(instance)));
     }
@@ -6274,7 +6422,7 @@ public:
     {
         static_assert(!detail::is_tag_v<T>,
                       "quiver: tags carry no data and are never replaced; use on_add/on_remove");
-        return connect_hook<T>(detail::pool_base::hook_kind::replace, fn, user);
+        return connect_hook<T>(pool_base::hook_kind::replace, fn, user);
     }
 
     template <component T, auto Candidate>
@@ -6283,7 +6431,7 @@ public:
         static_assert(!detail::is_tag_v<T>,
                       "quiver: tags carry no data and are never replaced; use on_add/on_remove");
         return connect_hook<T>(
-            detail::pool_base::hook_kind::replace, detail::free_hook_thunk<Candidate>(), nullptr);
+            pool_base::hook_kind::replace, detail::free_hook_thunk<Traits, Candidate>(), nullptr);
     }
 
     template <component T, auto Candidate, class Inst>
@@ -6292,8 +6440,8 @@ public:
         static_assert(!detail::is_tag_v<T>,
                       "quiver: tags carry no data and are never replaced; use on_add/on_remove");
         return connect_hook<T>(
-            detail::pool_base::hook_kind::replace,
-            detail::bound_hook_thunk<Candidate, Inst>(),
+            pool_base::hook_kind::replace,
+            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
             const_cast<void*>(static_cast<const void*>(instance)));
     }
@@ -6339,14 +6487,15 @@ public:
             // The typename is required here: a dependent template argument is
             // not one of C++20's typename-optional contexts.
             // NOLINTNEXTLINE(readability-redundant-typename)
-            using result = selection_t<except<Xs...>, typename detail::as_const_part<Ts>::type...>;
+            using result =
+                basic_selection<Traits, except<Xs...>, typename detail::as_const_part<Ts>::type...>;
             // Missing include pools propagate as null -> an empty selection.
             return result{self.template flat_include_pools<Ts...>(),
                           {self.template pool_base_of<Xs>()...}};
         }
         else
         {
-            using result = selection_t<except<Xs...>, Ts...>;
+            using result = basic_selection<Traits, except<Xs...>, Ts...>;
             // maybe<T> contributes its inner type's pool, any_of<As...> one
             // pool per alternative; registering keeps the selection's pointer
             // array complete (a never-added member stays empty).
@@ -6476,7 +6625,7 @@ public:
                 }
             }
         }
-        auto& pool = ensure_pool<detail::kin>();
+        auto& pool = ensure_pool<kin>();
         if constexpr (checks_enabled)
         {
             if (pool.locked())
@@ -6485,7 +6634,7 @@ public:
                 return;
             }
         }
-        detail::kin* child_k = pool.at(child.index());
+        kin* child_k = pool.at(child.index());
         if (child_k == nullptr)
         {
             child_k = &pool.emplace(child);
@@ -6494,7 +6643,7 @@ public:
         {
             detail::kin_links::unlink(pool, *child_k);
         }
-        detail::kin* parent_k = pool.at(parent.index());
+        kin* parent_k = pool.at(parent.index());
         if (parent_k == nullptr)
         {
             // Stable storage: emplacing the parent's record cannot move child_k.
@@ -6521,12 +6670,12 @@ public:
             }
             return;
         }
-        auto* pool = peek_pool<detail::kin>();
+        auto* pool = peek_pool<kin>();
         if (pool == nullptr)
         {
             return;
         }
-        detail::kin* k = pool->at(child.index());
+        kin* k = pool->at(child.index());
         if (k == nullptr || k->parent == no_entity)
         {
             return;
@@ -6547,12 +6696,12 @@ public:
 
     [[nodiscard]] entity parent_of(entity child) const noexcept
     {
-        const auto* pool = peek_pool<detail::kin>();
+        const auto* pool = peek_pool<kin>();
         if (pool == nullptr || !table_.alive(child))
         {
             return no_entity;
         }
-        const detail::kin* k = pool->at(child.index());
+        const kin* k = pool->at(child.index());
         return k == nullptr ? no_entity : k->parent;
     }
 
@@ -6563,17 +6712,17 @@ public:
     template <class F>
     void children_of(entity parent, F&& fn) const
     {
-        const auto* pool = peek_pool<detail::kin>();
+        const auto* pool = peek_pool<kin>();
         if (pool == nullptr || !table_.alive(parent))
         {
             return;
         }
-        const detail::kin* k = pool->at(parent.index());
+        const kin* k = pool->at(parent.index());
         if (k == nullptr)
         {
             return;
         }
-        const detail::single_pool_lock lock(pool);  // unwinds on early exit and exceptions
+        const single_pool_lock lock(pool);  // unwinds on early exit and exceptions
         for (entity child = k->first_child; child != no_entity;)
         {
             const entity next = pool->at(child.index())->next_sibling;
@@ -6620,7 +6769,8 @@ public:
             {
                 continue;
             }
-            const entity e{slot, table_.generation_at(slot)};
+            const entity e(static_cast<typename Traits::index_type>(slot),
+                           table_.generation_at(slot));
             if constexpr (std::predicate<F&, entity>)
             {
                 if (!fn(e))
@@ -6696,7 +6846,7 @@ public:
                 return;
             }
         }
-        for (detail::pool_base* pool : active_)
+        for (pool_base* pool : active_)
         {
             pool->compact();
         }
@@ -6714,7 +6864,7 @@ public:
     template <class F>
     void each_pool(F&& fn) const
     {
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             fn(pool->info());
         }
@@ -6730,7 +6880,7 @@ public:
         {
             return;
         }
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             if (pool->contains(e.index()))
             {
@@ -6745,7 +6895,7 @@ public:
     {
         memory_footprint f{};
         f.entity_table_bytes = table_.bytes();
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             const pool_info info = pool->info();
             f.component_bytes += info.capacity * info.bytes_per_item;
@@ -6774,7 +6924,7 @@ public:
     // the form save files and tools should persist. O(pools this world uses).
     [[nodiscard]] pool_ref find_pool_by_hash(std::uint64_t name_hash) const noexcept
     {
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             if (pool->name_hash() == name_hash)
             {
@@ -6793,7 +6943,7 @@ public:
         {
             return r;
         }
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             if (auto r = pool->check(table_); !r)
             {
@@ -6814,12 +6964,13 @@ public:
 
 private:
     friend struct test_access;
-    friend class scoped_hook;  // resolves its pool anchor through the token
+    template <class>
+    friend class basic_scoped_hook;  // resolves its pool anchor through the token
 
     // The pool a hook token belongs to; null for empty/stale tokens. Pools
     // are heap-stable for the world's life, so the pointer survives world
     // moves (the connections move with the pools).
-    [[nodiscard]] detail::pool_base* pool_for_token(hook_token token) noexcept
+    [[nodiscard]] pool_base* pool_for_token(hook_token token) noexcept
     {
         if (!token || token.pool >= pools_.size() || !pools_[token.pool])
         {
@@ -6843,7 +6994,7 @@ private:
     template <component T>
     pool_of_t<T>& ensure_pool()
     {
-        static_assert(component_pool<pool_of_t<T>>,
+        static_assert(component_pool<pool_of_t<T>, Traits>,
                       "quiver: pool_of<T> specializations must derive quiver::basic_pool (via "
                       "packed_pool_of / stable_pool_of / tag_pool_of, or from scratch) and "
                       "construct from a std::pmr::memory_resource* — see the pool_of seam "
@@ -6862,7 +7013,7 @@ private:
             {
                 // Cold, once per type: a name-hash collision would corrupt any
                 // snapshot keyed on hash_of, so make it loud immediately.
-                for (const detail::pool_base* existing : active_)
+                for (const pool_base* existing : active_)
                 {
                     if (existing->name_hash() == pool->name_hash())
                     {
@@ -6891,7 +7042,7 @@ private:
     }
 
     template <component T>
-    [[nodiscard]] detail::pool_base* pool_base_of() const noexcept
+    [[nodiscard]] pool_base* pool_base_of() const noexcept
     {
         return peek_pool<T>();
     }
@@ -6914,14 +7065,14 @@ private:
         constexpr std::size_t n =
             (std::size_t{0} + ... +
              detail::any_of_traits<detail::bare<detail::maybe_inner<Es>>>::width);
-        std::array<detail::pool_base*, n> out{};
+        std::array<pool_base*, n> out{};
         std::size_t at = 0;
         (self.template fill_flat<Es>(out, at), ...);
         return out;
     }
 
     template <class E, std::size_t N, class Self>
-    void fill_flat(this Self&& self, std::array<detail::pool_base*, N>& out, std::size_t& at)
+    void fill_flat(this Self&& self, std::array<pool_base*, N>& out, std::size_t& at)
     {
         using core = detail::bare<detail::maybe_inner<E>>;
         constexpr bool from_const = std::is_const_v<std::remove_reference_t<Self>>;
@@ -6955,22 +7106,21 @@ private:
     // The group whose owned set is EXACTLY the given pools (any order); null
     // when any pool is missing, unbonded, or the sets differ.
     template <std::size_t N>
-    [[nodiscard]] static detail::group_core* standing_bond(
-        const std::array<detail::pool_base*, N>& pools) noexcept
+    [[nodiscard]] static group_core* standing_bond(const std::array<pool_base*, N>& pools) noexcept
     {
-        for (detail::pool_base* pool : pools)
+        for (pool_base* pool : pools)
         {
             if (pool == nullptr)
             {
                 return nullptr;
             }
         }
-        detail::group_core* bond = pools[0]->bond_;
+        group_core* bond = pools[0]->bond_;
         if (bond == nullptr || bond->owner_count != N)
         {
             return nullptr;
         }
-        for (detail::pool_base* pool : pools)
+        for (pool_base* pool : pools)
         {
             if (!bond->owns(pool))
             {
@@ -7022,7 +7172,7 @@ private:
 
     [[nodiscard]] bool any_locked() const noexcept
     {
-        for (const detail::pool_base* pool : active_)
+        for (const pool_base* pool : active_)
         {
             if (pool->locked())
             {
@@ -7035,14 +7185,14 @@ private:
     // Hooks receive the owning world; moves must re-aim the back-pointers.
     void repoint_pools() noexcept
     {
-        for (detail::pool_base* pool : active_)
+        for (pool_base* pool : active_)
         {
             pool->owner_ = this;
         }
     }
 
     template <component T>
-    hook_token connect_hook(detail::pool_base::hook_kind kind, component_hook fn, void* user)
+    hook_token connect_hook(pool_base::hook_kind kind, component_hook fn, void* user)
     {
         auto& pool = ensure_pool<T>();
         if constexpr (checks_enabled)
@@ -7067,7 +7217,7 @@ private:
     {
         if constexpr (checks_enabled)
         {
-            for (const detail::pool_base* pool : active_)
+            for (const pool_base* pool : active_)
             {
                 if (pool->locked())
                 {
@@ -7110,7 +7260,7 @@ private:
                 // The nonce stamped into the handle must match the applying
                 // buffer: handles from another buffer, or recorded before a
                 // clear(), are refused rather than silently mis-resolved.
-                const std::uint32_t ticket = target.index() & ~detail::provisional_bit;
+                const std::uint32_t ticket = target.index() & ~limits::provisional_bit;
                 if (target.generation() != buffer.nonce_ || ticket >= buffer.resolved_.size())
                 {
                     if constexpr (checks_enabled)
@@ -7145,7 +7295,7 @@ private:
     // Thin shims over detail::kin_links so call sites read as policy.
     void sever_links(entity e) noexcept
     {
-        if (auto* pool = peek_pool<detail::kin>())
+        if (auto* pool = peek_pool<kin>())
         {
             detail::kin_links::sever(*pool, e);
         }
@@ -7159,7 +7309,7 @@ private:
             {
                 continue;
             }
-            const detail::pool_base& first = *bond->owners[0];
+            const pool_base& first = *bond->owners[0];
             for (std::uint32_t i = 0; i < bond->owner_count; ++i)
             {
                 if (bond->paired > bond->owners[i]->size())
@@ -7186,7 +7336,7 @@ private:
             }
             // Completeness: no intersection member may sit beyond the
             // partition. Walk the smallest owner's tail probing all others.
-            const detail::pool_base* smallest = &first;
+            const pool_base* smallest = &first;
             for (std::uint32_t i = 1; i < bond->owner_count; ++i)
             {
                 if (bond->owners[i]->size() < smallest->size())
@@ -7216,27 +7366,33 @@ private:
 
     [[nodiscard]] std::expected<void, fault> check_links() const
     {
-        const auto* pool = peek_pool<detail::kin>();
+        const auto* pool = peek_pool<kin>();
         return pool == nullptr ? std::expected<void, fault>{}
                                : detail::kin_links::check(*pool, table_);
     }
 
-    detail::entity_table table_;
-    std::pmr::vector<std::unique_ptr<detail::pool_base>> pools_;  // indexed by type_id (holes ok)
+    entity_table table_;
+    std::pmr::vector<std::unique_ptr<pool_base>> pools_;  // indexed by type_id (holes ok)
     // Dense, creation-order view of the same pools. The pools_ vector is sized
     // by the largest process-global type id this world has touched, so worlds
     // in multi-world processes carry null holes there; every O(pools) walk
     // (kill, apply, reset, shrink, each_pool, validate) uses this list instead.
-    std::pmr::vector<detail::pool_base*> active_;
+    std::pmr::vector<pool_base*> active_;
     // Bond objects are heap-stable for the life of the world; unbond
     // tombstones instead of freeing so stored bonded_views degrade to empty.
-    std::pmr::vector<std::unique_ptr<detail::group_core>> bonds_;
+    std::pmr::vector<std::unique_ptr<group_core>> bonds_;
     std::pmr::memory_resource* memory_;
     // Guards against hooks resurrecting state on doomed entities (see add()):
     entity dying_;           // the entity kill() is currently sweeping
     bool clearing_ = false;  // reset() is wiping pools
     entity globals_;         // cached globals() carrier; revalidated on use
 };
+
+// The classic world: the default-traits alias every existing spelling uses.
+using world = basic_world<default_entity_traits>;
+
+using entity_ref = basic_entity_ref<world>;
+using const_entity_ref = basic_entity_ref<const world>;
 
 // ----------------------------------------------------------------------------
 // Scoped hooks
@@ -7250,24 +7406,25 @@ private:
 // after the iteration ends, or let a later destructor do it.
 // ----------------------------------------------------------------------------
 
-class scoped_hook
+template <class Traits>
+class basic_scoped_hook
 {
 public:
-    scoped_hook() = default;
+    basic_scoped_hook() = default;
 
-    scoped_hook(world& w, hook_token token) noexcept
+    basic_scoped_hook(basic_world<Traits>& w, hook_token token) noexcept
         : pool_(w.pool_for_token(token)),
           token_(token)
     {
     }
 
-    scoped_hook(scoped_hook&& other) noexcept
+    basic_scoped_hook(basic_scoped_hook&& other) noexcept
         : pool_(std::exchange(other.pool_, nullptr)),
           token_(std::exchange(other.token_, hook_token{}))
     {
     }
 
-    scoped_hook& operator=(scoped_hook&& other) noexcept
+    basic_scoped_hook& operator=(basic_scoped_hook&& other) noexcept
     {
         if (this != &other)
         {
@@ -7278,10 +7435,10 @@ public:
         return *this;
     }
 
-    scoped_hook(const scoped_hook&) = delete;
-    scoped_hook& operator=(const scoped_hook&) = delete;
+    basic_scoped_hook(const basic_scoped_hook&) = delete;
+    basic_scoped_hook& operator=(const basic_scoped_hook&) = delete;
 
-    ~scoped_hook() { release(); }
+    ~basic_scoped_hook() { release(); }
 
     // Disconnect now; idempotent. Refused (token kept) while the pool
     // iterates, so a retry stays possible.
@@ -7310,9 +7467,11 @@ public:
     explicit operator bool() const noexcept { return static_cast<bool>(token_); }
 
 private:
-    detail::pool_base* pool_ = nullptr;
+    detail::basic_pool_base<Traits>* pool_ = nullptr;
     hook_token token_{};
 };
+
+using scoped_hook = basic_scoped_hook<default_entity_traits>;
 
 // ----------------------------------------------------------------------------
 // Trackers
@@ -7358,9 +7517,13 @@ enum class track : std::uint8_t
     return static_cast<track>(static_cast<std::uint8_t>(a) & static_cast<std::uint8_t>(b));
 }
 
-template <component T>
+template <component T, class Traits = default_entity_traits>
 class tracker
 {
+    using entity = quiver::basic_entity<Traits>;
+    using world = basic_world<Traits>;
+    using scoped_hook = basic_scoped_hook<Traits>;
+
 public:
     explicit tracker(world& w,
                      track which = track::all,
@@ -7374,18 +7537,19 @@ public:
     {
         if ((which & track::added) == track::added)
         {
-            on_added_ = scoped_hook(w, w.on_add<T>(&tracker::record_added, this));
+            on_added_ = scoped_hook(w, w.template on_add<T>(&tracker::record_added, this));
         }
         if constexpr (!detail::is_tag_v<T>)
         {
             if ((which & track::replaced) == track::replaced)
             {
-                on_replaced_ = scoped_hook(w, w.on_replace<T>(&tracker::record_replaced, this));
+                on_replaced_ =
+                    scoped_hook(w, w.template on_replace<T>(&tracker::record_replaced, this));
             }
         }
         if ((which & track::removed) == track::removed)
         {
-            on_removed_ = scoped_hook(w, w.on_remove<T>(&tracker::record_removed, this));
+            on_removed_ = scoped_hook(w, w.template on_remove<T>(&tracker::record_removed, this));
         }
     }
 
@@ -7583,9 +7747,14 @@ struct watcher_triggers_ok<types<Cs...>>
 };
 }  // namespace detail
 
-template <class... Specs>
-class watcher
+template <class Traits, class... Specs>
+class basic_watcher
 {
+    using entity = quiver::basic_entity<Traits>;
+    using world = basic_world<Traits>;
+    using scoped_hook = basic_scoped_hook<Traits>;
+    using watcher = basic_watcher;  // the historical body spelling
+
     static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_includes}) ==
                       1,
                   "quiver: a watcher takes exactly one types<...> condition list");
@@ -7622,7 +7791,8 @@ class watcher
                                               detail::list_size<trigger_list>::value;
 
 public:
-    explicit watcher(world& w, std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    explicit basic_watcher(world& w,
+                           std::pmr::memory_resource* memory = std::pmr::get_default_resource())
         : seen_(memory),
           matched_(memory)
     {
@@ -7632,11 +7802,11 @@ public:
         connect_triggers(w, k, trigger_list{});
     }
 
-    watcher(const watcher&) = delete;  // pinned: the hooks hold `this`
-    watcher(watcher&&) = delete;
-    watcher& operator=(const watcher&) = delete;
-    watcher& operator=(watcher&&) = delete;
-    ~watcher() = default;  // scoped_hooks disconnect
+    basic_watcher(const basic_watcher&) = delete;  // pinned: the hooks hold `this`
+    basic_watcher(basic_watcher&&) = delete;
+    basic_watcher& operator=(const basic_watcher&) = delete;
+    basic_watcher& operator=(basic_watcher&&) = delete;
+    ~basic_watcher() = default;  // scoped_hooks disconnect
 
     // Deduplicated; every entry currently matches the condition set.
     [[nodiscard]] std::span<const entity> matched() const noexcept { return matched_; }
@@ -7662,8 +7832,8 @@ private:
     template <class... Is>
     void connect_includes(world& w, std::size_t& k, types<Is...>)
     {
-        ((hooks_[k] = scoped_hook(w, w.on_add<Is>(&watcher::probe_edge, this)),
-          hooks_[k + 1] = scoped_hook(w, w.on_remove<Is>(&watcher::evict_edge, this)),
+        ((hooks_[k] = scoped_hook(w, w.template on_add<Is>(&watcher::probe_edge, this)),
+          hooks_[k + 1] = scoped_hook(w, w.template on_remove<Is>(&watcher::evict_edge, this)),
           k += 2),
          ...);
     }
@@ -7671,8 +7841,9 @@ private:
     template <class... Es>
     void connect_excludes(world& w, std::size_t& k, types<Es...>)
     {
-        ((hooks_[k] = scoped_hook(w, w.on_add<Es>(&watcher::evict_edge, this)),
-          hooks_[k + 1] = scoped_hook(w, w.on_remove<Es>(&watcher::unshielded_edge<Es>, this)),
+        ((hooks_[k] = scoped_hook(w, w.template on_add<Es>(&watcher::evict_edge, this)),
+          hooks_[k + 1] =
+              scoped_hook(w, w.template on_remove<Es>(&watcher::unshielded_edge<Es>, this)),
           k += 2),
          ...);
     }
@@ -7680,7 +7851,8 @@ private:
     template <class... Cs>
     void connect_triggers(world& w, std::size_t& k, types<Cs...>)
     {
-        ((hooks_[k++] = scoped_hook(w, w.on_replace<Cs>(&watcher::probe_edge, this))), ...);
+        ((hooks_[k++] = scoped_hook(w, w.template on_replace<Cs>(&watcher::probe_edge, this))),
+         ...);
     }
 
     static void probe_edge(world& w, entity e, void* user)
@@ -7750,6 +7922,10 @@ private:
     std::array<scoped_hook, hook_count> hooks_;
 };
 
+// The public spelling: condition lists over the classic world.
+template <class... Specs>
+using watcher = basic_watcher<default_entity_traits, Specs...>;
+
 // ----------------------------------------------------------------------------
 // Archives: pack / unpack / graft
 //
@@ -7792,37 +7968,57 @@ private:
 // restore_entity.
 // ----------------------------------------------------------------------------
 
-template <class W>
-concept archive_writer = requires(W& w, std::uint64_t n, entity e) {
+template <class W, class Traits = default_entity_traits>
+concept archive_writer = requires(W& w, std::uint64_t n, basic_entity<Traits> e) {
     w(n);
     w(e);
 };
 
-template <class W, class T>
+template <class W, class T, class Traits = default_entity_traits>
 concept archive_writer_for =
-    archive_writer<W> && (detail::is_tag_v<T> || requires(W& w, const T& v) { w(v); });
+    archive_writer<W, Traits> && (detail::is_tag_v<T> || requires(W& w, const T& v) { w(v); });
 
-template <class R>
-concept archive_reader = requires(R& r, std::uint64_t& n, entity& e) {
+template <class R, class Traits = default_entity_traits>
+concept archive_reader = requires(R& r, std::uint64_t& n, basic_entity<Traits>& e) {
     r(n);
     r(e);
 };
 
-template <class R, class T>
+template <class R, class T, class Traits = default_entity_traits>
 concept archive_reader_for =
-    archive_reader<R> && (detail::is_tag_v<T> || requires(R& r, T& v) { r(v); });
+    archive_reader<R, Traits> && (detail::is_tag_v<T> || requires(R& r, T& v) { r(v); });
 
 namespace detail
 {
 struct archive_access;
+
+// One u64 stamp identifying the handle layout a stream was packed with;
+// unpack/graft refuse streams from a different layout with archive_mismatch.
+template <class Traits>
+[[nodiscard]] consteval std::uint64_t layout_stamp() noexcept
+{
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    const auto mix = [&h](std::uint64_t v)
+    {
+        h ^= v;
+        h *= 0x100000001b3ull;
+    };
+    mix(static_cast<std::uint64_t>(std::numeric_limits<typename Traits::index_type>::digits));
+    mix(Traits::index_bits);
+    mix(static_cast<std::uint64_t>(std::numeric_limits<typename Traits::generation_type>::digits));
+    return h;
 }
+}  // namespace detail
 
 // The old-handle → fresh-handle mapping a graft produces. Sorted by old slot
 // (pack emits slot order); resolve is a binary search.
-class graft_map
+template <class Traits>
+class basic_graft_map
 {
+    using entity = quiver::basic_entity<Traits>;
+
 public:
-    explicit graft_map(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    explicit basic_graft_map(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
         : pairs_(memory)
     {
     }
@@ -7838,7 +8034,7 @@ public:
         {
             return it->second;
         }
-        return no_entity;
+        return entity{};
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return pairs_.size(); }
@@ -7858,11 +8054,14 @@ private:
     std::pmr::vector<std::pair<entity, entity>> pairs_;
 };
 
+using graft_map = basic_graft_map<default_entity_traits>;
+
 namespace detail
 {
 struct archive_access  // pack/unpack/graft internals; not user API
 {
-    static std::pmr::vector<std::pair<entity, entity>>& pairs(graft_map& map) noexcept
+    template <class Traits>
+    static auto& pairs(basic_graft_map<Traits>& map) noexcept
     {
         return map.pairs_;
     }
@@ -7890,11 +8089,12 @@ struct relink_traits
 
 namespace detail
 {
-template <component T, class W>
-void pack_one(const world& w, W& out)
+template <component T, class Traits, class W>
+void pack_one(const basic_world<Traits>& w, W& out)
 {
+    using entity = quiver::basic_entity<Traits>;
     out(hash_of<T>());
-    const auto sel = w.select<T>();  // const world: all-const, never registers
+    const auto sel = w.template select<T>();  // const world: all-const, never registers
     out(static_cast<std::uint64_t>(sel.count()));
     if constexpr (is_tag_v<T>)
     {
@@ -7911,9 +8111,10 @@ void pack_one(const world& w, W& out)
     }
 }
 
-template <component T, class R>
-[[nodiscard]] std::expected<void, fault> unpack_one(world& w, R& in)
+template <component T, class Traits, class R>
+[[nodiscard]] std::expected<void, fault> unpack_one(basic_world<Traits>& w, R& in)
 {
+    using entity = quiver::basic_entity<Traits>;
     std::uint64_t hash{};
     in(hash);
     if (hash != hash_of<T>())
@@ -7934,7 +8135,7 @@ template <component T, class R>
         }
         if constexpr (is_tag_v<T>)
         {
-            w.add<T>(e);
+            w.template add<T>(e);
         }
         else
         {
@@ -7943,15 +8144,19 @@ template <component T, class R>
                           "move it into the world; give T those operations or load manually");
             T value{};
             in(value);
-            w.add<T>(e, std::move(value));
+            w.template add<T>(e, std::move(value));
         }
     }
     return {};
 }
 
-template <component T, class R>
-[[nodiscard]] std::expected<void, fault> graft_one(world& w, R& in, const graft_map& map)
+template <component T, class Traits, class R>
+[[nodiscard]] std::expected<void, fault> graft_one(basic_world<Traits>& w,
+                                                   R& in,
+                                                   const basic_graft_map<Traits>& map)
 {
+    using entity = quiver::basic_entity<Traits>;
+    constexpr entity no_entity{};  // shadows the default-traits constant
     std::uint64_t hash{};
     in(hash);
     if (hash != hash_of<T>())
@@ -7973,7 +8178,7 @@ template <component T, class R>
         }
         if constexpr (is_tag_v<T>)
         {
-            w.add<T>(owner);
+            w.template add<T>(owner);
         }
         else
         {
@@ -7986,43 +8191,48 @@ template <component T, class R>
             {
                 relink_traits<T>::relink(value, map);
             }
-            w.add<T>(owner, std::move(value));
+            w.template add<T>(owner, std::move(value));
         }
     }
     return {};
 }
 }  // namespace detail
 
-// Serializes the live entity set plus the listed component types.
-template <component... Ts, class W>
-void pack(const world& w, W& out)
+// Serializes the live entity set plus the listed component types. The
+// stream opens with a layout stamp naming the handle traits it was packed
+// with; loads under different traits refuse with archive_mismatch.
+template <component... Ts, class Traits, class W>
+void pack(const basic_world<Traits>& w, W& out)
 {
+    using entity = quiver::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "quiver: pack needs at least one component type");
-    static_assert((archive_writer_for<W, Ts> && ...),
+    static_assert((archive_writer_for<W, Ts, Traits> && ...),
                   "quiver: the writer must be callable with std::uint64_t, quiver::entity, and "
                   "each non-tag component as (const T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
                   "quiver: pack/unpack/graft take plain component types");
     static_assert(detail::all_distinct<Ts...>, "quiver: duplicate component type in pack");
+    out(detail::layout_stamp<Traits>());
     out(static_cast<std::uint64_t>(w.live_count()));
     w.live_entities([&](entity e) { out(e); });
     (detail::pack_one<Ts>(w, out), ...);
 }
 
 // Manifest form: pack(world, writer, Saved{}).
-template <class W, component... Ts>
-void pack(const world& w, W& out, types<Ts...>)
+template <class Traits, class W, component... Ts>
+void pack(const basic_world<Traits>& w, W& out, types<Ts...>)
 {
     pack<Ts...>(w, out);
 }
 
 // Restores a pack stream into an EMPTY world: exact index+generation pairs
 // (rollback semantics — handles saved elsewhere stay meaningful).
-template <component... Ts, class R>
-[[nodiscard]] std::expected<void, fault> unpack(world& w, R& in)
+template <component... Ts, class Traits, class R>
+[[nodiscard]] std::expected<void, fault> unpack(basic_world<Traits>& w, R& in)
 {
+    using entity = quiver::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "quiver: unpack needs at least one component type");
-    static_assert((archive_reader_for<R, Ts> && ...),
+    static_assert((archive_reader_for<R, Ts, Traits> && ...),
                   "quiver: the reader must be callable with std::uint64_t&, quiver::entity&, "
                   "and each non-tag component as (T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
@@ -8034,6 +8244,13 @@ template <component... Ts, class R>
             detail::violate("unpack into a non-empty world (reset() it, or use graft)");
         }
         return std::unexpected(fault{fault_code::world_not_empty, {}, "unpack target"});
+    }
+    std::uint64_t stamp{};
+    in(stamp);
+    if (stamp != detail::layout_stamp<Traits>())
+    {
+        return std::unexpected(
+            fault{fault_code::archive_mismatch, {}, "stream packed with different entity traits"});
     }
     std::uint64_t count{};
     in(count);
@@ -8053,8 +8270,8 @@ template <component... Ts, class R>
 }
 
 // Manifest form: unpack(world, reader, Saved{}).
-template <class R, component... Ts>
-[[nodiscard]] std::expected<void, fault> unpack(world& w, R& in, types<Ts...>)
+template <class Traits, class R, component... Ts>
+[[nodiscard]] std::expected<void, fault> unpack(basic_world<Traits>& w, R& in, types<Ts...>)
 {
     return unpack<Ts...>(w, in);
 }
@@ -8062,18 +8279,28 @@ template <class R, component... Ts>
 // Merges a pack stream into a (possibly populated) world: every archived
 // entity becomes a FRESH spawn; returns the old→new map. Component values
 // relink their stored handles per relink_traits (explicit opt-in).
-template <component... Ts, class R>
-[[nodiscard]] std::expected<graft_map, fault> graft(
-    world& w, R& in, std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+template <component... Ts, class Traits, class R>
+[[nodiscard]] std::expected<basic_graft_map<Traits>, fault> graft(
+    basic_world<Traits>& w,
+    R& in,
+    std::pmr::memory_resource* memory = std::pmr::get_default_resource())
 {
+    using entity = quiver::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "quiver: graft needs at least one component type");
-    static_assert((archive_reader_for<R, Ts> && ...),
+    static_assert((archive_reader_for<R, Ts, Traits> && ...),
                   "quiver: the reader must be callable with std::uint64_t&, quiver::entity&, "
                   "and each non-tag component as (T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
                   "quiver: pack/unpack/graft take plain component types");
-    graft_map map(memory);
+    basic_graft_map<Traits> map(memory);
     auto& pairs = detail::archive_access::pairs(map);
+    std::uint64_t stamp{};
+    in(stamp);
+    if (stamp != detail::layout_stamp<Traits>())
+    {
+        return std::unexpected(
+            fault{fault_code::archive_mismatch, {}, "stream packed with different entity traits"});
+    }
     std::uint64_t count{};
     in(count);
     pairs.reserve(count);
@@ -8093,9 +8320,9 @@ template <component... Ts, class R>
 }
 
 // Manifest form: graft(world, reader, Saved{}).
-template <class R, component... Ts>
-[[nodiscard]] std::expected<graft_map, fault> graft(
-    world& w,
+template <class Traits, class R, component... Ts>
+[[nodiscard]] std::expected<basic_graft_map<Traits>, fault> graft(
+    basic_world<Traits>& w,
     R& in,
     types<Ts...>,
     std::pmr::memory_resource* memory = std::pmr::get_default_resource())
@@ -8125,21 +8352,26 @@ template <class R, component... Ts>
 // state). Move-only; stages must outlive nothing — the pipeline owns them.
 // ----------------------------------------------------------------------------
 
-class pipeline
+template <class Traits>
+class basic_pipeline
 {
+    using world = basic_world<Traits>;
+    using command_buffer = basic_command_buffer<Traits>;
+    using pipeline = basic_pipeline;  // the historical body spelling
+
 public:
     using stage_fn = std::move_only_function<void(world&, float)>;
 
-    explicit pipeline(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    explicit basic_pipeline(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
         : deferred_(memory)
     {
     }
 
-    pipeline(pipeline&&) noexcept = default;
-    pipeline& operator=(pipeline&&) = default;  // not noexcept: deferred_ may rebind
-    pipeline(const pipeline&) = delete;
-    pipeline& operator=(const pipeline&) = delete;
-    ~pipeline() = default;
+    basic_pipeline(basic_pipeline&&) noexcept = default;
+    basic_pipeline& operator=(basic_pipeline&&) = default;  // not noexcept: deferred_ may rebind
+    basic_pipeline(const basic_pipeline&) = delete;
+    basic_pipeline& operator=(const basic_pipeline&) = delete;
+    ~basic_pipeline() = default;
 
     // Refused while run() executes (the running stage lives in this vector);
     // register stages between frames.
@@ -8192,6 +8424,8 @@ private:
     bool running_ = false;  // stage() during run() would relocate the running stage
 };
 
+using pipeline = basic_pipeline<default_entity_traits>;
+
 // ----------------------------------------------------------------------------
 // Entity references
 //
@@ -8210,6 +8444,7 @@ template <class W>  // W = world (full verb set) or const world (read-only)
 class basic_entity_ref
 {
     static constexpr bool writable = !std::is_const_v<W>;
+    using entity = typename std::remove_const_t<W>::entity;  // the world''s handle type
 
 public:
     basic_entity_ref() = default;
@@ -8340,17 +8575,20 @@ private:
     entity entity_;
 };
 
-inline entity_ref world::ref(entity e) noexcept
+template <class Traits>
+typename basic_world<Traits>::entity_ref basic_world<Traits>::ref(entity e) noexcept
 {
     return entity_ref{*this, e};
 }
 
-inline const_entity_ref world::ref(entity e) const noexcept
+template <class Traits>
+typename basic_world<Traits>::const_entity_ref basic_world<Traits>::ref(entity e) const noexcept
 {
     return const_entity_ref{*this, e};
 }
 
-inline entity_ref world::globals()
+template <class Traits>
+typename basic_world<Traits>::entity_ref basic_world<Traits>::globals()
 {
     if (!table_.alive(globals_))
     {
@@ -8369,7 +8607,8 @@ inline entity_ref world::globals()
     return entity_ref{*this, globals_};
 }
 
-inline const_entity_ref world::globals() const noexcept
+template <class Traits>
+typename basic_world<Traits>::const_entity_ref basic_world<Traits>::globals() const noexcept
 {
     if (table_.alive(globals_))
     {
@@ -8377,53 +8616,6 @@ inline const_entity_ref world::globals() const noexcept
     }
     // No spawning on const worlds; a dead-safe ref when none exists yet.
     return const_entity_ref{*this, select<globals_mark>().first()};
-}
-
-// --- command_buffer's deferred ops (need the complete world type) ---
-
-template <component T, command_buffer::op_kind Kind>
-void command_buffer::erased_apply(world& w, entity target, void* payload)
-{
-    T& value = *static_cast<T*>(payload);
-    if constexpr (Kind == op_kind::add)
-    {
-        w.add<T>(target, std::move(value));
-    }
-    else
-    {
-        w.put<T>(target, std::move(value));
-    }
-}
-
-template <component T, command_buffer::op_kind Kind>
-void command_buffer::erased_apply_tag(world& w, entity target)
-{
-    if constexpr (Kind == op_kind::add)
-    {
-        w.add<T>(target);
-    }
-    else
-    {
-        w.put<T>(target);
-    }
-}
-
-template <component T>
-void blueprint::erased_stamp(world& w, entity e)
-{
-    w.add<T>(e);
-}
-
-template <component T>
-void blueprint::erased_stamp_value(world& w, entity e, const void* payload)
-{
-    w.add<T>(e, *static_cast<const T*>(payload));  // copy: the recipe is reusable
-}
-
-template <component T>
-void command_buffer::erased_remove(world& w, entity target)
-{
-    w.remove<T>(target);
 }
 
 // ----------------------------------------------------------------------------
@@ -9314,8 +9506,8 @@ struct test_access
     {
         // Through the BASE pointer: test_access is the base's friend, and the
         // derived pools' using-declarations are their own access path.
-        static_cast<detail::pool_base*>(w.peek_pool<T>())->sparse_.set(e.index(),
-                                                                       detail::npos32 - 1);
+        static_cast<detail::pool_base*>(w.peek_pool<T>())
+            ->sparse_.set(e.index(), detail::npos32 - 1);
     }
 
     static void corrupt_generation(world& w, entity e) { ++w.table_.generation_[e.index()]; }
