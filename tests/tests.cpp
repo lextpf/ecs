@@ -765,6 +765,26 @@ static void test_command_buffer_spawn()
             CHECK(p.x == 77);
         });
     CHECK(found == 1);
+
+    // Value-pack spawn: the deferred path mirrors world.spawn(Cs&&...), and
+    // move-only payloads ride the arena like any recorded add.
+    ecs::command_buffer packs;
+    const ecs::entity prov = packs.spawn(Pos{5}, TagA{});
+    CHECK(!w.alive(prov));
+    packs.add<Hp>(prov, Hp{9});  // follow-up adds still target the provisional
+    const ecs::entity prov2 = packs.spawn(MoveOnly{43});
+
+    ecs::entity real1 = ecs::no_entity;
+    ecs::entity real2 = ecs::no_entity;
+    const ecs::apply_result pr =
+        w.apply(packs,
+                [&](ecs::entity provisional, ecs::entity real)
+                { (provisional == prov ? real1 : real2) = real; });
+    CHECK(pr.applied == 6 && pr.skipped == 0);
+    CHECK(prov2 != prov);
+    CHECK(w.get<Pos>(real1).x == 5 && w.has<TagA>(real1));
+    CHECK(w.get<Hp>(real1).hp == 9);
+    CHECK(*w.get<MoveOnly>(real2).box == 43);
     CHECK_VALID(w);
 }
 

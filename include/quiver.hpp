@@ -4836,6 +4836,21 @@ public:
         return provisional;
     }
 
+    // Deferred create with initial components, mirroring world.spawn(Cs&&...).
+    // Payloads are constructed now and moved into place at apply time; tag
+    // components ride along as empty values. O(components).
+    template <class... Cs>
+        requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
+                 (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint<Traits>> && ...))
+    entity spawn(Cs&&... components)
+    {
+        static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
+                      "quiver: duplicate component type in spawn(...)");
+        const entity provisional = spawn();
+        (record_value(provisional, std::forward<Cs>(components)), ...);
+        return provisional;
+    }
+
     // Deferred world.add<T>. The component is constructed now and moved into
     // place at apply time.
     template <component T, class... Args>
@@ -4936,6 +4951,23 @@ private:
         if (ops_.size() == ops_.capacity())
         {
             ops_.reserve(std::max<std::size_t>(16, ops_.capacity() * 2));
+        }
+    }
+
+    // Value-pack recording for spawn(Cs&&...): tags arrive as empty values,
+    // everything else is forwarded into the arena. Mirrors world's
+    // value-spawn dispatch.
+    template <class C>
+    void record_value(entity target, C&& value)
+    {
+        using T = std::remove_cvref_t<C>;
+        if constexpr (detail::is_tag_v<T>)
+        {
+            record<T, op_kind::add>(target);
+        }
+        else
+        {
+            record<T, op_kind::add>(target, std::forward<C>(value));
         }
     }
 

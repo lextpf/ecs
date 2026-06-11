@@ -120,6 +120,14 @@ void test_traits_compact_world()
     CHECK(applied.applied == 3);
     CHECK(w.select<Pos>().count() == 3);
 
+    // Value-pack spawns mint their provisional at the same spare bit.
+    ecs::basic_command_buffer<compact_traits> cmd2;
+    const compact_entity packed = cmd2.spawn(Pos{4}, Hp{1});
+    CHECK((packed.index() & (std::uint16_t{1} << 15)) != 0);
+    const auto applied2 = w.apply(cmd2);
+    CHECK(applied2.applied == 3);  // one spawn, two adds
+    CHECK(w.select<Pos>().count() == 4);
+
     // Kill recycles the slot and bumps the 16-bit generation.
     const compact_entity g = w.spawn();
     const auto slot = g.index();
