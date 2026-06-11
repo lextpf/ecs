@@ -988,45 +988,49 @@ void grow_if_full(Vector& v)
     }
 }
 
-class sparse_index
+template <entity_traits Traits>
+class basic_sparse_index
 {
 public:
-    static constexpr std::uint32_t page_size = 4096;  // entries; 16 KiB per page
+    using index_type = typename Traits::index_type;
 
-    explicit sparse_index(std::pmr::memory_resource* memory) noexcept
+    static constexpr index_type npos = entity_limits<Traits>::npos;
+    static constexpr std::uint32_t page_size = 4096;  // entries; bytes follow the width
+
+    explicit basic_sparse_index(std::pmr::memory_resource* memory) noexcept
         : memory_(memory),
           pages_(memory)
     {
     }
 
-    sparse_index(const sparse_index&) = delete;
-    sparse_index& operator=(const sparse_index&) = delete;
-    sparse_index(sparse_index&&) = delete;  // pools never move
-    sparse_index& operator=(sparse_index&&) = delete;
+    basic_sparse_index(const basic_sparse_index&) = delete;
+    basic_sparse_index& operator=(const basic_sparse_index&) = delete;
+    basic_sparse_index(basic_sparse_index&&) = delete;  // pools never move
+    basic_sparse_index& operator=(basic_sparse_index&&) = delete;
 
-    ~sparse_index() { clear(); }
+    ~basic_sparse_index() { clear(); }
 
-    // O(1): page lookup. npos32 when the key is absent.
-    [[nodiscard]] std::uint32_t get(std::uint32_t key) const noexcept
+    // O(1): page lookup. npos when the key is absent.
+    [[nodiscard]] index_type get(index_type key) const noexcept
     {
         const std::size_t p = key / page_size;
         if (p >= pages_.size() || pages_[p] == nullptr)
         {
-            return npos32;
+            return npos;
         }
         return pages_[p][key % page_size];
     }
 
-    void set(std::uint32_t key, std::uint32_t value)
+    void set(index_type key, index_type value)
     {
         page(key / page_size)[key % page_size] = value;
     }
 
     // Pre-allocates the page for key, so a following set(key, ...) cannot throw.
-    void ensure(std::uint32_t key) { page(key / page_size); }
+    void ensure(index_type key) { page(key / page_size); }
 
     // Write for a key whose page is known to exist (the key is already mapped).
-    void set_existing(std::uint32_t key, std::uint32_t value) noexcept
+    void set_existing(index_type key, index_type value) noexcept
     {
         pages_[key / page_size][key % page_size] = value;
     }
@@ -1039,27 +1043,26 @@ public:
         {
             pages += page != nullptr ? 1 : 0;
         }
-        return (pages * page_size * sizeof(std::uint32_t)) +
+        return (pages * page_size * sizeof(index_type)) +
                (pages_.capacity() * sizeof(pages_[0]));
     }
 
-    void erase(std::uint32_t key) noexcept
+    void erase(index_type key) noexcept
     {
         const std::size_t p = key / page_size;
         if (p < pages_.size() && pages_[p] != nullptr)
         {
-            pages_[p][key % page_size] = npos32;
+            pages_[p][key % page_size] = npos;
         }
     }
 
     void clear() noexcept
     {
-        for (std::uint32_t* page : pages_)
+        for (index_type* page : pages_)
         {
             if (page != nullptr)
             {
-                memory_->deallocate(
-                    page, page_size * sizeof(std::uint32_t), alignof(std::uint32_t));
+                memory_->deallocate(page, page_size * sizeof(index_type), alignof(index_type));
             }
         }
         pages_.clear();
@@ -1077,16 +1080,16 @@ public:
             }
             for (std::uint32_t i = 0; i < page_size; ++i)
             {
-                if (pages_[p][i] != npos32)
+                if (pages_[p][i] != npos)
                 {
-                    fn(static_cast<std::uint32_t>((p * page_size) + i), pages_[p][i]);
+                    fn(static_cast<index_type>((p * page_size) + i), pages_[p][i]);
                 }
             }
         }
     }
 
 private:
-    std::uint32_t* page(std::size_t p)
+    index_type* page(std::size_t p)
     {
         if (p >= pages_.size())
         {
@@ -1094,16 +1097,16 @@ private:
         }
         if (pages_[p] == nullptr)
         {
-            auto* fresh = static_cast<std::uint32_t*>(
-                memory_->allocate(page_size * sizeof(std::uint32_t), alignof(std::uint32_t)));
-            std::fill_n(fresh, page_size, npos32);
+            auto* fresh = static_cast<index_type*>(
+                memory_->allocate(page_size * sizeof(index_type), alignof(index_type)));
+            std::fill_n(fresh, page_size, npos);
             pages_[p] = fresh;
         }
         return pages_[p];
     }
 
     std::pmr::memory_resource* memory_;
-    std::pmr::vector<std::uint32_t*> pages_;
+    std::pmr::vector<index_type*> pages_;
 };
 
 // ----------------------------------------------------------------------------
@@ -1415,12 +1418,13 @@ template <entity_traits Traits>
 struct basic_group_core
 {
     using pool_base = basic_pool_base<Traits>;
+    using index_type = typename Traits::index_type;
 
     static constexpr std::uint32_t max_owners = 8;
 
     std::array<pool_base*, max_owners> owners{};
     std::uint32_t owner_count = 0;
-    std::uint32_t paired = 0;  // k: dense_[0, k) is the mirrored intersection
+    index_type paired = 0;  // k: dense_[0, k) is the mirrored intersection
 
     [[nodiscard]] bool owns(const pool_base* p) const noexcept
     {
@@ -1444,10 +1448,15 @@ public:
     using entity = quiver::basic_entity<Traits>;
     using entity_table = basic_entity_table<Traits>;
     using group_core = basic_group_core<Traits>;
-    using pool_base = basic_pool_base;  // the historical body spelling
+    using index_type = typename Traits::index_type;  // slot indices AND dense positions
+    using pool_base = basic_pool_base;               // the historical body spelling
     using single_pool_lock = basic_single_pool_lock<Traits>;
     using world = quiver::basic_world<Traits>;
     using component_hook = quiver::basic_component_hook<Traits>;
+
+    // Positions are bounded by slots (rows <= live <= max_slots < npos), so
+    // one sentinel serves both lanes.
+    static constexpr index_type npos = entity_limits<Traits>::npos;
 
     basic_pool_base(std::pmr::memory_resource* memory,
                     std::string_view name,
@@ -1470,12 +1479,12 @@ public:
 
     // --- hot, non-virtual membership ---
 
-    [[nodiscard]] bool contains(std::uint32_t index) const noexcept
+    [[nodiscard]] bool contains(index_type index) const noexcept
     {
-        return sparse_.get(index) != npos32;
+        return sparse_.get(index) != npos;
     }
 
-    [[nodiscard]] std::uint32_t position_of(std::uint32_t index) const noexcept
+    [[nodiscard]] index_type position_of(index_type index) const noexcept
     {
         return sparse_.get(index);
     }
@@ -1487,9 +1496,9 @@ public:
 
     // Copies the component at src_index onto dst (false when T cannot be
     // copy-constructed). Cold path, drives world::duplicate.
-    virtual bool copy_item(std::uint32_t src_index, entity dst) = 0;
+    virtual bool copy_item(index_type src_index, entity dst) = 0;
 
-    virtual void erase_if_present(std::uint32_t index) noexcept = 0;
+    virtual void erase_if_present(index_type index) noexcept = 0;
     virtual void wipe() noexcept = 0;  // destroy all components, keep the pool object
     virtual void compact() = 0;
 
@@ -1497,7 +1506,7 @@ public:
     // bytes at a dense position, or null for tag pools. Pair with
     // pool_info::bytes_per_item; the pointer obeys the pool's invalidation
     // rules like any component reference.
-    [[nodiscard]] virtual void* item_address(std::uint32_t /*pos*/) noexcept { return nullptr; }
+    [[nodiscard]] virtual void* item_address(index_type /*pos*/) noexcept { return nullptr; }
 
     [[nodiscard]] virtual std::size_t item_capacity() const noexcept = 0;
     [[nodiscard]] virtual std::size_t extra_bookkeeping_bytes() const noexcept { return 0; }
@@ -1597,14 +1606,14 @@ protected:
     // Swaps two dense positions INCLUDING the derived pool's payload mirror.
     // The cross-pool half of bond maintenance (and the bond build pass) runs
     // through this; cold, and compiled per pool type.
-    virtual void mirror_swap(std::uint32_t a, std::uint32_t b) noexcept = 0;
+    virtual void mirror_swap(index_type a, index_type b) noexcept = 0;
 
     // Membership insert; the caller appends payload first (so a throwing
     // component constructor leaves the pool untouched).
     void attach(entity e)
     {
         dense_.push_back(e);
-        sparse_.set(e.index(), static_cast<std::uint32_t>(dense_.size() - 1));
+        sparse_.set(e.index(), static_cast<index_type>(dense_.size() - 1));
         if (bond_ != nullptr)
         {
             bond_on_attach(e);
@@ -1613,14 +1622,14 @@ protected:
 
     // Membership swap-remove. Returns the dense position that was vacated;
     // the caller mirrors the same swap in its payload arrays.
-    std::uint32_t detach(std::uint32_t index) noexcept
+    index_type detach(index_type index) noexcept
     {
         if (bond_ != nullptr)
         {
             bond_on_detach(index);  // moves the entity out of the partition first
         }
-        const std::uint32_t pos = sparse_.get(index);
-        const auto last = static_cast<std::uint32_t>(dense_.size() - 1);
+        const index_type pos = sparse_.get(index);
+        const auto last = static_cast<index_type>(dense_.size() - 1);
         if (pos != last)
         {
             dense_[pos] = dense_[last];
@@ -1646,26 +1655,26 @@ protected:
                 return;
             }
         }
-        const std::uint32_t k = bond_->paired;
+        const index_type k = bond_->paired;
         for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
         {
             pool_base* owner = bond_->owners[i];
-            const std::uint32_t at = owner->sparse_.get(e.index());
+            const index_type at = owner->sparse_.get(e.index());
             if (at != k)
             {
                 owner->mirror_swap(k, at);
             }
         }
-        bond_->paired = k + 1;
+        bond_->paired = static_cast<index_type>(k + 1);
     }
 
     // This pool is about to swap-remove the entity at slot `index`. If it is
     // paired, move it (mirrored in every owner) to the partition edge first
     // so the removal's own swap stays entirely in the unpaired tail. The
     // entity remains in the other owners, correctly unpaired. O(owners).
-    void bond_on_detach(std::uint32_t index) noexcept
+    void bond_on_detach(index_type index) noexcept
     {
-        const std::uint32_t pos = sparse_.get(index);
+        const index_type pos = sparse_.get(index);
         if (pos >= bond_->paired)
         {
             return;
@@ -1681,7 +1690,7 @@ protected:
                 }
             }
         }
-        const std::uint32_t edge = bond_->paired - 1;
+        const auto edge = static_cast<index_type>(bond_->paired - 1);
         if (pos != edge)
         {
             for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
@@ -1694,7 +1703,7 @@ protected:
 
     // Swaps two dense positions and repairs both sparse links; payload
     // mirroring is the derived pool's job.
-    void swap_dense(std::uint32_t a, std::uint32_t b) noexcept
+    void swap_dense(index_type a, index_type b) noexcept
     {
         std::swap(dense_[a], dense_[b]);
         sparse_.set_existing(dense_[a].index(), a);
@@ -1708,19 +1717,19 @@ protected:
     template <class PosCompare, class SwapPayload, class Algo = std_sort>
     void sort_dense_impl(PosCompare cmp, SwapPayload swap_payload, Algo&& algo = {})
     {
-        const auto n = static_cast<std::uint32_t>(dense_.size());
-        std::pmr::vector<std::uint32_t> perm(n, memory_);
-        for (std::uint32_t i = 0; i < n; ++i)
+        const auto n = static_cast<index_type>(dense_.size());
+        std::pmr::vector<index_type> perm(n, memory_);
+        for (index_type i = 0; i < n; ++i)
         {
             perm[i] = i;
         }
         algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
         // Apply the gather permutation in place, cycle by cycle: position i
         // receives the element that was at perm[i].
-        for (std::uint32_t i = 0; i < n; ++i)
+        for (index_type i = 0; i < n; ++i)
         {
-            std::uint32_t curr = i;
-            std::uint32_t next = perm[curr];
+            index_type curr = i;
+            index_type next = perm[curr];
             while (next != i)
             {
                 swap_dense(curr, next);
@@ -1750,7 +1759,7 @@ protected:
         }
         std::expected<void, fault> result{};
         sparse_.visit(
-            [&](std::uint32_t key, std::uint32_t value)
+            [&](index_type key, index_type value)
             {
                 if (!result)
                 {
@@ -1809,7 +1818,7 @@ protected:
     // Defined after single_pool_lock (dispatch runs under it).
     void dispatch_if(const std::vector<hook_entry>* list, entity e);
 
-    sparse_index sparse_;
+    basic_sparse_index<Traits> sparse_;
     std::pmr::vector<entity> dense_;
     std::unique_ptr<hook_lists> hooks_;  // null until the first hook connects
     group_core* bond_ = nullptr;         // null unless this pool is owned by a bond
@@ -1891,8 +1900,10 @@ public:
     using base = basic_pool_base<Traits>;
     using entity = typename base::entity;
     using entity_table = typename base::entity_table;
+    using index_type = typename base::index_type;
     using base::contains;
     using base::entity_at;
+    using base::npos;
 
 protected:
     using base::attach;
@@ -1934,22 +1945,22 @@ public:
         return items_[sparse_.get(e.index())];
     }
 
-    [[nodiscard]] T* at(std::uint32_t index) noexcept
+    [[nodiscard]] T* at(index_type index) noexcept
     {
-        const std::uint32_t pos = sparse_.get(index);
-        return pos == npos32 ? nullptr : items_.data() + pos;
+        const index_type pos = sparse_.get(index);
+        return pos == npos ? nullptr : items_.data() + pos;
     }
 
-    [[nodiscard]] const T* at(std::uint32_t index) const noexcept
+    [[nodiscard]] const T* at(index_type index) const noexcept
     {
-        const std::uint32_t pos = sparse_.get(index);
-        return pos == npos32 ? nullptr : items_.data() + pos;
+        const index_type pos = sparse_.get(index);
+        return pos == npos ? nullptr : items_.data() + pos;
     }
 
-    [[nodiscard]] const T& at_pos(std::uint32_t pos) const noexcept { return items_[pos]; }
-    [[nodiscard]] T& at_pos(std::uint32_t pos) noexcept { return items_[pos]; }
+    [[nodiscard]] const T& at_pos(index_type pos) const noexcept { return items_[pos]; }
+    [[nodiscard]] T& at_pos(index_type pos) noexcept { return items_[pos]; }
 
-    [[nodiscard]] void* item_address(std::uint32_t pos) noexcept override { return &items_[pos]; }
+    [[nodiscard]] void* item_address(index_type pos) noexcept override { return &items_[pos]; }
 
     template <class PosCompare, class Algo = std_sort>
     void sort_dense(PosCompare cmp, Algo&& algo = {})
@@ -1959,11 +1970,11 @@ public:
                       "(stable storage sorts without touching payloads)");
         sort_dense_impl(
             cmp,
-            [this](std::uint32_t a, std::uint32_t b) { std::swap(items_[a], items_[b]); },
+            [this](index_type a, index_type b) { std::swap(items_[a], items_[b]); },
             std::forward<Algo>(algo));
     }
 
-    bool copy_item(std::uint32_t src_index, entity dst) override
+    bool copy_item(index_type src_index, entity dst) override
     {
         if constexpr (std::copy_constructible<T>)
         {
@@ -1979,7 +1990,7 @@ public:
         }
     }
 
-    void swap_positions(std::uint32_t a, std::uint32_t b)
+    void swap_positions(index_type a, index_type b)
     {
         static_assert(std::is_swappable_v<T>,
                       "quiver: reordering a packed pool swaps components; T must be swappable "
@@ -1992,7 +2003,7 @@ public:
     // and non-swappable packed pools exist legally as long as they are never
     // bonded (bond<A, B>() statically walls off packed-derived pools of
     // non-swappable components — derived_from, so custom pools are covered).
-    void mirror_swap(std::uint32_t a, std::uint32_t b) noexcept override
+    void mirror_swap(index_type a, index_type b) noexcept override
     {
         if constexpr (std::is_swappable_v<T>)
         {
@@ -2004,15 +2015,15 @@ public:
         }
     }
 
-    void erase_if_present(std::uint32_t index) noexcept override
+    void erase_if_present(index_type index) noexcept override
     {
         if (!contains(index))
         {
             return;
         }
         fire_remove(dense_[sparse_.get(index)]);  // before destruction: hooks may read it
-        const std::uint32_t pos = detach(index);
-        const auto last = static_cast<std::uint32_t>(items_.size() - 1);
+        const index_type pos = detach(index);
+        const auto last = static_cast<index_type>(items_.size() - 1);
         if (pos != last)
         {
             if constexpr (std::is_move_assignable_v<T>)
@@ -2071,6 +2082,7 @@ public:
     using base = basic_pool_base<Traits>;
     using entity = typename base::entity;
     using entity_table = typename base::entity_table;
+    using index_type = typename base::index_type;
     using base::contains;
     using base::entity_at;
 
@@ -2107,21 +2119,21 @@ public:
     {
         sort_dense_impl(
             cmp,
-            [](std::uint32_t, std::uint32_t) {},  // membership only
+            [](index_type, index_type) {},  // membership only
             std::forward<Algo>(algo));
     }
 
-    bool copy_item(std::uint32_t, entity dst) override
+    bool copy_item(index_type, entity dst) override
     {
         emplace(dst);  // membership is the whole payload
         return true;
     }
 
-    void swap_positions(std::uint32_t a, std::uint32_t b) noexcept { swap_dense(a, b); }
+    void swap_positions(index_type a, index_type b) noexcept { swap_dense(a, b); }
 
-    void mirror_swap(std::uint32_t a, std::uint32_t b) noexcept override { swap_dense(a, b); }
+    void mirror_swap(index_type a, index_type b) noexcept override { swap_dense(a, b); }
 
-    void erase_if_present(std::uint32_t index) noexcept override
+    void erase_if_present(index_type index) noexcept override
     {
         if (contains(index))
         {
@@ -2158,8 +2170,10 @@ public:
     using base = basic_pool_base<Traits>;
     using entity = typename base::entity;
     using entity_table = typename base::entity_table;
+    using index_type = typename base::index_type;
     using base::contains;
     using base::entity_at;
+    using base::npos;
 
 protected:
     using base::attach;
@@ -2202,7 +2216,7 @@ public:
         grow_if_full(dense_);
         grow_if_full(slot_of_);
         sparse_.ensure(e.index());
-        const std::uint32_t slot = peek_free_slot();  // may allocate a chunk
+        const index_type slot = peek_free_slot();  // may allocate a chunk
         T* item = std::construct_at(slot_ptr(slot), std::forward<Args>(args)...);
         commit_free_slot(slot);  // nofail; only after construction succeeded
         slot_of_.push_back(slot);
@@ -2211,26 +2225,26 @@ public:
         return *item;  // stable: hooks cannot have moved it
     }
 
-    [[nodiscard]] T* at(std::uint32_t index) noexcept
+    [[nodiscard]] T* at(index_type index) noexcept
     {
-        const std::uint32_t pos = sparse_.get(index);
-        return pos == npos32 ? nullptr : slot_ptr(slot_of_[pos]);
+        const index_type pos = sparse_.get(index);
+        return pos == npos ? nullptr : slot_ptr(slot_of_[pos]);
     }
 
-    [[nodiscard]] const T* at(std::uint32_t index) const noexcept
+    [[nodiscard]] const T* at(index_type index) const noexcept
     {
-        const std::uint32_t pos = sparse_.get(index);
-        return pos == npos32 ? nullptr : slot_ptr(slot_of_[pos]);
+        const index_type pos = sparse_.get(index);
+        return pos == npos ? nullptr : slot_ptr(slot_of_[pos]);
     }
 
-    [[nodiscard]] const T& at_pos(std::uint32_t pos) const noexcept
+    [[nodiscard]] const T& at_pos(index_type pos) const noexcept
     {
         return *slot_ptr(slot_of_[pos]);
     }
 
-    [[nodiscard]] T& at_pos(std::uint32_t pos) noexcept { return *slot_ptr(slot_of_[pos]); }
+    [[nodiscard]] T& at_pos(index_type pos) noexcept { return *slot_ptr(slot_of_[pos]); }
 
-    [[nodiscard]] void* item_address(std::uint32_t pos) noexcept override
+    [[nodiscard]] void* item_address(index_type pos) noexcept override
     {
         return slot_ptr(slot_of_[pos]);
     }
@@ -2242,11 +2256,11 @@ public:
     {
         sort_dense_impl(
             cmp,
-            [this](std::uint32_t a, std::uint32_t b) { std::swap(slot_of_[a], slot_of_[b]); },
+            [this](index_type a, index_type b) { std::swap(slot_of_[a], slot_of_[b]); },
             std::forward<Algo>(algo));
     }
 
-    bool copy_item(std::uint32_t src_index, entity dst) override
+    bool copy_item(index_type src_index, entity dst) override
     {
         if constexpr (std::copy_constructible<T>)
         {
@@ -2259,36 +2273,36 @@ public:
         }
     }
 
-    void swap_positions(std::uint32_t a, std::uint32_t b) noexcept
+    void swap_positions(index_type a, index_type b) noexcept
     {
         swap_dense(a, b);
         std::swap(slot_of_[a], slot_of_[b]);  // payloads stay put
     }
 
-    void mirror_swap(std::uint32_t a, std::uint32_t b) noexcept override { swap_positions(a, b); }
+    void mirror_swap(index_type a, index_type b) noexcept override { swap_positions(a, b); }
 
     [[nodiscard]] std::size_t extra_bookkeeping_bytes() const noexcept override
     {
-        return (slot_of_.capacity() * sizeof(std::uint32_t)) +
-               (free_slots_.capacity() * sizeof(std::uint32_t)) +
+        return (slot_of_.capacity() * sizeof(index_type)) +
+               (free_slots_.capacity() * sizeof(index_type)) +
                (chunks_.capacity() * sizeof(std::byte*));
     }
 
     // add_chunk pre-reserves one free-list entry per slot, so the push_back
     // below can never reallocate (which is what the lint cannot see).
     // NOLINTNEXTLINE(bugprone-exception-escape)
-    void erase_if_present(std::uint32_t index) noexcept override
+    void erase_if_present(index_type index) noexcept override
     {
         if (!contains(index))
         {
             return;
         }
         fire_remove(dense_[sparse_.get(index)]);  // before destruction: hooks may read it
-        const std::uint32_t pos = detach(index);
-        const std::uint32_t slot = slot_of_[pos];
+        const index_type pos = detach(index);
+        const index_type slot = slot_of_[pos];
         std::destroy_at(slot_ptr(slot));
         free_slots_.push_back(slot);
-        const auto last = static_cast<std::uint32_t>(slot_of_.size() - 1);
+        const auto last = static_cast<index_type>(slot_of_.size() - 1);
         if (pos != last)
         {
             slot_of_[pos] = slot_of_[last];
@@ -2343,7 +2357,7 @@ public:
             return std::unexpected(fault{fault_code::slot_map_broken, name_, "slot accounting"});
         }
         std::vector<std::uint8_t> used(slot_count_, 0);
-        for (const std::uint32_t slot : slot_of_)
+        for (const index_type slot : slot_of_)
         {
             if (slot >= slot_count_ || used[slot] != 0)
             {
@@ -2351,7 +2365,7 @@ public:
             }
             used[slot] = 1;
         }
-        for (const std::uint32_t slot : free_slots_)
+        for (const index_type slot : free_slots_)
         {
             if (slot >= slot_count_ || used[slot] != 0)
             {
@@ -2363,17 +2377,17 @@ public:
     }
 
 private:
-    [[nodiscard]] T* slot_ptr(std::uint32_t slot) noexcept
+    [[nodiscard]] T* slot_ptr(index_type slot) noexcept
     {
         return reinterpret_cast<T*>(chunks_[slot / chunk_items]) + (slot % chunk_items);
     }
 
-    [[nodiscard]] const T* slot_ptr(std::uint32_t slot) const noexcept
+    [[nodiscard]] const T* slot_ptr(index_type slot) const noexcept
     {
         return reinterpret_cast<const T*>(chunks_[slot / chunk_items]) + (slot % chunk_items);
     }
 
-    [[nodiscard]] std::uint32_t peek_free_slot()
+    [[nodiscard]] index_type peek_free_slot()
     {
         if (!free_slots_.empty())
         {
@@ -2383,10 +2397,10 @@ private:
         {
             add_chunk();
         }
-        return static_cast<std::uint32_t>(slot_count_);
+        return static_cast<index_type>(slot_count_);
     }
 
-    void commit_free_slot(std::uint32_t slot) noexcept
+    void commit_free_slot(index_type slot) noexcept
     {
         if (!free_slots_.empty() && free_slots_.back() == slot)
         {
@@ -2413,7 +2427,7 @@ private:
 
     void release_all() noexcept
     {
-        for (const std::uint32_t slot : slot_of_)
+        for (const index_type slot : slot_of_)
         {
             std::destroy_at(slot_ptr(slot));
         }
@@ -2428,9 +2442,9 @@ private:
         chunks_.clear();
     }
 
-    std::pmr::vector<std::uint32_t> slot_of_;  // parallel to dense_
-    std::pmr::vector<std::byte*> chunks_;      // fixed blocks, never relocated
-    std::pmr::vector<std::uint32_t> free_slots_;
+    std::pmr::vector<index_type> slot_of_;  // parallel to dense_
+    std::pmr::vector<std::byte*> chunks_;   // fixed blocks, never relocated
+    std::pmr::vector<index_type> free_slots_;
     std::size_t slot_count_ = 0;  // slots handed out so far (used + free)
 };
 
@@ -2456,6 +2470,10 @@ using pool_for = std::conditional_t<storage_policy<T> == storage::tag,
 //       using base::base;                                // (memory_resource*)
 //       void erase_if_present(std::uint32_t i) noexcept override { ++erases; ... }
 //   };
+//
+// Slot indices and dense positions in the pool surface are the traits'
+// index_type — std::uint32_t for the default traits, so existing overrides
+// keep their spellings; custom-traits pools write base::index_type.
 //   template <> struct quiver::pool_of<Telemetry> { using type = telemetry_pool; };
 //
 // The contract (checked at registration by the component_pool concept):
@@ -3017,8 +3035,8 @@ public:
             {
                 return false;
             }
-            const std::uint32_t pos = first->position_of(e.index());
-            if (pos == detail::npos32 || first->entity_at(pos) != e)
+            const auto pos = first->position_of(e.index());
+            if (pos == detail::entity_limits<Traits>::npos || first->entity_at(pos) != e)
             {
                 return false;
             }
@@ -3036,8 +3054,8 @@ public:
                 {
                     continue;
                 }
-                const std::uint32_t pos = alt->position_of(e.index());
-                if (pos != detail::npos32 && alt->entity_at(pos) == e)
+                const auto pos = alt->position_of(e.index());
+                if (pos != detail::entity_limits<Traits>::npos && alt->entity_at(pos) == e)
                 {
                     return matches_rest(e.index(), alt);
                 }
@@ -4339,8 +4357,8 @@ public:
         {
             return false;
         }
-        const std::uint32_t pos = pool_->position_of(e.index());
-        return pos != detail::npos32 && pool_->entity_at(pos) == e;
+        const auto pos = pool_->position_of(e.index());
+        return pos != detail::entity_limits<Traits>::npos && pool_->entity_at(pos) == e;
     }
 
     // Type-erased payload bytes of e, or null (absent entity, stale handle,
@@ -4355,8 +4373,8 @@ public:
         {
             return nullptr;
         }
-        const std::uint32_t pos = pool_->position_of(e.index());
-        if (pos == detail::npos32 || pool_->entity_at(pos) != e)
+        const auto pos = pool_->position_of(e.index());
+        if (pos == detail::entity_limits<Traits>::npos || pool_->entity_at(pos) != e)
         {
             return nullptr;
         }
@@ -4504,8 +4522,8 @@ public:
         {
             return false;
         }
-        const std::uint32_t pos = includes_[0]->position_of(e.index());
-        if (pos == detail::npos32 || includes_[0]->entity_at(pos) != e)
+        const auto pos = includes_[0]->position_of(e.index());
+        if (pos == detail::entity_limits<Traits>::npos || includes_[0]->entity_at(pos) != e)
         {
             return false;
         }
@@ -6225,8 +6243,8 @@ public:
         for (std::size_t pos = 0; pos < n; ++pos)
         {
             const entity e = lead->entity_at(pos);
-            const std::uint32_t at = follow->position_of(e.index());
-            if (at == detail::npos32)
+            const auto at = follow->position_of(e.index());
+            if (at == detail::entity_limits<Traits>::npos)
             {
                 continue;
             }
@@ -7693,12 +7711,12 @@ private:
     }
 
     void record(std::pmr::vector<entity>& list,
-                detail::sparse_index& seen,
+                detail::basic_sparse_index<Traits>& seen,
                 entity e,
                 bool keep_history)
     {
-        const std::uint32_t pos = seen.get(e.index());
-        if (pos != detail::npos32)
+        const auto pos = seen.get(e.index());
+        if (pos != detail::entity_limits<Traits>::npos)
         {
             // Slot recycled before a drain. For added/replaced the live
             // successor wins (the predecessor's event is moot once it died);
@@ -7712,10 +7730,12 @@ private:
         }
         seen.ensure(e.index());  // nofail set below
         list.push_back(e);
-        seen.set_existing(e.index(), static_cast<std::uint32_t>(list.size() - 1));
+        seen.set_existing(e.index(),
+                          static_cast<typename Traits::index_type>(list.size() - 1));
     }
 
-    static void drain(std::pmr::vector<entity>& list, detail::sparse_index& seen) noexcept
+    static void drain(std::pmr::vector<entity>& list,
+                      detail::basic_sparse_index<Traits>& seen) noexcept
     {
         for (const entity e : list)
         {
@@ -7724,9 +7744,9 @@ private:
         list.clear();
     }
 
-    detail::sparse_index seen_added_;  // entity slot -> list position (dedupe)
-    detail::sparse_index seen_replaced_;
-    detail::sparse_index seen_removed_;
+    detail::basic_sparse_index<Traits> seen_added_;  // entity slot -> list position (dedupe)
+    detail::basic_sparse_index<Traits> seen_replaced_;
+    detail::basic_sparse_index<Traits> seen_removed_;
     std::pmr::vector<entity> added_;
     std::pmr::vector<entity> replaced_;
     std::pmr::vector<entity> removed_;
@@ -7918,8 +7938,8 @@ public:
 
     [[nodiscard]] bool contains(entity e) const noexcept
     {
-        const std::uint32_t pos = seen_.get(e.index());
-        return pos != detail::npos32 && matched_[pos] == e;
+        const auto pos = seen_.get(e.index());
+        return pos != detail::entity_limits<Traits>::npos && matched_[pos] == e;
     }
 
     void clear() noexcept
@@ -7997,19 +8017,20 @@ private:
 
     void insert(entity e)
     {
-        if (seen_.get(e.index()) != detail::npos32)
+        if (seen_.get(e.index()) != detail::entity_limits<Traits>::npos)
         {
             return;  // already collected
         }
         seen_.ensure(e.index());  // nofail set below
         matched_.push_back(e);
-        seen_.set_existing(e.index(), static_cast<std::uint32_t>(matched_.size() - 1));
+        seen_.set_existing(e.index(),
+                           static_cast<typename Traits::index_type>(matched_.size() - 1));
     }
 
     void evict(entity e) noexcept
     {
-        const std::uint32_t pos = seen_.get(e.index());
-        if (pos == detail::npos32)
+        const auto pos = seen_.get(e.index());
+        if (pos == detail::entity_limits<Traits>::npos)
         {
             return;
         }
@@ -8020,7 +8041,7 @@ private:
         seen_.erase(e.index());
     }
 
-    detail::sparse_index seen_;  // entity slot -> matched_ position (dedupe + O(1) evict)
+    detail::basic_sparse_index<Traits> seen_;  // slot -> matched_ position (dedupe + O(1) evict)
     std::pmr::vector<entity> matched_;
     std::array<scoped_hook, hook_count> hooks_;
 };
