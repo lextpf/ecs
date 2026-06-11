@@ -1021,10 +1021,7 @@ public:
         return pages_[p][key % page_size];
     }
 
-    void set(index_type key, index_type value)
-    {
-        page(key / page_size)[key % page_size] = value;
-    }
+    void set(index_type key, index_type value) { page(key / page_size)[key % page_size] = value; }
 
     // Pre-allocates the page for key, so a following set(key, ...) cannot throw.
     void ensure(index_type key) { page(key / page_size); }
@@ -1043,8 +1040,7 @@ public:
         {
             pages += page != nullptr ? 1 : 0;
         }
-        return (pages * page_size * sizeof(index_type)) +
-               (pages_.capacity() * sizeof(pages_[0]));
+        return (pages * page_size * sizeof(index_type)) + (pages_.capacity() * sizeof(pages_[0]));
     }
 
     void erase(index_type key) noexcept
@@ -3826,9 +3822,7 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
     // Tags contribute nothing to callback arguments and rows; observed parts
     // probe by entity INDEX (their pools do not share the partition layout).
     template <class T>
-    [[nodiscard]] auto part_at(std::size_t slot,
-                               index_type pos,
-                               index_type index) const noexcept
+    [[nodiscard]] auto part_at(std::size_t slot, index_type pos, index_type index) const noexcept
     {
         if constexpr (detail::is_maybe_v<T>)
         {
@@ -5110,7 +5104,7 @@ public:
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
-                 (!std::convertible_to<Cs&&, std::pmr::memory_resource*> && ...))
+                 (!std::convertible_to<Cs &&, std::pmr::memory_resource*> && ...))
     explicit basic_blueprint(Cs&&... components)
         : basic_blueprint()
     {
@@ -5123,7 +5117,7 @@ public:
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
-                 (!std::convertible_to<Cs&&, std::pmr::memory_resource*> && ...))
+                 (!std::convertible_to<Cs &&, std::pmr::memory_resource*> && ...))
     basic_blueprint(std::pmr::memory_resource* memory, Cs&&... components)
         : basic_blueprint(memory)
     {
@@ -7728,8 +7722,7 @@ private:
         }
         seen.ensure(e.index());  // nofail set below
         list.push_back(e);
-        seen.set_existing(e.index(),
-                          static_cast<typename Traits::index_type>(list.size() - 1));
+        seen.set_existing(e.index(), static_cast<typename Traits::index_type>(list.size() - 1));
     }
 
     static void drain(std::pmr::vector<entity>& list,

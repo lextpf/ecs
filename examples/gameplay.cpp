@@ -170,7 +170,8 @@ int main()
     ecs::blueprint goblin{Transform{Vec2{0, 0}}, Velocity{Vec2{1, 0}}, SpriteRef{7U}, Health{20}};
 
     int column = 0;
-    world.spawn(goblin, 4,
+    world.spawn(goblin,
+                4,
                 [&](ecs::entity g)
                 {
                     world.get<Transform>(g).position = {static_cast<float>(column) * 10.0F, 0};
