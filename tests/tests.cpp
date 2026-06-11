@@ -2011,6 +2011,21 @@ static void test_entity_ref()
     CHECK(hero.find<Vel>() != nullptr);
     hero.put<Pos>(3);
     CHECK(hero.get<Pos>().x == 3);
+
+    // Multi-component get hands back a tuple of references, const through
+    // a const_entity_ref, mirroring the world verb.
+    auto [mp, mv] = hero.get<Pos, Vel>();
+    static_assert(std::is_same_v<decltype(mp), Pos&>);
+    CHECK(mp.x == 3 && mv.v == 2);
+    mp.x = 4;  // tuple elements alias the live components
+    CHECK(hero.get<Pos>().x == 4);
+    mp.x = 3;
+
+    ecs::const_entity_ref shade{hero};
+    auto [sp, sv] = shade.get<Pos, Vel>();
+    static_assert(std::is_same_v<decltype(sp), const Pos&>);
+    CHECK(sp.x == 3 && sv.v == 2);
+
     CHECK(hero.remove<Vel>());
 
     const ecs::entity parent = w.spawn();

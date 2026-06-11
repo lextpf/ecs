@@ -8601,6 +8601,14 @@ public:
         return bound("entity_ref::get").template get<T>(entity_);
     }
 
+    // Multi-component point lookup, mirroring world.get<T, U, ...>: a tuple
+    // of references, const through a const_entity_ref.
+    template <component T, component U, component... Rest>
+    [[nodiscard]] auto get() const
+    {
+        return bound("entity_ref::get").template get<T, U, Rest...>(entity_);
+    }
+
     template <component T>
     [[nodiscard]] auto* find() const noexcept
     {
