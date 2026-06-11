@@ -1122,18 +1122,11 @@ template <entity_traits Traits>
 class basic_entity_table
 {
 public:
-    // World-side slot plumbing is 32-bit; wider HANDLES exist standalone
-    // (basic_entity puts no ceiling on index_type), but a table minting them
-    // is the staged remainder of the traits conversion.
-    static_assert(std::numeric_limits<typename Traits::index_type>::digits <= 32,
-                  "quiver: worlds support entity index types up to 32 bits");
-
     using entity = quiver::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using generation_type = typename Traits::generation_type;
 
-    static constexpr std::uint32_t max_slots =
-        static_cast<std::uint32_t>(entity_limits<Traits>::max_slots);
+    static constexpr index_type max_slots = entity_limits<Traits>::max_slots;
 
     explicit basic_entity_table(std::pmr::memory_resource* memory) noexcept
         : generation_(memory),
@@ -1179,18 +1172,18 @@ public:
     {
         while (!free_stack_.empty())
         {
-            const std::uint32_t index = free_stack_.back();
+            const index_type index = free_stack_.back();
             free_stack_.pop_back();
             if (free_flag_[index] != 0)
             {
                 // Pop + claim leaves size+live unchanged: slack is preserved.
                 free_flag_[index] = 0;
                 ++live_;
-                return entity(static_cast<index_type>(index), generation_[index]);
+                return entity(index, generation_[index]);
             }
             // Stale entry: the slot was claimed by restore() after being freed.
         }
-        const auto index = static_cast<std::uint32_t>(generation_.size());
+        const auto index = static_cast<index_type>(generation_.size());
         if (index >= max_slots)  // unconditional: the provisional index bit is reserved
         {
             violate("entity table is full (2^index_bits - 1 slots)");
@@ -1200,14 +1193,14 @@ public:
         free_flag_.push_back(0);
         ++live_;
         ensure_destroy_slack();  // pay for the future destroy here, where we allocate anyway
-        return entity(static_cast<index_type>(index), 0);
+        return entity(index, 0);
     }
 
     // O(1). The generation bump is what invalidates outstanding handles.
     // Never allocates: create()/restore() maintain enough free-stack slack for
     // every live entity, which is what makes kill() noexcept end-to-end.
     // NOLINTNEXTLINE(bugprone-exception-escape) -- nofail push_back: slack invariant above
-    void destroy(std::uint32_t index) noexcept
+    void destroy(index_type index) noexcept
     {
         ++generation_[index];  // wraps mod 2^generation_bits by design
         free_flag_[index] = 1;
@@ -1217,17 +1210,17 @@ public:
 
     [[nodiscard]] bool alive(entity e) const noexcept
     {
-        const std::uint32_t index = e.index();
+        const index_type index = e.index();
         return index < generation_.size() && free_flag_[index] == 0 &&
                generation_[index] == e.generation();
     }
 
-    [[nodiscard]] bool occupied(std::uint32_t index) const noexcept
+    [[nodiscard]] bool occupied(index_type index) const noexcept
     {
         return index < generation_.size() && free_flag_[index] == 0;
     }
 
-    [[nodiscard]] generation_type generation_at(std::uint32_t index) const noexcept
+    [[nodiscard]] generation_type generation_at(index_type index) const noexcept
     {
         return generation_[index];
     }
@@ -1242,10 +1235,10 @@ public:
             return std::unexpected(
                 fault{fault_code::bad_handle, {}, "restore_entity: invalid handle"});
         }
-        const std::uint32_t index = e.index();
+        const index_type index = e.index();
         while (generation_.size() <= index)
         {
-            const auto fresh = static_cast<std::uint32_t>(generation_.size());
+            const auto fresh = static_cast<index_type>(generation_.size());
             generation_.push_back(0);
             free_flag_.push_back(1);
             free_stack_.push_back(fresh);
@@ -1266,7 +1259,7 @@ public:
     // capacity. O(slots).
     void destroy_all() noexcept
     {
-        for (std::uint32_t index = 0; index < generation_.size(); ++index)
+        for (index_type index = 0; index < generation_.size(); ++index)
         {
             if (free_flag_[index] == 0)
             {
@@ -1285,15 +1278,15 @@ public:
     // Drops stale free-stack entries and returns slack memory.
     void shrink()
     {
-        std::erase_if(free_stack_, [this](std::uint32_t index) { return free_flag_[index] == 0; });
+        std::erase_if(free_stack_, [this](index_type index) { return free_flag_[index] == 0; });
         // A slot can sit on the stack twice (freed, restored, freed again);
         // keep only the newest entry of each.
         std::pmr::vector<std::uint8_t> seen(generation_.size(), 0, generation_.get_allocator());
-        std::pmr::vector<std::uint32_t> kept(free_stack_.get_allocator());
+        std::pmr::vector<index_type> kept(free_stack_.get_allocator());
         kept.reserve(free_stack_.size());
         for (std::size_t i = free_stack_.size(); i-- > 0;)  // newest entry of each slot wins
         {
-            const std::uint32_t index = free_stack_[i];
+            const index_type index = free_stack_[i];
             if (seen[index] == 0)
             {
                 seen[index] = 1;
@@ -1314,7 +1307,7 @@ public:
     [[nodiscard]] std::size_t bytes() const noexcept
     {
         return (generation_.capacity() * sizeof(generation_type)) + free_flag_.capacity() +
-               (free_stack_.capacity() * sizeof(std::uint32_t));
+               (free_stack_.capacity() * sizeof(index_type));
     }
 
     [[nodiscard]] std::expected<void, fault> check() const
@@ -1334,7 +1327,7 @@ public:
             return std::unexpected(fault{fault_code::table_out_of_sync, {}, "live count"});
         }
         std::vector<std::uint8_t> reachable(generation_.size(), 0);
-        for (const std::uint32_t index : free_stack_)
+        for (const index_type index : free_stack_)
         {
             if (index >= generation_.size())
             {
@@ -1343,7 +1336,7 @@ public:
             }
             reachable[index] = 1;
         }
-        for (std::uint32_t index = 0; index < generation_.size(); ++index)
+        for (index_type index = 0; index < generation_.size(); ++index)
         {
             if (free_flag_[index] != 0 && reachable[index] == 0)
             {
@@ -1371,7 +1364,7 @@ private:
 
     std::pmr::vector<generation_type> generation_;
     std::pmr::vector<std::uint8_t> free_flag_;  // 1 = free
-    std::pmr::vector<std::uint32_t> free_stack_;
+    std::pmr::vector<index_type> free_stack_;
     std::size_t live_ = 0;
 };
 
@@ -2750,6 +2743,7 @@ template <class Traits, class... Ts, class... Xs>
 class basic_selection<Traits, except<Xs...>, Ts...>
 {
     using entity = quiver::basic_entity<Traits>;
+    using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using selection_t = basic_selection;  // the historical body spelling
     template <class T>
@@ -2926,7 +2920,7 @@ public:
     void each(F&& fn) const
     {
         run(fn,
-            [this]<class G>(G& f, entity e, std::uint32_t index)
+            [this]<class G>(G& f, entity e, index_type index)
             { return this->invoke_with_refs(f, e, index); });
     }
 
@@ -2935,7 +2929,7 @@ public:
     void entities(F&& fn) const
     {
         run(fn,
-            []<class G>(G& f, entity e, std::uint32_t)
+            []<class G>(G& f, entity e, index_type)
             {
                 if constexpr (std::predicate<G&, entity>)
                 {
@@ -3280,7 +3274,7 @@ public:
             const selection_t& s = *owner_self_;
             s.run_span(
                 fn,
-                [&s]<class G>(G& f, entity e, std::uint32_t index)
+                [&s]<class G>(G& f, entity e, typename Traits::index_type index)
                 { return s.invoke_with_refs(f, e, index); },
                 driver_,
                 begin_,
@@ -3296,7 +3290,7 @@ public:
             }
             owner_self_->run_span(
                 fn,
-                []<class G>(G& f, entity e, std::uint32_t)
+                []<class G>(G& f, entity e, typename Traits::index_type)
                 {
                     if constexpr (std::predicate<G&, entity>)
                     {
@@ -3423,14 +3417,14 @@ private:
         return best;
     }
 
-    [[nodiscard]] bool matches_rest(std::uint32_t index, const pool_base* driver) const noexcept
+    [[nodiscard]] bool matches_rest(index_type index, const pool_base* driver) const noexcept
     {
         return matches_from(index, driver, sizeof...(Ts));
     }
 
     // The full predicate, optionally skipping one element (the union-driving
     // group satisfies itself by construction).
-    [[nodiscard]] bool matches_from(std::uint32_t index,
+    [[nodiscard]] bool matches_from(index_type index,
                                     const pool_base* driver,
                                     std::size_t skip_element) const noexcept
     {
@@ -3601,7 +3595,7 @@ private:
     // Must produce exactly detail::sel_part_t<T> so the range iterator's
     // value_type stays in lockstep with each()'s callback arguments.
     template <std::size_t I, class T>
-    [[nodiscard]] detail::sel_part_t<T> ref_tuple(std::uint32_t index) const
+    [[nodiscard]] detail::sel_part_t<T> ref_tuple(index_type index) const
     {
         if constexpr (detail::is_any_of_v<detail::bare<detail::maybe_inner<T>>>)
         {
@@ -3627,7 +3621,7 @@ private:
     // One pointer per non-tag alternative, each fetched independently (the
     // matching machinery already guaranteed at least one is non-null).
     template <class Group>
-    [[nodiscard]] detail::sel_part_t<Group> group_parts(std::size_t off, std::uint32_t index) const
+    [[nodiscard]] detail::sel_part_t<Group> group_parts(std::size_t off, index_type index) const
     {
         return [&]<std::size_t... Ks, class... As>(std::index_sequence<Ks...>, types<As...>)
         { return std::tuple_cat(this->template alternative_part<As>(off + Ks, index)...); }(
@@ -3636,7 +3630,7 @@ private:
     }
 
     template <class A>
-    [[nodiscard]] auto alternative_part(std::size_t slot, std::uint32_t index) const
+    [[nodiscard]] auto alternative_part(std::size_t slot, index_type index) const
     {
         if constexpr (detail::is_tag_v<detail::bare<A>>)
         {
@@ -3651,7 +3645,7 @@ private:
         }
     }
 
-    [[nodiscard]] auto value_refs(std::uint32_t index) const
+    [[nodiscard]] auto value_refs(index_type index) const
     {
         return [this, index]<std::size_t... Is>(std::index_sequence<Is...>)
         {
@@ -3660,7 +3654,7 @@ private:
     }
 
     template <class F>
-    bool invoke_with_refs(F& fn, entity e, std::uint32_t index) const
+    bool invoke_with_refs(F& fn, entity e, index_type index) const
     {
         auto refs = value_refs(index);
         using traits = detail::callback_traits<F, entity, decltype(refs)>;
@@ -3782,6 +3776,7 @@ template <class Traits, class... Ts, class... Xs>  // const-qualify for read-onl
 class basic_bonded_view<Traits, except<Xs...>, Ts...>
 {
     using entity = quiver::basic_entity<Traits>;
+    using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using group_core = detail::basic_group_core<Traits>;
     using bonded_view_t = basic_bonded_view;  // the historical body spelling
@@ -3832,8 +3827,8 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
     // probe by entity INDEX (their pools do not share the partition layout).
     template <class T>
     [[nodiscard]] auto part_at(std::size_t slot,
-                               std::uint32_t pos,
-                               std::uint32_t index) const noexcept
+                               index_type pos,
+                               index_type index) const noexcept
     {
         if constexpr (detail::is_maybe_v<T>)
         {
@@ -3864,7 +3859,7 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
 
     // One row's payload parts: owners in lockstep at the partition position,
     // observed pools probed by the row entity's index.
-    [[nodiscard]] auto row_parts(std::uint32_t pos, std::uint32_t index) const noexcept
+    [[nodiscard]] auto row_parts(index_type pos, index_type index) const noexcept
     {
         return [this, pos, index]<std::size_t... Is>(std::index_sequence<Is...>)
         {
@@ -3874,7 +3869,7 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
 
     // Row filter: every except<> pool must lack the entity. Null pools
     // (never registered) exclude nothing.
-    [[nodiscard]] bool passes(std::uint32_t index) const noexcept
+    [[nodiscard]] bool passes(index_type index) const noexcept
     {
         for (pool_base* pool : excludes_)
         {
@@ -3951,7 +3946,7 @@ public:
         else
         {
             std::size_t n = 0;
-            for (std::uint32_t pos = 0; pos < bond_->paired; ++pos)
+            for (index_type pos = 0; pos < bond_->paired; ++pos)
             {
                 n += passes(bases_[first_owned]->entity_at(pos).index()) ? 1 : 0;
             }
@@ -3972,7 +3967,7 @@ public:
         {
             return false;
         }
-        const std::uint32_t pos = bases_[first_owned]->position_of(e.index());
+        const index_type pos = bases_[first_owned]->position_of(e.index());
         return pos < bond_->paired && bases_[first_owned]->entity_at(pos) == e && passes(e.index());
     }
 
@@ -3995,8 +3990,8 @@ public:
             return;
         }
         const view_locks locks(bases_);
-        const std::uint32_t n = bond_->paired;
-        for (std::uint32_t pos = 0; pos < n; ++pos)
+        const index_type n = bond_->paired;
+        for (index_type pos = 0; pos < n; ++pos)
         {
             const entity e = bases_[first_owned]->entity_at(pos);
             if (!passes(e.index()))
@@ -4046,8 +4041,8 @@ public:
             return;
         }
         const view_locks locks(bases_);
-        const std::uint32_t n = bond_->paired;
-        for (std::uint32_t pos = 0; pos < n; ++pos)
+        const index_type n = bond_->paired;
+        for (index_type pos = 0; pos < n; ++pos)
         {
             const entity e = bases_[first_owned]->entity_at(pos);
             if (!passes(e.index()))
@@ -4080,7 +4075,7 @@ public:
     void sort(Compare cmp, Algorithm&& algo = {})
     {
         sort_partition(
-            [&](std::uint32_t a, std::uint32_t b)
+            [&](index_type a, index_type b)
             {
                 return static_cast<bool>(
                     cmp(bases_[first_owned]->entity_at(a), bases_[first_owned]->entity_at(b)));
@@ -4103,7 +4098,7 @@ public:
                           "quiver: T uses tag storage and carries no values to compare; sort by "
                           "(entity, entity) instead");
             auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(bases_[slot]);
-            sort_partition([&](std::uint32_t a, std::uint32_t b)
+            sort_partition([&](index_type a, index_type b)
                            { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); },
                            std::forward<Algorithm>(algo));
         }
@@ -4135,7 +4130,7 @@ public:
 
             iterator() = default;
 
-            iterator(const Self* view, std::uint32_t pos) noexcept
+            iterator(const Self* view, typename Traits::index_type pos) noexcept
                 : view_(view),
                   pos_(pos)
             {
@@ -4184,14 +4179,14 @@ public:
             }
 
             const Self* view_ = nullptr;
-            std::uint32_t pos_ = 0;
-            std::uint32_t end_ = 0;
+            typename Traits::index_type pos_ = 0;
+            typename Traits::index_type end_ = 0;
         };
 
         [[nodiscard]] iterator begin() const noexcept
         {
             iterator it(&view_, 0);
-            it.end_ = static_cast<std::uint32_t>(size_);
+            it.end_ = static_cast<typename Traits::index_type>(size_);
             it.seek();
             return it;
         }
@@ -4251,14 +4246,14 @@ private:
                 }
             }
         }
-        const std::uint32_t n = bond_->paired;
-        std::pmr::vector<std::uint32_t> perm(n, bases_[first_owned]->memory_);
-        for (std::uint32_t i = 0; i < n; ++i)
+        const index_type n = bond_->paired;
+        std::pmr::vector<index_type> perm(n, bases_[first_owned]->memory_);
+        for (index_type i = 0; i < n; ++i)
         {
             perm[i] = i;
         }
         algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
-        const auto swap_all = [&](std::uint32_t a, std::uint32_t b) noexcept
+        const auto swap_all = [&](index_type a, index_type b) noexcept
         {
             for (std::size_t slot = 0; slot < sizeof...(Ts); ++slot)
             {
@@ -4268,10 +4263,10 @@ private:
                 }
             }
         };
-        for (std::uint32_t i = 0; i < n; ++i)
+        for (index_type i = 0; i < n; ++i)
         {
-            std::uint32_t curr = i;
-            std::uint32_t next = perm[curr];
+            index_type curr = i;
+            index_type next = perm[curr];
             while (next != i)
             {
                 swap_all(curr, next);
@@ -4393,7 +4388,8 @@ public:
             return nullptr;
         }
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-        return const_cast<pool_base*>(pool_)->item_address(static_cast<std::uint32_t>(pos));
+        return const_cast<pool_base*>(pool_)->item_address(
+            static_cast<typename Traits::index_type>(pos));
     }
 
     // The entity at a dense position (pairs with raw_at).
@@ -4428,6 +4424,7 @@ template <class Traits>
 class basic_runtime_selection
 {
     using entity = quiver::basic_entity<Traits>;
+    using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using pool_ref = basic_pool_ref<Traits>;
     using runtime_selection = basic_runtime_selection;  // the historical body spelling
@@ -4566,7 +4563,7 @@ private:
 
     [[nodiscard]] static bool matches_lists(const std::vector<const pool_base*>& includes,
                                             const std::vector<const pool_base*>& excludes,
-                                            std::uint32_t index,
+                                            index_type index,
                                             const pool_base* driver) noexcept
     {
         for (const pool_base* pool : includes)
@@ -4603,7 +4600,7 @@ private:
         return best;
     }
 
-    [[nodiscard]] bool matches_rest(std::uint32_t index, const pool_base* driver) const noexcept
+    [[nodiscard]] bool matches_rest(index_type index, const pool_base* driver) const noexcept
     {
         for (const pool_base* pool : includes_)
         {
@@ -5063,7 +5060,7 @@ private:
     std::pmr::vector<op> ops_;
     detail::payload_arena arena_;
     std::pmr::vector<entity> resolved_;  // scratch used by world::apply; reused across applies
-    std::uint32_t ticket_count_ = 0;
+    index_type ticket_count_ = 0;
     generation_type nonce_ = fresh_nonce();  // this buffer's identity
 };
 
@@ -5429,6 +5426,7 @@ public:
 private:
     using world = basic_world;  // the historical body spelling
     using entity_table = detail::basic_entity_table<Traits>;
+    using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using group_core = detail::basic_group_core<Traits>;
     using single_pool_lock = detail::basic_single_pool_lock<Traits>;
@@ -5676,7 +5674,7 @@ public:
             }
             return;
         }
-        const std::uint32_t index = e.index();
+        const index_type index = e.index();
         if constexpr (checks_enabled)
         {
             // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
@@ -5708,13 +5706,13 @@ public:
     [[nodiscard]] bool alive(entity e) const noexcept { return table_.alive(e); }
 
     // The live handle occupying a slot, or no_entity. For inspectors/tools.
-    [[nodiscard]] entity current_handle(std::uint32_t slot) const noexcept
+    [[nodiscard]] entity current_handle(index_type slot) const noexcept
     {
         if (!table_.occupied(slot))
         {
             return no_entity;
         }
-        return entity(static_cast<typename Traits::index_type>(slot), table_.generation_at(slot));
+        return entity(slot, table_.generation_at(slot));
     }
 
     // Call-site sugar: a {world, entity} view forwarding the component verbs
@@ -6181,14 +6179,14 @@ public:
         }
         if constexpr (std::invocable<Compare&, const T&, const T&> && !detail::is_tag_v<T>)
         {
-            pool->sort_dense([&](std::uint32_t a, std::uint32_t b)
+            pool->sort_dense([&](index_type a, index_type b)
                              { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); },
                              std::forward<Algorithm>(algo));
         }
         else if constexpr (std::invocable<Compare&, entity, entity>)
         {
             pool->sort_dense(
-                [&](std::uint32_t a, std::uint32_t b)
+                [&](index_type a, index_type b)
                 { return static_cast<bool>(cmp(pool->entity_at(a), pool->entity_at(b))); },
                 std::forward<Algorithm>(algo));
         }
@@ -6238,7 +6236,7 @@ public:
                 return;
             }
         }
-        std::uint32_t front = 0;
+        index_type front = 0;
         const std::size_t n = lead->size();
         for (std::size_t pos = 0; pos < n; ++pos)
         {
@@ -6333,11 +6331,11 @@ public:
         // One-time partition build: partition the FIRST owner probing all
         // others, then mirror each remaining owner's prefix into its order.
         pool_base& first = *pools[0];
-        std::uint32_t k = 0;
-        const auto n = static_cast<std::uint32_t>(first.size());
-        for (std::uint32_t pos = 0; pos < n; ++pos)
+        index_type k = 0;
+        const auto n = static_cast<index_type>(first.size());
+        for (index_type pos = 0; pos < n; ++pos)
         {
-            const std::uint32_t index = first.entity_at(pos).index();
+            const index_type index = first.entity_at(pos).index();
             bool in_all = true;
             for (std::size_t i = 1; i < pools.size(); ++i)
             {
@@ -6354,9 +6352,9 @@ public:
         }
         for (std::size_t i = 1; i < pools.size(); ++i)
         {
-            for (std::uint32_t j = 0; j < k; ++j)
+            for (index_type j = 0; j < k; ++j)
             {
-                const std::uint32_t there = pools[i]->position_of(first.entity_at(j).index());
+                const index_type there = pools[i]->position_of(first.entity_at(j).index());
                 if (there != j)
                 {
                     pools[i]->mirror_swap(j, there);
@@ -6698,7 +6696,7 @@ public:
             return {};
         }
         const apply_result result = apply_replay(buffer);
-        std::uint32_t ticket = 0;
+        std::size_t ticket = 0;
         // Index loop for the same reason as apply_replay; ops recorded from
         // inside on_spawn never apply (the clear below is terminal).
         for (std::size_t i = 0; i < buffer.ops_.size(); ++i)
@@ -6884,14 +6882,13 @@ public:
     template <class F>
     void live_entities(F&& fn) const
     {
-        for (std::uint32_t slot = 0; slot < table_.slots(); ++slot)
+        for (index_type slot = 0; slot < table_.slots(); ++slot)
         {
             if (!table_.occupied(slot))
             {
                 continue;
             }
-            const entity e(static_cast<typename Traits::index_type>(slot),
-                           table_.generation_at(slot));
+            const entity e(slot, table_.generation_at(slot));
             if constexpr (std::predicate<F&, entity>)
             {
                 if (!fn(e))
@@ -7171,7 +7168,7 @@ private:
     // The post-liveness-check half of has, for has_all/has_any's single
     // liveness gate. An unregistered pool counts as absent.
     template <component T>
-    [[nodiscard]] bool probe(std::uint32_t index) const noexcept
+    [[nodiscard]] bool probe(index_type index) const noexcept
     {
         const auto* pool = peek_pool<T>();
         return pool != nullptr && pool->contains(index);
@@ -7381,7 +7378,8 @@ private:
                 // The nonce stamped into the handle must match the applying
                 // buffer: handles from another buffer, or recorded before a
                 // clear(), are refused rather than silently mis-resolved.
-                const std::uint32_t ticket = target.index() & ~limits::provisional_bit;
+                const auto ticket =
+                    static_cast<index_type>(target.index() & ~limits::provisional_bit);
                 if (target.generation() != buffer.nonce_ || ticket >= buffer.resolved_.size())
                 {
                     if constexpr (checks_enabled)
@@ -7442,7 +7440,7 @@ private:
             }
             // Mirror equality: the same entity at the same position in every
             // owner, across the whole partition.
-            for (std::uint32_t pos = 0; pos < bond->paired; ++pos)
+            for (index_type pos = 0; pos < bond->paired; ++pos)
             {
                 const entity e = first.entity_at(pos);
                 for (std::uint32_t i = 1; i < bond->owner_count; ++i)
@@ -7467,7 +7465,7 @@ private:
             }
             for (std::size_t pos = bond->paired; pos < smallest->size(); ++pos)
             {
-                const std::uint32_t index = smallest->entity_at(pos).index();
+                const auto index = smallest->entity_at(pos).index();
                 bool in_all = true;
                 for (std::uint32_t i = 0; i < bond->owner_count; ++i)
                 {
