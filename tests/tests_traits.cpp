@@ -28,6 +28,30 @@ struct wide_traits
 using compact_entity = ecs::basic_entity<compact_traits>;
 using wide_entity = ecs::basic_entity<wide_traits>;
 
+// Archive components with entity members under custom traits: one with a
+// per-layout member hook, one with a traits-generic template member.
+struct CompactSquad
+{
+    compact_entity leader;
+    int morale = 0;
+
+    void quiver_relink(const ecs::basic_graft_map<compact_traits>& map)
+    {
+        leader = map.resolve(leader);
+    }
+};
+
+struct CompactLink
+{
+    compact_entity target;
+
+    template <class Traits>
+    void quiver_relink(const ecs::basic_graft_map<Traits>& map)
+    {
+        target = map.resolve(target);
+    }
+};
+
 // The alias identity, pinned at compile time.
 static_assert(std::same_as<ecs::entity, ecs::basic_entity<ecs::default_entity_traits>>);
 static_assert(std::same_as<ecs::entity_hash, ecs::basic_entity_hash<ecs::default_entity_traits>>);
@@ -161,4 +185,41 @@ void test_traits_compact_world()
 
     CHECK_VALID(w);
     CHECK_VALID(fresh);
+}
+
+void test_traits_relink()
+{
+    section("entity traits: graft relinks under custom layouts");
+
+    // The trait detects per-layout hooks at their own traits — and only there.
+    static_assert(ecs::relink_traits<CompactSquad, compact_traits>::links);
+    static_assert(!ecs::relink_traits<CompactSquad>::links);
+    static_assert(ecs::relink_traits<CompactLink, compact_traits>::links);
+    static_assert(!ecs::relink_traits<Pos, compact_traits>::links);
+
+    using compact_world = ecs::basic_world<compact_traits>;
+    compact_world source;
+    const compact_entity captain = source.spawn();
+    source.add<Pos>(captain, Pos{1});
+    const compact_entity grunt = source.spawn();
+    source.add<Pos>(grunt, Pos{2});
+    source.add<CompactSquad>(grunt, CompactSquad{captain, 7});
+    source.add<CompactLink>(grunt, CompactLink{captain});
+
+    byte_writer out;
+    ecs::pack<Pos, CompactSquad, CompactLink>(source, out);
+
+    compact_world host;
+    host.spawn();  // pre-populated: grafted ids must be fresh
+    byte_reader in{&out.data};
+    const auto grafted = ecs::graft<Pos, CompactSquad, CompactLink>(host, in);
+    CHECK(grafted.has_value());
+    const compact_entity new_captain = grafted->resolve(captain);
+    const compact_entity new_grunt = grafted->resolve(grunt);
+    CHECK(host.alive(new_captain) && host.alive(new_grunt));
+    CHECK(new_captain != captain || new_grunt != grunt);  // fresh spawns
+    CHECK(host.get<CompactSquad>(new_grunt).leader == new_captain);
+    CHECK(host.get<CompactSquad>(new_grunt).morale == 7);
+    CHECK(host.get<CompactLink>(new_grunt).target == new_captain);
+    CHECK_VALID(host);
 }

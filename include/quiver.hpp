@@ -8170,21 +8170,26 @@ struct archive_access  // pack/unpack/graft internals; not user API
     }
 };
 
-template <class T>
-concept has_member_relink = requires(T& v, const graft_map& m) { v.quiver_relink(m); };
+template <class T, class Traits>
+concept has_member_relink =
+    requires(T& v, const basic_graft_map<Traits>& m) { v.quiver_relink(m); };
 }  // namespace detail
 
 // Opt-in entity-handle rewriting for graft. A component participates by
-// defining `void quiver_relink(const graft_map&)`, or — for types you do not
-// own — by specializing relink_traits<T> with `links = true` and a static
-// relink(T&, const graft_map&).
-template <class T>
+// defining `void quiver_relink(const graft_map&)` — against the layout's own
+// basic_graft_map<Traits>, or as a member template serving every layout — or,
+// for types you do not own, by specializing relink_traits<T, Traits> with
+// `links = true` and a static relink(T&, const basic_graft_map<Traits>&).
+// A hook written for one layout reports links == false everywhere else,
+// which is coherent: a component storing that layout's handles cannot ride
+// another layout's archive anyway.
+template <class T, class Traits = default_entity_traits>
 struct relink_traits
 {
-    static constexpr bool links = detail::has_member_relink<T>;
+    static constexpr bool links = detail::has_member_relink<T, Traits>;
 
-    static void relink(T& value, const graft_map& map)
-        requires detail::has_member_relink<T>
+    static void relink(T& value, const basic_graft_map<Traits>& map)
+        requires detail::has_member_relink<T, Traits>
     {
         value.quiver_relink(map);
     }
@@ -8290,9 +8295,9 @@ template <component T, class Traits, class R>
                           "move it into the world; give T those operations or load manually");
             T value{};
             in(value);
-            if constexpr (relink_traits<T>::links)
+            if constexpr (relink_traits<T, Traits>::links)
             {
-                relink_traits<T>::relink(value, map);
+                relink_traits<T, Traits>::relink(value, map);
             }
             w.template add<T>(owner, std::move(value));
         }

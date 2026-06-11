@@ -254,3 +254,4 @@ void test_reflection_ecs_verbs();
 // tests_traits.cpp (M7: entity-traits templating)
 void test_traits_entity_layouts();
 void test_traits_compact_world();
+void test_traits_relink();
