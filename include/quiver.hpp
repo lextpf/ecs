@@ -5056,6 +5056,35 @@ public:
     {
     }
 
+    // Records the whole recipe from component values in one expression; tag
+    // components ride along as empty values:
+    //   blueprint goblin{Transform{0, 0}, Health{20}, Burning{}};
+    // Equivalent to default construction followed by one add per value.
+    template <class... Cs>
+        requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
+                 (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
+                 (!std::convertible_to<Cs&&, std::pmr::memory_resource*> && ...))
+    explicit basic_blueprint(Cs&&... components)
+        : basic_blueprint()
+    {
+        static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
+                      "quiver: duplicate component type in blueprint{...}");
+        (record_value(std::forward<Cs>(components)), ...);
+    }
+
+    // The same, with the recipe storage fed by an explicit memory resource.
+    template <class... Cs>
+        requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
+                 (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
+                 (!std::convertible_to<Cs&&, std::pmr::memory_resource*> && ...))
+    basic_blueprint(std::pmr::memory_resource* memory, Cs&&... components)
+        : basic_blueprint(memory)
+    {
+        static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
+                      "quiver: duplicate component type in blueprint{...}");
+        (record_value(std::forward<Cs>(components)), ...);
+    }
+
     basic_blueprint(basic_blueprint&& other) noexcept
         : ops_(std::move(other.ops_)),
           arena_(std::move(other.arena_))
@@ -5086,8 +5115,9 @@ public:
 
     // Records one component for every future stamp. Constructor arguments are
     // evaluated once, here; each spawn copy-constructs from the stored value.
+    // Returns *this, so conditional recipe-building chains.
     template <component T, class... Args>
-    void add(Args&&... args)
+    basic_blueprint& add(Args&&... args)
     {
         if constexpr (checks_enabled)
         {
@@ -5096,7 +5126,7 @@ public:
                 if (o.type == detail::type_id<T>())
                 {
                     detail::violate_pool("blueprint already contains component", name_of<T>());
-                    return;
+                    return *this;
                 }
             }
         }
@@ -5132,6 +5162,7 @@ public:
                               destroy_fn,
                               payload});
         }
+        return *this;
     }
 
     [[nodiscard]] bool empty() const noexcept { return ops_.empty(); }
@@ -5173,6 +5204,22 @@ private:
         if (ops_.size() == ops_.capacity())
         {
             ops_.reserve(std::max<std::size_t>(8, ops_.capacity() * 2));
+        }
+    }
+
+    // Value-pack recording: tags arrive as empty values, everything else is
+    // forwarded into the arena. Mirrors world's value-spawn dispatch.
+    template <class C>
+    void record_value(C&& value)
+    {
+        using T = std::remove_cvref_t<C>;
+        if constexpr (detail::is_tag_v<T>)
+        {
+            add<T>();
+        }
+        else
+        {
+            add<T>(std::forward<C>(value));
         }
     }
 

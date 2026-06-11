@@ -1904,6 +1904,40 @@ static void test_blueprint()
         never_used.add<Counted>(5);
     }
     CHECK(Counted::total_ctors == Counted::total_dtors);
+
+    // Value-pack construction: the whole recipe in one line, deduced from
+    // component values; tags ride along as empty values.
+    ecs::blueprint orc{Pos{4}, Hp{12}, TagA{}};
+    CHECK(orc.size() == 3);
+    const ecs::entity o1 = w.spawn(orc);
+    const ecs::entity o2 = w.spawn(orc);
+    CHECK(w.get<Pos>(o1).x == 4 && w.get<Hp>(o2).hp == 12);
+    CHECK(w.has<TagA>(o1) && w.has<TagA>(o2));
+    w.get<Pos>(o1).x = 77;  // stamps stay independent copies
+    CHECK(w.get<Pos>(o2).x == 4);
+
+    // add() chains, so conditional recipe-building stays terse.
+    ecs::blueprint chained;
+    chained.add<Pos>(1).add<Hp>(2);
+    CHECK(chained.size() == 2);
+    const ecs::entity c1 = w.spawn(chained);
+    CHECK(w.get<Pos>(c1).x == 1 && w.get<Hp>(c1).hp == 2);
+
+    // A leading memory resource still wins overload resolution when
+    // component values follow it.
+    std::pmr::monotonic_buffer_resource scratch;
+    ecs::blueprint arena_pack(&scratch, Pos{6});
+    CHECK(arena_pack.size() == 1);
+    CHECK(w.get<Pos>(w.spawn(arena_pack)).x == 6);
+
+    // Payload destruction balances for brace-built recipes too.
+    Counted::total_ctors = 0;
+    Counted::total_dtors = 0;
+    {
+        ecs::blueprint braced{Counted{5}};
+        CHECK(braced.size() == 1);
+    }
+    CHECK(Counted::total_ctors == Counted::total_dtors);
     CHECK_VALID(w);
 }
 
