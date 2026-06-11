@@ -165,22 +165,21 @@ int main()
     // World state without a singleton framework: components on globals().
     world.globals().obtain<MatchClock>();
 
-    // A reusable spawn recipe.
-    ecs::blueprint goblin;
-    goblin.add<Transform>(Vec2{0, 0});
-    goblin.add<Velocity>(Vec2{1, 0});
-    goblin.add<SpriteRef>(7U);
-    goblin.add<Health>(20);
+    // A reusable spawn recipe, recorded in one expression; the batch stamp
+    // hands each goblin back for its per-entity tweaks.
+    ecs::blueprint goblin{Transform{Vec2{0, 0}}, Velocity{Vec2{1, 0}}, SpriteRef{7U}, Health{20}};
 
-    for (int i = 0; i < 4; ++i)
-    {
-        const ecs::entity g = world.spawn(goblin);
-        world.get<Transform>(g).position = {static_cast<float>(i) * 10.0F, 0};
-        if (i % 2 == 0)
-        {
-            world.add<Burning>(g);  // enters the Health∩Burning bond
-        }
-    }
+    int column = 0;
+    world.spawn(goblin, 4,
+                [&](ecs::entity g)
+                {
+                    world.get<Transform>(g).position = {static_cast<float>(column) * 10.0F, 0};
+                    if (column % 2 == 0)
+                    {
+                        world.add<Burning>(g);  // enters the Health∩Burning bond
+                    }
+                    ++column;
+                });
     const ecs::entity player = world.spawn(Transform{{50, 0}}, Velocity{{0, 0}});
     world.add<SpriteRef>(player, SpriteRef{1U});
     world.add<Health>(player, Health{100});
