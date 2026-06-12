@@ -1,4 +1,4 @@
-# quiver clang-tidy configuration (derived from the glyph project's profile).
+# ecs clang-tidy configuration (derived from the glyph project's profile).
 
 Checks: >
   bugprone-*,
@@ -61,10 +61,10 @@ WarningsAsErrors: ''
 
 # Analyze the library header when included from project sources; leave system
 # and vcpkg headers alone.
-HeaderFilterRegex: '.*[/\\]include[/\\]quiver\.hpp$'
+HeaderFilterRegex: '.*[/\\]src[/\\]ecs\.hpp$'
 
 FormatStyle: file
-User: quiver
+User: ecs
 
 CheckOptions:
   - key: modernize-use-override.IgnoreDestructors
