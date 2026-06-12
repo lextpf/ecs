@@ -39,9 +39,11 @@
 *.out
 *.app
 
-# Build directories
-build/
-Build/
+# Build directories: contents ignored, but the .gitkeep is re-included so the
+# empty build/ folder stays checked in. (A plain `build/` dir rule would make
+# the re-include impossible.)
+build/*
+!build/.gitkeep
 build-*/
 
 # CMake generated files
@@ -69,7 +71,6 @@ Testing/
 .cache/
 
 # Build outputs
-build/
 build-cdb/
 build-scratch/
 .cache/
