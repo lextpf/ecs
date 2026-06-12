@@ -1,14 +1,11 @@
 // ============================================================================
-// tests_bonds.cpp — N-ary bonds (M2): bond<A, B, C, ...> mirrored partitions
-// across up to 8 owners, churn maintenance, violation matrix, unbond
-// semantics. The 2-ary regression gate is test_bonded_pairs in tests.cpp,
-// which must keep passing unchanged through the same machinery.
+// tests_bonds.cpp -- N-ary bonds: mirrored partitions, churn, violations,
+// unbond. The 2-ary regression gate is test_bonded_pairs in tests.cpp.
 // ============================================================================
 
 #include "test_harness.hpp"
 
-// Never registered in any world: observed maybe<Unseen> parts must be null,
-// not an error.
+// Never registered: maybe<Unseen> parts must be null, not an error.
 struct Unseen
 {
     int v = 0;
@@ -33,13 +30,12 @@ void test_bond_n_ary()
         }
     }
 
-    // Pos ∩ Vel ∩ Hp = entities with i % 6 == 0 → i ∈ {0, 6}.
+    // Pos & Vel & Hp = entities with i % 6 == 0 -> i in {0, 6}.
     auto trio = w.bond<Pos, Vel, Hp>();
     CHECK(trio.count() == 2);
     CHECK_VALID(w);
 
-    // The mirror invariant, verified directly: the same entity at the same
-    // dense position in EVERY owner.
+    // Mirror invariant: the same entity at the same dense position in every owner.
     auto mirrored = [&](std::size_t expect)
     {
         auto pa = w.find_pool<Pos>();
@@ -136,8 +132,7 @@ void test_bond_n_ary()
     CHECK(quad.count() == 1);
     CHECK_VALID(w4);
 
-    // The 2-ary spelling rides the same machinery (exhaustive regression
-    // lives in test_bonded_pairs, unchanged).
+    // The 2-ary spelling rides the same machinery (regression: test_bonded_pairs).
     ecs::world w2;
     const ecs::entity x = w2.spawn(Pos{1}, Vel{2});
     auto duo = w2.bond<Pos, Vel>();
@@ -190,8 +185,8 @@ void test_bond_n_ary_paths()
     CHECK((fresh.bonded<Pos, Vel, Stable>().count() == 4));
     CHECK_VALID(fresh);
 
-    // Lifetime balance under partition churn (mirror swaps move packed
-    // payloads; stable owners never move theirs).
+    // Lifetime balance under churn: mirror swaps move packed payloads; stable
+    // owners never move theirs.
     ecs::world w2;
     w2.bond<Hp, StableCounted, TagB>();
     const int live_before = Counted::live;
@@ -213,7 +208,7 @@ void test_bond_n_ary_paths()
     CHECK_VALID(w2);
 }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 void test_bond_n_ary_violations()
 {
     section("bond<A, B, C>: violation matrix");
@@ -224,8 +219,7 @@ void test_bond_n_ary_violations()
     w.bond<Pos, Vel, Hp>();
 
     {
-        // Overlapping owned sets are refused outright — subset, superset,
-        // and partial overlap all spell "already bonded".
+        // Overlapping owned sets are refused: subset, superset, partial overlap.
         violation_scope guard;
         auto v = w.bond<Pos, TagA>();
         CHECK(violations_seen == 1);
@@ -267,8 +261,7 @@ void test_bond_n_ary_violations()
         w.unhook(t);
     }
     {
-        // bonded<> naming a subset of the standing owned set: violation,
-        // empty view.
+        // bonded<> naming a subset of the owned set: violation, empty view.
         violation_scope guard;
         auto v = w.bonded<Pos, Vel>();
         CHECK(violations_seen == 1);
@@ -299,7 +292,7 @@ void test_bond_n_ary_violations()
         CHECK(!w3.validate().has_value());
     }
     CHECK_VALID(w);
-    // Compile-time walls, for the record (each is a static_assert):
+    // Compile-time walls (each is a static_assert):
     //   w.bond<Pos, Pos, Vel>();              // duplicate component type
     //   w.bond<Pos>();                        // needs at least two types
     //   w.bond<T1, T2, T3, T4, T5, T6, T7, T8, T9>();  // at most 8 owners
@@ -338,8 +331,7 @@ void test_bond_observed_views()
     section("bonded views: observed maybe<> parts and except<> filters");
     ecs::world w;
 
-    // Owned pair; Hp is OBSERVED (not part of the group identity), TagA
-    // filters.
+    // Owned pair; Hp is observed (not part of the group identity), TagA filters.
     w.bond<Pos, Vel>();
     int idx = 0;
     ecs::entity tagged = ecs::no_entity;
@@ -359,9 +351,8 @@ void test_bond_observed_views()
         }
     }
 
-    // The observed part arrives as a pointer, null when absent — exactly the
-    // selection maybe<> convention. Membership in the partition does NOT
-    // imply membership in observed pools.
+    // Observed parts arrive as pointers, null when absent (the maybe<> convention).
+    // Partition membership does not imply membership in observed pools.
     const auto view = w.bonded<Pos, Vel, ecs::maybe<Hp>>();
     CHECK(view.count() == 6);
     int with = 0;
@@ -402,8 +393,8 @@ void test_bond_observed_views()
     CHECK(range_rows == 5);
     CHECK(range_with == 3);
 
-    // An observed pool that never registered yields all-null parts, not an
-    // error (and never filters).
+    // A never-registered observed pool yields all-null parts, never an error
+    // or a filter.
     const auto cold = w.bonded<Pos, Vel, ecs::maybe<Unseen>>();
     int null_parts = 0;
     cold.each([&](Pos&, Vel&, Unseen* t) { null_parts += (t == nullptr) ? 1 : 0; });
@@ -416,11 +407,10 @@ void test_bond_observed_views()
     cview.each([&](const Pos&, const Vel&, const Hp* hp) { cwith += (hp != nullptr) ? 1 : 0; });
     CHECK(cwith == 3);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
-        // The full owned set must be listed plain. A wrong plain set is a
-        // runtime violation with an empty view; fewer than two plain types
-        // is a compile-time wall:
+        // The owned set must be listed plain. A wrong plain set is a runtime
+        // violation (empty view); fewer than two plain types is a static_assert:
         //   w.bonded<Pos, ecs::maybe<Hp>>();  // static_assert: owned set is plain
         violation_scope guard;
         const auto extra_plain = w.bonded<Pos, Vel, Hp>();  // Hp listed plain, not owned
@@ -439,8 +429,7 @@ void test_bond_partition_sort()
     w.bond<Pos, Vel, Stable>();
     auto view = w.bonded<Pos, Vel, Stable>();
 
-    // Members in scrambled order, plus non-members on every side to prove
-    // the tail stays untouched.
+    // Scrambled members plus non-members to prove the tail stays untouched.
     for (int i = 0; i < 8; ++i)
     {
         const ecs::entity e = w.spawn(Pos{100 - i}, Vel{i});
@@ -481,8 +470,7 @@ void test_bond_partition_sort()
         CHECK(mirrored);
     }
 
-    // Entities OUTSIDE the partition kept their membership (and the pools
-    // their integrity).
+    // Entities outside the partition kept their membership; pools stay intact.
     CHECK(w.select<Pos>().count() == 8);
     CHECK((w.select<Pos>(ecs::except<Stable>{}).count() == 2));
     CHECK_VALID(w);
@@ -501,7 +489,7 @@ void test_bond_partition_sort()
     }
     CHECK_VALID(w);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         // Refused while any owner iterates.
         violation_scope guard;
@@ -515,8 +503,7 @@ void test_bond_partition_sort()
     }
 #endif
 
-    // Lifetime balance: payload swaps in packed owners move values, never
-    // duplicate them.
+    // Lifetime balance: packed-owner swaps move values, never duplicate them.
     {
         ecs::world w2;
         w2.bond<Counted, Hp>();

@@ -1,7 +1,6 @@
 // ============================================================================
-// tests.cpp — quiver's test suite. No framework: a CHECK macro, a counter, and
-// an exit code. Build with QUIVER_CHECKS on (the default without NDEBUG); the
-// violation-handler tests are skipped when checks are compiled out.
+// tests.cpp -- ecs test suite. No framework: a CHECK macro, a counter, an
+// exit code. Violation-handler tests are skipped when ECS_CHECKS is off.
 // ============================================================================
 
 #include "test_harness.hpp"
@@ -14,7 +13,7 @@
 // Empty but explicitly packed: storage_policy beats the empty-type auto-tag.
 struct EmptyPacked
 {
-    static constexpr auto quiver_storage = ecs::storage::packed;
+    static constexpr auto ecs_storage = ecs::storage::packed;
 };
 
 struct MoveOnly
@@ -27,9 +26,8 @@ struct MoveOnly
     std::unique_ptr<int> box;
 };
 
-// Knows its own address; its move constructor records whether the source was
-// where it claimed to be. If the command buffer's arena ever relocated a
-// payload behind its back, sources would lie.
+// Its move ctor flags sources not at their recorded address: catches the
+// command buffer arena relocating payloads.
 static int anchored_betrayals = 0;
 
 struct Anchored
@@ -60,17 +58,15 @@ struct Anchored
     const Anchored* self;
 };
 
-// Non-movable component (std::atomic member): legal in stable storage, which
-// constructs and destroys in place and never moves payloads.
+// Non-movable (std::atomic member): legal in stable storage, which never moves payloads.
 struct Pinned
 {
     std::atomic<int> charge{0};
-    static constexpr auto quiver_storage = ecs::storage::stable;
+    static constexpr auto ecs_storage = ecs::storage::stable;
 };
 static_assert(!std::is_move_constructible_v<Pinned>);
 
-// Payload aligned beyond the command buffer's bump-arena alignment: must get
-// a dedicated, exactly-aligned chunk.
+// Aligned past the arena default: the command buffer must hand out an exactly-aligned chunk.
 static int misaligned_big = 0;
 
 struct alignas(128) Big128
@@ -104,14 +100,13 @@ struct Label
     std::string value;
 };
 
-// Archive round-trip component with an entity member, relinked via the
-// member hook.
+// Entity-bearing component, relinked via the ecs_relink member hook.
 struct Squad
 {
     ecs::entity leader;
     int morale = 0;
 
-    void quiver_relink(const ecs::graft_map& map) { leader = map.resolve(leader); }
+    void ecs_relink(const ecs::graft_map& map) { leader = map.resolve(leader); }
 };
 
 // A "foreign" type that opts into relinking via the trait instead.
@@ -121,11 +116,11 @@ struct ForeignLink
 };
 
 template <>
-struct quiver::relink_traits<ForeignLink>
+struct ecs::relink_traits<ForeignLink>
 {
     static constexpr bool links = true;
 
-    static void relink(ForeignLink& value, const quiver::graft_map& map)
+    static void relink(ForeignLink& value, const ecs::graft_map& map)
     {
         value.target = map.resolve(value.target);
     }
@@ -143,8 +138,7 @@ struct GpuUploads
 
 // --- genericity-wave fixtures ---
 
-// A component with a CUSTOM storage backend: derives the built-in packed
-// pool and instruments the cold virtuals.
+// Custom storage backend: derives the packed pool and instruments the cold virtuals.
 struct Telemetry
 {
     int v = 0;
@@ -175,7 +169,7 @@ struct telemetry_pool : ecs::packed_pool_of<Telemetry>
 struct LabeledA
 {
     int v = 0;
-    static constexpr std::string_view quiver_label = "test.labeled_a";
+    static constexpr std::string_view ecs_label = "test.labeled_a";
 };
 
 // Pinned identity for a "foreign" type via the variable template.
@@ -188,17 +182,17 @@ struct ForeignVec
 struct DupLabel1
 {
     int v = 0;
-    static constexpr std::string_view quiver_label = "test.duplicate";
+    static constexpr std::string_view ecs_label = "test.duplicate";
 };
 
 struct DupLabel2
 {
     int v = 0;
-    static constexpr std::string_view quiver_label = "test.duplicate";
+    static constexpr std::string_view ecs_label = "test.duplicate";
 };
 
 template <>
-struct quiver::pool_of<Telemetry>
+struct ecs::pool_of<Telemetry>
 {
     using type = telemetry_pool;
 };
@@ -207,7 +201,7 @@ struct quiver::pool_of<Telemetry>
 struct Audit
 {
     int v = 0;
-    static constexpr auto quiver_storage = ecs::storage::stable;
+    static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
 struct audit_pool : ecs::stable_pool_of<Audit>
@@ -225,13 +219,13 @@ struct audit_pool : ecs::stable_pool_of<Audit>
 };
 
 template <>
-struct quiver::pool_of<Audit>
+struct ecs::pool_of<Audit>
 {
     using type = audit_pool;
 };
 
 template <>
-inline constexpr std::string_view quiver::component_label<ForeignVec> = "test.foreign_vec";
+inline constexpr std::string_view ecs::component_label<ForeignVec> = "test.foreign_vec";
 
 namespace hookfree
 {
@@ -246,13 +240,12 @@ inline void on_free_short(ecs::entity)
 }
 }  // namespace hookfree
 
-// Stable storage with a tuned chunk size (local classes cannot host the
-// static members).
+// Stable storage with a tuned chunk size (local classes cannot host the statics).
 struct TunedStable
 {
     int v = 0;
-    static constexpr auto quiver_storage = ecs::storage::stable;
-    static constexpr std::size_t quiver_chunk_items = 8;
+    static constexpr auto ecs_storage = ecs::storage::stable;
+    static constexpr std::size_t ecs_chunk_items = 8;
 };
 
 // Distinct types for the multi-world registration-order test.
@@ -313,8 +306,7 @@ static void test_lifecycle_and_reuse()
     CHECK(w.current_handle(reused.index()) == reused);
     CHECK(w.current_handle(9999) == ecs::no_entity);
 
-    // Components attached through a stale handle must not leak onto the
-    // recycled entity. (has/find are the safe, non-violating queries.)
+    // A stale handle must not reach the recycled entity; has/find never violate.
     CHECK(!w.has<Pos>(a));
     CHECK(w.find<Pos>(a) == nullptr);
 
@@ -433,8 +425,7 @@ static void test_tags()
     CHECK(w.remove<TagA>(a));
     CHECK(!w.has<TagA>(a));
 
-    // Explicit policy beats the empty-type auto-tag: EmptyPacked has a real
-    // (1-byte) pool and value access works.
+    // Explicit policy beats the auto-tag: EmptyPacked has a real pool, so value access works.
     w.add<EmptyPacked>(a);
     CHECK(w.find<EmptyPacked>(a) != nullptr);
     CHECK_VALID(w);
@@ -598,8 +589,7 @@ static void test_filters_and_driver()
     section("include/exclude filters, smallest-pool driving");
     ecs::world w;
 
-    // A misleading population: Pos is the big pool, Vel is smallest, and some
-    // Vel holders are disqualified (no Pos, or excluded by TagB).
+    // Pos is the big pool, Vel the smallest; some Vel holders disqualify (no Pos or TagB).
     std::vector<ecs::entity> expected;
     for (int i = 0; i < 50; ++i)
     {
@@ -638,8 +628,7 @@ static void test_filters_and_driver()
     }
     CHECK(!sel.contains(v_only));
 
-    // Driving from the smallest pool means iteration order follows Vel's dense
-    // order, not Pos's.
+    // Smallest-pool driving: iteration follows Vel's dense order, not Pos's.
     std::vector<ecs::entity> vel_order;
     w.select<Vel>().entities(
         [&](ecs::entity e)
@@ -678,8 +667,7 @@ static void test_selection_reuse_and_const_world()
     cold_sel.each([&](const Pos&) { ++cold_visits; });
     CHECK(cold_visits == 0);
 
-    // reset() empties pools but never destroys them: stored selections stay
-    // usable and see the rebuilt world.
+    // reset() empties pools but never destroys them: stored selections see the rebuilt world.
     w.reset();
     CHECK(movers.count() == 0);
     CHECK(!w.alive(e));
@@ -697,8 +685,7 @@ static void test_command_buffer_basics()
 
     ecs::command_buffer cmd;
 
-    // Strict recording order: add then remove leaves the component absent;
-    // remove then add leaves it present.
+    // Strict recording order: add-then-remove ends absent; remove-then-add ends present.
     cmd.add<Vel>(a, Vel{5});
     cmd.remove<Vel>(a);
     cmd.remove<Hp>(b);
@@ -716,8 +703,7 @@ static void test_command_buffer_basics()
     CHECK(w.get<Pos>(a).x == 7);
     CHECK(!w.alive(b));
 
-    // Ops aimed at an entity killed outside the buffer are skipped even when
-    // the slot has been recycled: the newcomer must not be touched.
+    // Ops on an externally killed entity are skipped; the recycled newcomer stays untouched.
     cmd.add<Vel>(a, Vel{9});
     cmd.kill(a);
     w.kill(a);  // killed externally between record and apply
@@ -752,8 +738,7 @@ static void test_command_buffer_spawn()
     cmd.kill(ghost2);  // even a deferred spawn can be deferred-killed
 
     const ecs::apply_result r = w.apply(cmd);
-    // Order is spawn, add, add, spawn, add, kill: ghost2 is alive when its add
-    // and its kill run, so every op applies and nothing is skipped.
+    // ghost2 is alive when its add and kill run, so all six ops apply, none skipped.
     CHECK(r.applied == 6 && r.skipped == 0);
 
     CHECK(w.live_count() == 1);
@@ -766,8 +751,7 @@ static void test_command_buffer_spawn()
         });
     CHECK(found == 1);
 
-    // Value-pack spawn: the deferred path mirrors world.spawn(Cs&&...), and
-    // move-only payloads ride the arena like any recorded add.
+    // Value-pack spawn mirrors world.spawn(Cs&&...); move-only payloads ride the arena.
     ecs::command_buffer packs;
     const ecs::entity prov = packs.spawn(Pos{5}, TagA{});
     CHECK(!w.alive(prov));
@@ -804,8 +788,7 @@ static void test_command_buffer_payloads()
 
     {
         ecs::command_buffer cmd;
-        // Hundreds of mixed-size payloads force several arena chunks. Anchored
-        // proves no payload was ever relocated; Aligned proves alignment.
+        // Mixed sizes force several chunks; Anchored catches relocation, Aligned misalignment.
         for (int i = 0; i < 400; ++i)
         {
             cmd.add<Anchored>(targets[i]);
@@ -815,8 +798,7 @@ static void test_command_buffer_payloads()
             }
             cmd.add<Counted>(targets[i], Counted{i});
         }
-        // Kill a slice of the targets so some payload ops get skipped: their
-        // payloads must still be destroyed exactly once.
+        // Killing a slice skips some ops; their payloads must still destroy exactly once.
         for (int i = 100; i < 200; ++i)
         {
             w.kill(targets[i]);
@@ -827,8 +809,7 @@ static void test_command_buffer_payloads()
     }
 
     {
-        // A buffer that records but is never applied must destroy its payloads
-        // on destruction.
+        // A never-applied buffer must destroy its payloads on destruction.
         ecs::command_buffer never_applied;
         never_applied.add<Counted>(targets[0], Counted{1});
         never_applied.add<Counted>(targets[1], Counted{2});
@@ -842,7 +823,7 @@ static void test_command_buffer_payloads()
     CHECK_VALID(w);
 }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 static void test_violations()
 {
     section("violation handler: structural changes during iteration");
@@ -877,8 +858,7 @@ static void test_violations()
         CHECK(w.has<Pos>(b));
     }
 
-    // add to the iterated pool: reported, then proceeds (it must return a
-    // reference). We stop iterating immediately and touch nothing stale.
+    // add to the iterated pool: reported, then proceeds (it must return a reference).
     {
         violation_scope guard;
         const ecs::entity fresh = w.spawn();
@@ -1016,7 +996,7 @@ static void test_negative_validation()
         }
     }
 }
-#endif  // QUIVER_CHECKS
+#endif  // ECS_CHECKS
 
 static void test_relationships()
 {
@@ -1075,7 +1055,7 @@ static void test_relationships()
     CHECK(w.parent_of(c3) == ecs::no_entity);
     CHECK_VALID(w);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // Self-adoption and cycles are refused.
     {
         violation_scope guard;
@@ -1171,8 +1151,7 @@ static void test_snapshot()
     }
     CHECK_VALID(loaded);
 
-    // The loaded world keeps spawning safely: recycled and fresh slots never
-    // collide with restored ones.
+    // Post-load spawns never collide with restored slots.
     std::unordered_set<std::uint32_t> indices;
     loaded.live_entities([&](ecs::entity e) { indices.insert(e.index()); });
     for (int i = 0; i < 20; ++i)
@@ -1228,8 +1207,7 @@ static void test_move_semantics()
 {
     section("move semantics: buffers, worlds, arenas");
 
-    // A moved-from command buffer behaves like a fresh one — including its
-    // provisional ticket counter (regression: defaulted move copied it).
+    // Moved-from buffers act fresh, ticket counter included (a defaulted move once copied it).
     {
         ecs::world w;
         ecs::command_buffer a;
@@ -1240,7 +1218,7 @@ static void test_move_semantics()
 
         ecs::command_buffer b{std::move(a)};
         // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
-        // Moved-from reuse is exactly the contract under test here.
+        // Moved-from reuse is the contract under test.
         CHECK(a.empty());
 
         const ecs::entity g2 = a.spawn();  // reuse the moved-from buffer
@@ -1278,9 +1256,8 @@ static void test_move_semantics()
         CHECK_VALID(w);
     }
 
-#if QUIVER_CHECKS
-    // Provisional handles from another buffer (or from before a clear) are
-    // refused, even when the ticket number happens to be in range.
+#if ECS_CHECKS
+    // Foreign or pre-clear provisional handles are refused even when the ticket is in range.
     {
         violation_scope guard;
         ecs::world w;
@@ -1323,8 +1300,7 @@ static void test_move_semantics()
         CHECK_VALID(w);
     }
 
-    // Moved-from worlds are empty and reusable; the moved-to world owns the
-    // data, and selections built before a move-construction stay valid.
+    // Moved-from worlds are empty and reusable; pre-move selections follow the moved-to world.
     {
         ecs::world w1;
         w1.spawn(Pos{1}, Vel{1});
@@ -1334,7 +1310,7 @@ static void test_move_semantics()
         ecs::world w2{std::move(w1)};
         CHECK(w2.live_count() == 2);
         CHECK(sel.count() == 2);  // pools traveled with the world
-        // NOLINTBEGIN(bugprone-use-after-move) — moved-from reuse is the contract under test
+        // NOLINTBEGIN(bugprone-use-after-move) -- moved-from reuse is the contract under test
         CHECK(w1.live_count() == 0);
         CHECK(w1.slot_count() == 0);
         w1.spawn(Pos{3});  // reuse after move
@@ -1366,8 +1342,7 @@ static void test_iteration_lock_unwinding()
     {
     };
 
-    // The empty catch blocks below are the point: the probe exception only
-    // exists to unwind the iteration mid-loop.
+    // Empty catches are the point: the probe exception just unwinds mid-loop.
     // NOLINTBEGIN(bugprone-empty-catch)
 
     // each(): the RAII lock releases when the callback throws.
@@ -1390,7 +1365,7 @@ static void test_iteration_lock_unwinding()
     }
     // NOLINTEND(bugprone-empty-catch)
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     CHECK(ecs::test_access::lock_count<Pos>(w) == 0);
     {
         violation_scope guard;
@@ -1405,7 +1380,7 @@ static void test_iteration_lock_unwinding()
     CHECK_VALID(w);
 }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 static void test_tag_add_refused_during_iteration()
 {
     section("tag add during its pool's iteration is refused");
@@ -1562,7 +1537,7 @@ static void test_range_iteration()
             break;
         }
     }
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     CHECK(ecs::test_access::lock_count<Pos>(w) == 0);
     CHECK(ecs::test_access::lock_count<Vel>(w) == 0);
 
@@ -1578,8 +1553,7 @@ static void test_range_iteration()
     CHECK(ecs::test_access::lock_count<Pos>(w) == 0);
 #endif
 
-    // Const world: const refs, and direct range-for over a temporary
-    // selection (C++23 extends range-init temporaries).
+    // Const world: const refs; range-for over a temporary (C++23 extends range-init temporaries).
     const ecs::world& cw = w;
     int const_sum = 0;
     for (auto&& [e, p] : cw.select<Pos>().range())
@@ -1637,8 +1611,7 @@ static void test_maybe_components()
         CHECK((tint != nullptr) == (e == tinted));
     }
 
-    // Const world: const pointers; unregistered maybe pool stays a null
-    // pointer without disqualifying anyone.
+    // Const world: const pointers; an unregistered maybe pool reads null, filtering no one.
     const ecs::world& cw = w;
     int rows = 0;
     cw.each<Pos, ecs::maybe<Tint>>(ecs::except<TagB>{},
@@ -1720,7 +1693,7 @@ static void test_sort()
     CHECK((order == std::vector<ecs::entity>{t1, t2}));
     CHECK_VALID(tw);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         w.each<Pos>(
@@ -1776,7 +1749,7 @@ static void test_query_helpers()
     w.kill(c1);
     CHECK(w.child_count(parent) == 1);
 
-    // kill is noexcept end-to-end now (free-stack slack invariant).
+    // kill is noexcept end-to-end (free-stack slack invariant).
     static_assert(noexcept(w.kill(parent)));
     CHECK_VALID(w);
 }
@@ -1837,8 +1810,7 @@ static void test_hooks()
     w.apply(cmd);
     CHECK(c.added == 3);
 
-    // purge and reset fire on_remove per live component (two entities still
-    // held Pos at purge time).
+    // purge and reset fire on_remove per live component (two held Pos at purge time).
     w.purge<Pos>();
     CHECK(c.removed == 3);
     w.spawn(Pos{1});  // added -> 4
@@ -1854,7 +1826,7 @@ static void test_hooks()
     CHECK(w.unhook(t_rem));
     CHECK(w.unhook(t_rep));
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // A hook that structurally mutates its own pool is a reported violation.
     {
         violation_scope guard;
@@ -1898,7 +1870,7 @@ static void test_blueprint()
     const ecs::entity g3 = w.spawn(goblin);
     CHECK(w.get<Pos>(g3).x == 7);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         goblin.add<Pos>(1);  // duplicate component in the recipe
@@ -1924,8 +1896,7 @@ static void test_blueprint()
     }
     CHECK(Counted::total_ctors == Counted::total_dtors);
 
-    // Value-pack construction: the whole recipe in one line, deduced from
-    // component values; tags ride along as empty values.
+    // Value-pack construction deduces the recipe; tags ride along as empty values.
     ecs::blueprint orc{Pos{4}, Hp{12}, TagA{}};
     CHECK(orc.size() == 3);
     const ecs::entity o1 = w.spawn(orc);
@@ -1942,8 +1913,7 @@ static void test_blueprint()
     const ecs::entity c1 = w.spawn(chained);
     CHECK(w.get<Pos>(c1).x == 1 && w.get<Hp>(c1).hp == 2);
 
-    // A leading memory resource still wins overload resolution when
-    // component values follow it.
+    // A leading memory resource wins overload resolution over the value pack.
     std::pmr::monotonic_buffer_resource scratch;
     ecs::blueprint arena_pack(&scratch, Pos{6});
     CHECK(arena_pack.size() == 1);
@@ -1958,8 +1928,7 @@ static void test_blueprint()
     }
     CHECK(Counted::total_ctors == Counted::total_dtors);
 
-    // Batch stamping: spawn(recipe, count) stamps count entities; the
-    // callback form hands each one back after its full stamp.
+    // spawn(recipe, count) stamps count entities; the callback gets each after its full stamp.
     ecs::blueprint swarm{Pos{8}};
     const std::size_t before = w.select<Pos>().count();
     w.spawn(swarm, 4);
@@ -2002,7 +1971,7 @@ static void test_duplicate()
     w.get<Pos>(r.clone).x = 40;  // independent copy
     CHECK(w.get<Pos>(src).x == 4);
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         const ecs::duplicate_result dead = w.duplicate(ecs::no_entity);
@@ -2027,8 +1996,7 @@ static void test_entity_ref()
     hero.put<Pos>(3);
     CHECK(hero.get<Pos>().x == 3);
 
-    // Multi-component get hands back a tuple of references, const through
-    // a const_entity_ref, mirroring the world verb.
+    // Multi-get returns a tuple of references, const through a const_entity_ref.
     auto [mp, mv] = hero.get<Pos, Vel>();
     static_assert(std::is_same_v<decltype(mp), Pos&>);
     CHECK(mp.x == 3 && mv.v == 2);
@@ -2284,8 +2252,8 @@ static void test_pmr_support()
 static void test_sort_non_involution()
 {
     section("sort<T>: non-involution permutations (regression)");
-    // The original cycle-walk applied the INVERSE permutation; reversals are
-    // involutions and masked it. {30,10,20} has a 3-cycle: the honest test.
+    // The old cycle-walk applied the INVERSE permutation; reversals masked it,
+    // the 3-cycle in {30,10,20} does not.
     ecs::world w;
     w.spawn(Pos{30});
     w.spawn(Pos{10});
@@ -2324,8 +2292,7 @@ static void test_hook_edge_cases()
 {
     section("hooks: new pools mid-sweep, dying-entity adds, clone double-grant");
 
-    // A hook registering a brand-new component type during kill/reset/
-    // duplicate used to reallocate active_ under the running sweep (ASan UAF).
+    // Regression: a hook registering a new type mid-sweep reallocated active_ (ASan UAF).
     struct LateA
     {
         int v = 0;
@@ -2357,9 +2324,8 @@ static void test_hook_edge_cases()
         CHECK(w.unhook(t2));
     }
 
-    // A hook adding a component to the DYING entity is refused (it would
-    // leave a pool holding a dead entity; the recycled slot must stay clean).
-#if QUIVER_CHECKS
+    // A hook adding to the DYING entity is refused: no pool may hold a dead entity.
+#if ECS_CHECKS
     {
         violation_scope guard;
         ecs::world w;
@@ -2376,8 +2342,7 @@ static void test_hook_edge_cases()
     }
 #endif
 
-    // duplicate: an on_add hook granting the clone a component the source
-    // also has must not double-attach it.
+    // duplicate: an on_add hook granting what the source also has must not double-attach.
     {
         ecs::world w;
         const ecs::hook_token t = w.on_add<Pos>(
@@ -2399,8 +2364,7 @@ static void test_hook_edge_cases()
         CHECK(w.unhook(t));
     }
 
-    // duplicate at items_ capacity: the copied-from reference must survive
-    // the growth (heap-payload component; the ASan config proves it).
+    // duplicate at items_ capacity: the copied-from reference must survive the growth.
     {
         ecs::world w;
         ecs::entity last;
@@ -2415,7 +2379,7 @@ static void test_hook_edge_cases()
         CHECK_VALID(w);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // unhook is structural: refused mid-iteration like connect.
     {
         violation_scope guard;
@@ -2502,7 +2466,7 @@ static void test_runtime_selection_self_mutation()
         });
     CHECK(visited == 4);    // the in-flight walk kept its snapshot
     CHECK(q.count() == 1);  // the next walk sees the narrowed selection
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     CHECK(ecs::test_access::lock_count<Pos>(w) == 0);  // no underflow
     CHECK(ecs::test_access::lock_count<Vel>(w) == 0);
     {
@@ -2577,9 +2541,8 @@ static void test_hook_connection_forms()
     w.remove<Tint>(e);
     CHECK(gpu.uploaded == 2);  // disconnected: no further uploads
 
-#if QUIVER_CHECKS
-    // Destroying a scoped_hook mid-iteration hits unhook's refusal: the hook
-    // stays connected and a violation is reported.
+#if ECS_CHECKS
+    // Destroying a scoped_hook mid-iteration hits unhook's refusal: it stays connected.
     {
         violation_scope guard;
         auto* leak = new ecs::scoped_hook(w, w.on_add<Pos, &hookfree::on_free_fn>());
@@ -2617,7 +2580,7 @@ static void test_tracker()
     CHECK(hurt.replaced().size() == 1);
     CHECK(hurt.replaced()[0] == a);
 
-    // removed() may hold dead handles — that is the information.
+    // removed() may hold dead handles -- that is the information.
     w.kill(b);
     CHECK(hurt.removed().size() == 1);
     CHECK(hurt.removed()[0] == b);
@@ -2649,8 +2612,7 @@ static void test_tracker()
     CHECK(moves.replaced().empty());
     CHECK(moves.removed().size() == 1);
 
-    // reset() funnels through on_remove: the tracker sees every death (the
-    // recycled entity still carries its Hp, so three in total).
+    // reset() funnels through on_remove; the recycled entity still carries Hp, so three deaths.
     hurt.clear();
     w.spawn(Hp{1});
     w.spawn(Hp{2});
@@ -2878,7 +2840,7 @@ static void test_bonded_pairs()
         CHECK_VALID(w);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // The violation matrix.
     {
         ecs::world w;
@@ -3045,7 +3007,7 @@ static void test_split()
         CHECK(without == 500);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         const auto work = sel.split(2);
@@ -3093,8 +3055,7 @@ static void test_archives()
 {
     section("archives: pack / unpack / graft");
 
-    // Round-trip: mixed storage kinds, slot holes, recycled generations,
-    // sorted order — into a fresh world with exact ids.
+    // Round-trip mixed storage, slot holes, recycled generations, and sort order; exact ids.
     byte_writer out;
     std::vector<ecs::entity> survivors;
     {
@@ -3146,7 +3107,7 @@ static void test_archives()
         CHECK_VALID(fresh);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // unpack refuses a non-empty world.
     {
         violation_scope guard;
@@ -3207,9 +3168,8 @@ static void test_archives()
         CHECK_VALID(host);
     }
 
-    // Orphan REFERENCE inside a component: resolve answers no_entity. The
-    // referenced entity must be outside the ARCHIVE (the entity section holds
-    // every live handle), so it dies before the pack.
+    // An orphan REFERENCE resolves to no_entity. The target dies before the pack,
+    // since the archive's entity section holds every live handle.
     {
         ecs::world w;
         const ecs::entity outsider = w.spawn();
@@ -3256,7 +3216,7 @@ static void test_globals()
     CHECK(w.globals().get<Tint>().color == 7);
     CHECK(w.globals().id() == g.id());  // stable across calls
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         w.kill(g.id());
@@ -3303,7 +3263,7 @@ static void test_globals()
         CHECK(quiet.live_count() == 0);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // A second marked entity is a validate() fault.
     {
         ecs::world broken;
@@ -3381,8 +3341,7 @@ static void test_review_regressions()
 {
     section("review regressions: apply reentrancy, reset window, moves, globals");
 
-    // A hook recording into the SAME buffer being applied: the new ops replay
-    // in the same pass (no UAF — the ASan config proves it; no silent drop).
+    // A hook recording into the buffer being applied: new ops replay in the same pass.
     {
         ecs::world w;
         ecs::command_buffer cmd;
@@ -3442,8 +3401,7 @@ static void test_review_regressions()
         CHECK_VALID(w);
     }
 
-    // reset(): a hook reading a bonded view mid-reset sees an EMPTY partition
-    // (no stale mirror over a wiped partner), and validate stays green.
+    // A hook reading a bonded view mid-reset sees an EMPTY partition; validate stays green.
     {
         ecs::world w;
         auto view = w.bond<Pos, Vel>();
@@ -3470,7 +3428,7 @@ static void test_review_regressions()
         CHECK_VALID(w);
     }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     // pipeline: registering a stage during run() is refused.
     {
         violation_scope guard;
@@ -3502,9 +3460,7 @@ static void test_review_regressions()
         CHECK(fires == 1);
     }
 
-    // The same property keeps a tracker safe across a world move: its hooks
-    // disconnect in the destination's pools when it dies (ASan would catch a
-    // dangling dispatch).
+    // Same property: a moved-under tracker disconnects from the destination's pools on death.
     {
         ecs::world a;
         ecs::world b;
@@ -3517,9 +3473,9 @@ static void test_review_regressions()
         b.spawn(Hp{2});  // no tracker left: must not dispatch into freed memory
     }
 
-#if QUIVER_CHECKS
-    // globals: the kill/duplicate refusal is membership-based, so the
-    // restored entity is protected BEFORE the first globals() call.
+#if ECS_CHECKS
+    // The kill/duplicate refusal is membership-based: a restored entity is
+    // protected BEFORE the first globals() call.
     {
         ecs::world w;
         w.globals().obtain<Tint>(Tint{5});
@@ -3591,12 +3547,10 @@ static void test_genericity_seams()
 {
     section("genericity: custom pools, pinned labels, raw access");
 
-    // The bond swappability wall covers DERIVED packed pools too (regression
-    // for the same_as -> derived_from guard fix).
+    // The bond swappability wall covers DERIVED packed pools (same_as -> derived_from fix).
     static_assert(std::derived_from<ecs::pool_of_t<Telemetry>, ecs::packed_pool_of<Telemetry>>);
 
-    // A custom storage backend registered through pool_of<T>: every layer of
-    // the library drives it unchanged.
+    // A custom backend registered through pool_of<T>: every library layer drives it unchanged.
     {
         static_assert(std::same_as<ecs::pool_of_t<Telemetry>, telemetry_pool>);
         telemetry_pool::erases = 0;
@@ -3649,8 +3603,7 @@ static void test_genericity_seams()
         CHECK(w.unhook(t));
     }
 
-    // A stable-derived custom backend: pointer stability + the override both
-    // hold through churn, bonds, and archives.
+    // Stable-derived custom backend: pointer stability and the override hold throughout.
     {
         audit_pool::erases = 0;
         ecs::world w;
@@ -3682,8 +3635,7 @@ static void test_genericity_seams()
         CHECK_VALID(w);
     }
 
-    // Pinned identity: labels replace the compiler-derived spelling, so the
-    // persisted hash is portable across toolchains.
+    // Pinned labels replace compiler-derived spellings, keeping persisted hashes portable.
     {
         static_assert(ecs::name_of<LabeledA>() == "test.labeled_a");
         static_assert(ecs::name_of<ForeignVec>() == "test.foreign_vec");
@@ -3701,8 +3653,8 @@ static void test_genericity_seams()
         CHECK(fresh.get<LabeledA>(fresh.select<const LabeledA>().first()).v == 7);
     }
 
-#if QUIVER_CHECKS
-    // Two distinct types sharing a label collide at registration — loudly.
+#if ECS_CHECKS
+    // Two distinct types sharing a label collide at registration -- loudly.
     {
         violation_scope guard;
         ecs::world w;
@@ -3712,8 +3664,7 @@ static void test_genericity_seams()
     }
 #endif
 
-    // Type-erased payload access: the bytes behind any component, no
-    // templates — what generic editors build on.
+    // Type-erased payload access: the raw bytes behind any component, no templates.
     {
         ecs::world w;
         const ecs::entity e = w.spawn(Pos{41});
@@ -3907,7 +3858,7 @@ static void test_world_ops_and_inspection()
     CHECK_VALID(second);
 }
 
-// NOLINTNEXTLINE(bugprone-exception-escape) — probe exceptions are caught at their throw sites
+// NOLINTNEXTLINE(bugprone-exception-escape) -- probe exceptions are caught at their throw sites
 int main()
 {
     test_entity_basics();
@@ -3923,17 +3874,17 @@ int main()
     test_command_buffer_basics();
     test_command_buffer_spawn();
     test_command_buffer_payloads();
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     test_violations();
     test_negative_validation();
 #else
-    std::printf("--- (QUIVER_CHECKS off: violation and corruption tests skipped)\n");
+    std::printf("--- (ECS_CHECKS off: violation and corruption tests skipped)\n");
 #endif
     test_relationships();
     test_snapshot();
     test_move_semantics();
     test_iteration_lock_unwinding();
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     test_tag_add_refused_during_iteration();
 #endif
     test_non_movable_components();
@@ -3977,7 +3928,7 @@ int main()
     test_custom_pool_from_scratch();
     test_bond_n_ary();
     test_bond_n_ary_paths();
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     test_bond_n_ary_violations();
 #endif
     test_bond_n_ary_unbond();
@@ -3987,13 +3938,13 @@ int main()
     test_any_of_basics();
     test_any_of_driving();
     test_any_of_composition();
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     test_any_of_violations();
 #endif
     test_watcher_entered();
     test_watcher_changed();
     test_watcher_lifetime();
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     test_watcher_violations();
 #endif
     test_any_basics();

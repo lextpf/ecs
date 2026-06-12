@@ -1,15 +1,13 @@
 // ============================================================================
-// tests_world.cpp — membership, mutation, and ordering parity (M1): variadic
-// has_all/has_any, amend, driven_by, sort algorithm injection, and the
-// from-scratch custom-pool worked example. Registered in tests.cpp's main().
+// tests_world.cpp -- has_all/has_any, amend, driven_by, sort algorithm
+// injection, and the from-scratch custom-pool example. Registered in tests.cpp.
 // ============================================================================
 
 #include "test_harness.hpp"
 
 #include <algorithm>
 
-// Tied sort keys: `group` collides on purpose so only a stable algorithm
-// pins the order within a tie class.
+// Tied sort keys: `group` collides so only a stable algorithm pins tie order.
 struct SortKey
 {
     int group = 0;
@@ -20,26 +18,20 @@ struct SortKeyStable
 {
     int group = 0;
     int seq = 0;
-    static constexpr auto quiver_storage = ecs::storage::stable;
+    static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
 // ------------------------------------------------ from-scratch custom pool
-// The executable spec of the pool_of seam's FROM-SCRATCH path: derive
-// quiver::basic_pool directly (not a built-in pool), implement the typed
-// surface (emplace / at / at_pos / sort_dense / swap_positions / reserve)
-// plus the cold virtuals, and every world feature — verbs, selections,
-// hooks, sorting, bonds, duplication, inspection — keeps working.
-//
-// The layout is deliberately NOT one of the built-ins: each payload lives in
-// its own heap box, so component pointers are stable and sorting swaps
-// pointers only.
-template <quiver::component T>
-class boxed_pool : public quiver::basic_pool
+// pool_of backend deriving ecs::basic_pool directly: typed surface plus cold
+// virtuals. Each payload lives in its own heap box, so pointers stay stable
+// and sorting swaps pointers only.
+template <ecs::component T>
+class boxed_pool : public ecs::basic_pool
 {
 public:
     explicit boxed_pool(std::pmr::memory_resource* memory) noexcept
-        : quiver::basic_pool(
-              memory, quiver::name_of<T>(), quiver::hash_of<T>(), ecs::storage::stable, sizeof(T)),
+        : ecs::basic_pool(
+              memory, ecs::name_of<T>(), ecs::hash_of<T>(), ecs::storage::stable, sizeof(T)),
           boxes_(memory)
     {
     }
@@ -67,13 +59,13 @@ public:
     [[nodiscard]] T* at(std::uint32_t index) noexcept
     {
         const std::uint32_t pos = sparse_.get(index);
-        return pos == quiver::detail::npos32 ? nullptr : boxes_[pos];
+        return pos == ecs::detail::npos32 ? nullptr : boxes_[pos];
     }
 
     [[nodiscard]] const T* at(std::uint32_t index) const noexcept
     {
         const std::uint32_t pos = sparse_.get(index);
-        return pos == quiver::detail::npos32 ? nullptr : boxes_[pos];
+        return pos == ecs::detail::npos32 ? nullptr : boxes_[pos];
     }
 
     [[nodiscard]] T& at_pos(std::uint32_t pos) noexcept { return *boxes_[pos]; }
@@ -81,7 +73,7 @@ public:
 
     [[nodiscard]] void* item_address(std::uint32_t pos) noexcept override { return boxes_[pos]; }
 
-    template <class PosCompare, class Algo = quiver::detail::std_sort>
+    template <class PosCompare, class Algo = ecs::detail::std_sort>
     void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
         sort_dense_impl(
@@ -147,13 +139,13 @@ public:
 
     [[nodiscard]] std::size_t item_capacity() const noexcept override { return boxes_.capacity(); }
 
-    [[nodiscard]] std::expected<void, quiver::fault> check(
-        const quiver::detail::entity_table& table) const override
+    [[nodiscard]] std::expected<void, ecs::fault> check(
+        const ecs::detail::entity_table& table) const override
     {
         if (boxes_.size() != dense_.size())
         {
             return std::unexpected(
-                quiver::fault{quiver::fault_code::sparse_dense_desync, name(), "box count"});
+                ecs::fault{ecs::fault_code::sparse_dense_desync, name(), "box count"});
         }
         return check_membership(table);
     }
@@ -162,8 +154,7 @@ private:
     std::pmr::vector<T*> boxes_;
 };
 
-// The component routed into the from-scratch pool, plus a Counted variant
-// for lifetime balance.
+// Components routed into the boxed pool; the Counted variant checks lifetimes.
 struct Crate
 {
     int v = 0;
@@ -175,13 +166,13 @@ struct CrateCounted : Counted
 };
 
 template <>
-struct quiver::pool_of<Crate>
+struct ecs::pool_of<Crate>
 {
     using type = boxed_pool<Crate>;
 };
 
 template <>
-struct quiver::pool_of<CrateCounted>
+struct ecs::pool_of<CrateCounted>
 {
     using type = boxed_pool<CrateCounted>;
 };
@@ -203,7 +194,7 @@ void test_has_all_any()
     CHECK((w.has_any<Pos, Hp>(lone)));
     CHECK((!w.has_any<Vel, Hp>(lone)));
 
-    // Tags are pure membership — exactly what these probes answer.
+    // Tags are pure membership.
     w.add<TagA>(e);
     CHECK((w.has_all<Pos, TagA>(e)));
     CHECK((w.has_any<TagB, TagA>(e)));
@@ -264,8 +255,7 @@ void test_amend()
         CHECK(moved.replaced()[0] == e);
     }
 
-    // Not structural: legal during iteration over the same pool, including
-    // on the entity currently visited. The lock unwinds with the loop.
+    // Not structural: legal mid-iteration, even on the entity being visited.
     const ecs::entity f = w.spawn(Pos{100});
     int visited = 0;
     w.select<Pos>().each(
@@ -301,9 +291,8 @@ void test_driven_by()
     const ecs::entity c = w.spawn(Pos{2}, Vel{20});
     w.spawn(Pos{99});  // Pos-only: matched only once Vel turns optional below
 
-    // Pos (4) outnumbers Vel (3): the default driver is Vel. Order the big
-    // pool, then force it to drive — sort<T> + driven_by<T> is quiver's
-    // ordered multi-component iteration.
+    // Pos (4) outnumbers Vel (3), so Vel drives by default. Sort Pos, then
+    // force it to drive: ordered multi-component iteration.
     w.sort<Pos>([](const Pos& l, const Pos& r) { return l.x < r.x; });
 
     const auto sel = w.select<Pos, Vel>();
@@ -321,8 +310,7 @@ void test_driven_by()
     CHECK(by_pos.count() == sel.count());
     CHECK(by_pos.contains(a) && by_pos.contains(b) && by_pos.contains(c));
 
-    // split carves the OVERRIDDEN driver's dense order: walking the parts in
-    // order reproduces the sorted sequence.
+    // split carves the overridden driver's order: parts replay the sorted sequence.
     {
         std::vector<int> from_parts;
         const auto work = by_pos.split(2);
@@ -342,8 +330,7 @@ void test_driven_by()
     CHECK(filtered.size() == 3);
     CHECK(filtered[0] == 2 && filtered[1] == 3 && filtered[2] == 99);
 
-    // Override on a const world whose pools never registered: empty, no
-    // violation.
+    // Const world with unregistered pools: empty, no violation.
     const ecs::world cold;
     std::size_t cold_visits = 0;
     cold.select<Pos, Vel>().driven_by<Pos>().each([&](const Pos&, const Vel&) { ++cold_visits; });
@@ -357,9 +344,8 @@ void test_sort_algorithm()
     section("sort: algorithm injection");
     ecs::world w;
 
-    // Scrambled spawn order with tied groups. std::stable_sort must keep
-    // spawn order within each tie class — the default std::sort guarantees
-    // no such thing.
+    // Tied groups: the injected stable_sort must keep spawn order within ties;
+    // the default std::sort guarantees no such thing.
     for (int i = 0; i < 6; ++i)
     {
         w.spawn(SortKey{i % 2, i}, SortKeyStable{i % 2, i});
@@ -373,8 +359,7 @@ void test_sort_algorithm()
     const std::vector<std::pair<int, int>> expected{{0, 0}, {0, 2}, {0, 4}, {1, 1}, {1, 3}, {1, 5}};
     CHECK(order == expected);
 
-    // Stable pools permute bookkeeping only: payload pointers survive the
-    // injected algorithm exactly like the default one.
+    // Stable pools permute bookkeeping only: pointers survive the injected sort.
     const ecs::entity probe = w.select<SortKeyStable>().first();
     const SortKeyStable* before = w.find<SortKeyStable>(probe);
     w.sort<SortKeyStable>([](const SortKeyStable& l, const SortKeyStable& r)
@@ -395,8 +380,8 @@ void test_sort_algorithm()
     const std::vector<int> spawn_order{0, 1, 2, 3, 4, 5};
     CHECK(seqs == spawn_order);
 
-#if QUIVER_CHECKS
-    // The refusal rules are the algorithm-blind ones.
+#if ECS_CHECKS
+    // Mid-iteration sort is refused regardless of algorithm.
     {
         violation_scope guard;
         w.select<SortKey>().each(
@@ -428,7 +413,7 @@ void test_custom_pool_from_scratch()
     CHECK(w.has<Crate>(a));
     CHECK(w.get<Crate>(a).v == 10);
 
-    // The boxed layout's own property: pointers survive further adds.
+    // Boxed layout: pointers survive further adds.
     const Crate* pinned = w.find<Crate>(a);
     for (int i = 0; i < 64; ++i)
     {
@@ -499,8 +484,7 @@ void test_custom_pool_from_scratch()
     CHECK(w.has<Crate>(dup.clone));
     CHECK(w.get<Crate>(dup.clone).v == w.get<Crate>(a).v);
 
-    // Inspection reports the custom pool with its declared kind; type-erased
-    // payload access goes through item_address.
+    // Inspection reports the declared kind; raw access goes through item_address.
     bool seen = false;
     w.each_pool(
         [&](const ecs::pool_info& info)

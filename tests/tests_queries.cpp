@@ -1,7 +1,6 @@
 // ============================================================================
-// tests_queries.cpp — any_of query combinators (M4): OR-alternatives inside
-// select, union driving with exact dedup, pointer-with-null callback parts,
-// and composition with except/maybe/manifests/range/split.
+// tests_queries.cpp -- any_of query combinators: OR-alternatives in select,
+// union driving with dedup, and composition with except/maybe/manifests.
 // ============================================================================
 
 #include "test_harness.hpp"
@@ -37,7 +36,7 @@ void test_any_of_basics()
     w.add<Dog>(both, Dog{40});
     w.spawn(Pos{4});  // neither: filtered out
 
-    // The nullity matrix: cat-only, dog-only, both — never neither.
+    // The nullity matrix: cat-only, dog-only, both -- never neither.
     int cats = 0;
     int dogs = 0;
     int boths = 0;
@@ -86,8 +85,7 @@ void test_any_of_driving()
     section("any_of: union driving with exact dedup");
     ecs::world w;
 
-    // NO plain include: the union of alternatives drives. Overlap (both)
-    // must be visited exactly once.
+    // No plain include: the union drives; overlap is visited exactly once.
     std::vector<ecs::entity> all;
     for (int i = 0; i < 12; ++i)
     {
@@ -102,7 +100,7 @@ void test_any_of_driving()
         }
         all.push_back(e);
     }
-    // Cats: 6, dogs: 4, overlap (i % 6 == 0): 2 → union = 8 distinct.
+    // Cats: 6, dogs: 4, overlap (i % 6 == 0): 2 -> union = 8 distinct.
     std::unordered_set<ecs::entity, ecs::entity_hash> visited;
     std::size_t visits = 0;
     w.select<ecs::any_of<Cat, Dog>>().each(
@@ -122,16 +120,15 @@ void test_any_of_driving()
     }
     CHECK(oracle == 8);
 
-    // With a small plain include present, the plain pool drives and the
-    // group becomes an OR-probe.
+    // With a small plain include, the plain pool drives; the group becomes an
+    // OR-probe.
     const ecs::entity special = all[0];  // has Cat (i=0) and Dog
     w.add<Hp>(special, Hp{1});
     std::size_t narrowed = 0;
     w.select<Hp, ecs::any_of<Cat, Dog>>().each([&](Hp&, Cat*, Dog*) { ++narrowed; });
     CHECK(narrowed == 1);
 
-    // When the union is SMALLER than the plain pool, the union drives — the
-    // match set never changes either way.
+    // A union smaller than the plain pool drives; the match set never changes.
     ecs::world w2;
     for (int i = 0; i < 100; ++i)
     {
@@ -194,7 +191,7 @@ void test_any_of_composition()
             with_vel += (v != nullptr) ? 1 : 0;
         });
     CHECK(rows == 9);
-    CHECK(with_vel == 4);  // i ∈ {0, 3, 6, 9}
+    CHECK(with_vel == 4);  // i in {0, 3, 6, 9}
 
     // first / count / contains agree with the walk.
     CHECK(sel.count() == 9);
@@ -208,7 +205,7 @@ void test_any_of_composition()
     std::size_t crossed = 0;
     w.select<ecs::any_of<Cat, Dog>, ecs::any_of<Vel, Hp>>().each(
         [&](ecs::entity, Cat*, Dog*, Vel*, Hp*) { ++crossed; });
-    // Entities with (Cat|Dog) AND (Vel|Hp): i ∈ {0,3,6,9} plus cross.
+    // Entities with (Cat|Dog) AND (Vel|Hp): i in {0,3,6,9} plus cross.
     CHECK(crossed == 5);
 
     // Manifests carry any_of like any other element.
@@ -217,8 +214,7 @@ void test_any_of_composition()
     w.select(Pets{}).each([&](Pos&, Cat*, Dog*) { ++via_manifest; });
     CHECK(via_manifest == 11);
 
-    // range() rows carry the pointer parts. Selections are live pool views:
-    // `cross` (spawned above) now matches too.
+    // range() carries the pointer parts. Selections are live: `cross` now matches.
     std::size_t range_rows = 0;
     for (auto [e, p, c, d, v] : sel.range())
     {
@@ -246,7 +242,7 @@ void test_any_of_composition()
 
     CHECK_VALID(w);
 
-    // Compile-time walls, for the record (each is a static_assert):
+    // Compile-time walls (each is a static_assert):
     //   select<any_of<Cat>>()                  // a group needs >= 2 alternatives
     //   select<any_of<Cat, Cat>>()             // duplicate alternative
     //   select<Cat, any_of<Cat, Dog>>()        // type appears twice across the select
@@ -255,7 +251,7 @@ void test_any_of_composition()
     //   bond<ecs::any_of<Cat, Dog>, Pos>()     // bonds own pools, not alternatives
 }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 void test_any_of_violations()
 {
     section("any_of: lock discipline covers every alternative pool");
@@ -263,8 +259,8 @@ void test_any_of_violations()
     const ecs::entity e = w.spawn(Pos{1});
     w.add<Cat>(e, Cat{1});
 
-    // Every alternative pool is lock-included during iteration: a structural
-    // change to ANY of them mid-loop is refused.
+    // Every alternative pool is locked during iteration; structural changes to
+    // any of them are refused.
     violation_scope guard;
     w.select<Pos, ecs::any_of<Cat, Dog>>().each(
         [&](ecs::entity who, Pos&, Cat*, Dog*)

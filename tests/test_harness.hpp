@@ -1,12 +1,10 @@
 // ============================================================================
-// test_harness.hpp — the shared spine of quiver's test suite. No framework:
-// a CHECK macro, inline counters every test TU shares, a violation capturer,
-// and the fixture types reused across suites. main() lives in tests.cpp and
-// remains the single registration point for every TU's test functions.
+// test_harness.hpp -- shared test spine: CHECK macro, counters, violation
+// capture, and fixture types. No framework; main() lives in tests.cpp.
 // ============================================================================
 #pragma once
 
-#include <quiver.hpp>
+#include <ecs.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -19,12 +17,9 @@
 #include <string>
 #include <vector>
 
-namespace ecs = quiver;
-
 // ------------------------------------------------------------------- harness
 
-// inline (not static): one counter shared by every test TU, so main()'s
-// totals cover the whole suite.
+// inline (not static): shared across TUs so main() totals the whole suite.
 inline int checks_run = 0;
 inline int checks_failed = 0;
 
@@ -98,7 +93,7 @@ struct TagB
 struct Stable
 {
     int value = 0;
-    static constexpr auto quiver_storage = ecs::storage::stable;
+    static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
 // Counts constructions/destructions to prove destructor balance everywhere.
@@ -141,12 +136,11 @@ struct Counted
     }
 };
 
-// Stable-storage variant of Counted (local classes cannot host the static
-// policy member).
+// Stable-storage Counted (local classes cannot host the static policy member).
 struct StableCounted : Counted
 {
     using Counted::Counted;
-    static constexpr auto quiver_storage = ecs::storage::stable;
+    static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
 // Over-aligned payload; the move constructor verifies the holder honoured it.
@@ -170,8 +164,7 @@ struct alignas(64) Aligned
     float lanes[16] = {};
 };
 
-// An injectable sort algorithm: same contract as the default (permute the
-// range exactly as a comparison sort would), different tie behavior.
+// An injectable sort: same permute-the-range contract, different tie behavior.
 struct stable_algo
 {
     template <class It, class Cmp>
@@ -181,8 +174,7 @@ struct stable_algo
     }
 };
 
-// A minimal in-memory archive: raw bytes, trivially-copyable values only
-// (quiver's writer/reader concepts put the encoding on the archive's side).
+// A minimal in-memory archive: ecs's writer/reader concepts keep encoding on the archive side.
 struct byte_writer
 {
     std::vector<std::byte> data;
@@ -211,38 +203,37 @@ struct byte_reader
 };
 
 // ----------------------------------------------- cross-TU test declarations
-// Each test TU defines its functions with external linkage; main() in
-// tests.cpp calls them through these declarations.
+// Each TU defines these; main() in tests.cpp calls them.
 
-// tests_world.cpp (M1: membership, mutation, ordering parity)
+// tests_world.cpp (membership, mutation, ordering parity)
 void test_has_all_any();
 void test_amend();
 void test_driven_by();
 void test_sort_algorithm();
 void test_custom_pool_from_scratch();
 
-// tests_bonds.cpp (M2/M3: N-ary bonds and bond views)
+// tests_bonds.cpp (N-ary bonds and bond views)
 void test_bond_n_ary();
 void test_bond_n_ary_paths();
-void test_bond_n_ary_violations();  // defined (and called) under QUIVER_CHECKS only
+void test_bond_n_ary_violations();  // defined (and called) under ECS_CHECKS only
 void test_bond_n_ary_unbond();
 void test_bond_observed_views();
 void test_bond_partition_sort();
 void test_bond_view_count();
 
-// tests_queries.cpp (M4: any_of combinators)
+// tests_queries.cpp (any_of combinators)
 void test_any_of_basics();
 void test_any_of_driving();
 void test_any_of_composition();
-void test_any_of_violations();  // defined (and called) under QUIVER_CHECKS only
+void test_any_of_violations();  // defined (and called) under ECS_CHECKS only
 
-// tests_reactive.cpp (M5: watcher condition monitors)
+// tests_reactive.cpp (watcher condition monitors)
 void test_watcher_entered();
 void test_watcher_changed();
 void test_watcher_lifetime();
-void test_watcher_violations();  // defined (and called) under QUIVER_CHECKS only
+void test_watcher_violations();  // defined (and called) under ECS_CHECKS only
 
-// tests_meta.cpp (M6/M8: any, reflection, meta×ECS bridge)
+// tests_meta.cpp (any, reflection, meta x ECS bridge)
 void test_any_basics();
 void test_reflection_registry();
 void test_reflection_fields();
@@ -251,7 +242,7 @@ void test_reflection_construct();
 void test_reflection_ecs_fields();
 void test_reflection_ecs_verbs();
 
-// tests_traits.cpp (M7: entity-traits templating)
+// tests_traits.cpp (entity-traits templating)
 void test_traits_entity_layouts();
 void test_traits_compact_world();
 void test_traits_wide_world();

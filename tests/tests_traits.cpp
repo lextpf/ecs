@@ -1,15 +1,13 @@
 // ============================================================================
-// tests_traits.cpp — entity-traits templating (M7). Layer 1: the traits
-// vocabulary, basic_entity<Traits> at custom widths, and the alias-identity
-// pins proving the default traits reproduce the classic handle bit for bit.
+// tests_traits.cpp -- entity traits at custom widths: handle layouts, compact
+// and wide worlds end-to-end, graft relinks, and the alias-identity pins.
 // ============================================================================
 
 #include "test_harness.hpp"
 
 #include <unordered_set>
 
-// A compact handle: 15-bit slots + 16-bit generations in 4 bytes (bit 15 of
-// the index stays reserved for the provisional flag).
+// A compact handle: 15:16 in 4 bytes; bit 15 stays reserved for provisionals.
 struct compact_traits
 {
     using index_type = std::uint16_t;
@@ -28,14 +26,13 @@ struct wide_traits
 using compact_entity = ecs::basic_entity<compact_traits>;
 using wide_entity = ecs::basic_entity<wide_traits>;
 
-// Archive components with entity members under custom traits: one with a
-// per-layout member hook, one with a traits-generic template member.
+// Relink subjects: one with a per-layout hook, one with a traits-generic template member.
 struct CompactSquad
 {
     compact_entity leader;
     int morale = 0;
 
-    void quiver_relink(const ecs::basic_graft_map<compact_traits>& map)
+    void ecs_relink(const ecs::basic_graft_map<compact_traits>& map)
     {
         leader = map.resolve(leader);
     }
@@ -46,7 +43,7 @@ struct CompactLink
     compact_entity target;
 
     template <class Traits>
-    void quiver_relink(const ecs::basic_graft_map<Traits>& map)
+    void ecs_relink(const ecs::basic_graft_map<Traits>& map)
     {
         target = map.resolve(target);
     }
@@ -60,12 +57,9 @@ static_assert(sizeof(compact_entity) == 4);
 static_assert(compact_entity::index_bits == 15 && compact_entity::generation_bits == 16);
 static_assert(wide_entity::index_bits == 48 && wide_entity::generation_bits == 16);
 
-// Compile-time walls, for the record (each fails the entity_traits concept):
-//   index_bits == digits(index_type)  // no spare bit left for provisionals
+// Compile-time walls (each fails the entity_traits concept):
+//   index_bits == digits(index_type)  // no spare bit for provisionals
 //   index_bits + generation digits > 64  // bits() could not pack
-// e.g. struct bad { using index_type = std::uint16_t; using generation_type =
-// std::uint16_t; static constexpr std::uint32_t index_bits = 16; };
-//   ecs::basic_entity<bad> rejected.
 
 void test_traits_entity_layouts()
 {
@@ -112,8 +106,7 @@ void test_traits_compact_world()
     using compact_world = ecs::basic_world<compact_traits>;
     compact_world w;
 
-    // The verbs run on 4-byte handles; component types are shared across
-    // worlds of different traits (type ids are process-wide).
+    // The verbs run on 4-byte handles; component type ids are process-wide.
     const compact_entity e = w.spawn();
     CHECK(w.alive(e));
     w.add<Pos>(e, Pos{1});
@@ -215,9 +208,8 @@ void test_traits_wide_world()
     CHECK(applied.applied == 3);
     CHECK(w.select<Pos>().count() == 3);
 
-    // restore_entity claims a slot far past 2^16; the paged sparse index
-    // touches one 32 KiB page for it, and current_handle round-trips the
-    // wide slot. (Slots are dense per high-water mark — keep it modest.)
+    // restore_entity claims a slot far past 2^16; the paged sparse index pays
+    // one page for it. Slots are dense per high-water mark -- keep it modest.
     const wide_entity far{std::uint64_t{1} << 20, std::uint16_t{5}};
     CHECK(w.restore_entity(far).has_value());
     CHECK(w.alive(far));
@@ -254,7 +246,7 @@ void test_traits_relink()
 {
     section("entity traits: graft relinks under custom layouts");
 
-    // The trait detects per-layout hooks at their own traits — and only there.
+    // The trait detects per-layout hooks at their own traits -- and only there.
     static_assert(ecs::relink_traits<CompactSquad, compact_traits>::links);
     static_assert(!ecs::relink_traits<CompactSquad>::links);
     static_assert(ecs::relink_traits<CompactLink, compact_traits>::links);

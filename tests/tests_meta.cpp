@@ -1,6 +1,6 @@
 // ============================================================================
-// tests_meta.cpp — quiver::any and the reflection registry (M6), plus the
-// meta×ECS bridge (M8). RTTI-free: identity is hash_of/name_of throughout.
+// tests_meta.cpp -- ecs::any, the reflection registry, and the meta x ECS
+// bridge. RTTI-free: identity is hash_of/name_of throughout.
 // ============================================================================
 
 #include "test_harness.hpp"
@@ -25,7 +25,7 @@ struct Vec2
 struct MetaLabeled
 {
     int v = 0;
-    static constexpr std::string_view quiver_label = "meta.labeled";
+    static constexpr std::string_view ecs_label = "meta.labeled";
 };
 
 struct MetaNoCopy
@@ -88,8 +88,7 @@ void test_any_basics()
         CHECK(Counted::live == live_before);
     }
 
-    // ref() aliases without owning: writes hit the original, destruction
-    // leaves it alone.
+    // ref() aliases without owning: writes hit the original, destruction leaves it alone.
     {
         Vec2 v{1, 2};
         ecs::any view = ecs::any::ref(v);
@@ -101,7 +100,7 @@ void test_any_basics()
     }
 
     // Copying an any that holds a non-copyable payload: violation + empty.
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         violation_scope guard;
         ecs::any pinned = ecs::any::make<MetaNoCopy>(5);
@@ -150,7 +149,7 @@ void test_reflection_registry()
     CHECK(!ecs::reflection_of(0x1234u));
     CHECK(!ecs::reflection_of("meta.never_registered"));
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
     {
         // Re-registering is a violation; the original node survives.
         violation_scope guard;
@@ -263,13 +262,11 @@ void test_reflection_ecs_fields()
     const ecs::entity e = w.spawn(Pos{1}, Hp{70});
     w.add<TagA>(e);
 
-    // get_at / set_at work on raw component bytes from pool_ref::raw — the
-    // property-grid path. (reflect_all registered identity only; the field
-    // arrives through the duplicate-tolerant builder, which reports under a
-    // counting handler and appends to the standing node.)
+    // get_at / set_at work on raw bytes from pool_ref::raw. Re-registering Hp
+    // is a violation; the field still lands on the standing node.
     const ecs::reflection rhp = ecs::reflection_of<Hp>();
     {
-#if QUIVER_CHECKS
+#if ECS_CHECKS
         violation_scope guard;
 #endif
         ecs::reflect<Hp>().field<&Hp::hp>("hp");
@@ -283,9 +280,8 @@ void test_reflection_ecs_fields()
     CHECK(!fhp.set_at(bytes, ecs::any::make<float>(1.0f)));  // type miss: untouched
     CHECK(w.get<Hp>(e).hp == 55);
 
-    // The inspector recipe: components_of x reflection_of enumerates exactly
-    // the registered subset (Pos was registered by an earlier suite;
-    // TagA has no payload and yields no raw pointer).
+    // components_of x reflection_of enumerates only the registered subset;
+    // TagA has no payload and yields no raw pointer.
     std::size_t reflected = 0;
     std::size_t tags_seen = 0;
     w.components_of(e,
@@ -347,8 +343,7 @@ void test_reflection_ecs_verbs()
     CHECK(!rhp.present_on(w, e));
     CHECK(!rhp.remove_from(w, e));  // second remove: nothing left
 
-    // Types never registered as reflections still answer (empty handle), and
-    // a non-component registration carries no ECS bridge.
+    // Never-registered names answer empty; non-component registrations carry no ECS bridge.
     CHECK(!ecs::reflection_of("meta.never_registered"));
 
     CHECK_VALID(w);

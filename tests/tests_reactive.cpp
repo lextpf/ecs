@@ -1,6 +1,6 @@
 // ============================================================================
-// tests_reactive.cpp — watcher condition-set monitors (M5): enter edges,
-// eviction (live truth), changed<> triggers, lifetime, and lock violations.
+// tests_reactive.cpp -- watcher tests: enter edges, eviction, changed<>
+// triggers, lifetime, and lock violations.
 // ============================================================================
 
 #include "test_harness.hpp"
@@ -28,7 +28,7 @@ void test_watcher_entered()
     CHECK(entered.count() == 1);
     CHECK(entered.contains(e));
 
-    // Losing any include evicts — matched() is live truth.
+    // Losing any include evicts -- matched() is live truth.
     w.remove<Hp>(e);
     CHECK(entered.count() == 0);
     CHECK(!entered.contains(e));
@@ -40,8 +40,7 @@ void test_watcher_entered()
     w.add<Burning>(e, Burning{6});
     CHECK(entered.count() == 1);
 
-    // Drain empties; a STILL-matching entity is not re-collected without a
-    // fresh edge.
+    // Drain empties; a still-matching entity is not re-collected without a fresh edge.
     entered.clear();
     CHECK(entered.count() == 0);
     CHECK((w.has_all<Burning, Hp>(e)));
@@ -59,8 +58,7 @@ void test_watcher_entered()
     ecs::watcher<ecs::types<Burning, Hp>> late(w);
     CHECK(late.count() == 0);
 
-    // except<> conditions: adding the exclude evicts, removing it (while the
-    // includes hold) inserts.
+    // except<>: adding the exclude evicts; removing it (includes held) inserts.
     ecs::watcher<ecs::types<Burning>, ecs::except<Shielded>> guarded(w);
     CHECK(guarded.count() == 0);  // `old` predates the watcher
     w.add<Shielded>(old);
@@ -133,8 +131,7 @@ void test_watcher_lifetime()
     const ecs::entity e = w.spawn(Burning{1});
     CHECK(watcher_box->count() == 1);
 
-    // reset() fires on_remove per live component: everything evicts, the
-    // connections survive (empty-but-connected, like tracker hooks).
+    // reset() evicts everything; the hook connections survive.
     w.reset();
     CHECK(watcher_box->count() == 0);
     const ecs::entity f = w.spawn(Burning{2});
@@ -158,15 +155,14 @@ void test_watcher_lifetime()
     CHECK_VALID(w);
 }
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 void test_watcher_violations()
 {
     section("watcher: hook connect/disconnect rules apply");
     ecs::world w;
     w.spawn(Burning{1});
 
-    // Constructing a watcher connects hooks — refused while a named pool
-    // iterates, leaving the watcher inert but safe to destroy.
+    // Hook connect is refused while a named pool iterates, leaving the watcher inert but safe.
     violation_scope guard;
     w.select<Burning>().each(
         [&](ecs::entity, Burning&)
