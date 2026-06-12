@@ -88,7 +88,7 @@
     {
       "name": "windows-debug",
       "configurePreset": "default",
-      "displayName": "Run all tests (Debug, QUIVER_CHECKS on)",
+      "displayName": "Run all tests (Debug, ECS_CHECKS on)",
       "configuration": "Debug",
       "output": {
         "outputOnFailure": true,
