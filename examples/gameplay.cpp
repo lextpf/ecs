@@ -1,23 +1,19 @@
 // ============================================================================
-// gameplay.cpp — a miniature skirmish that tours the whole library.
+// gameplay.cpp -- a miniature skirmish that tours the whole library.
 //
 // Acts:
-//   1. world setup: blueprints, globals, bonds, hooks, trackers
-//   2. the frame: a pipeline of plain-function stages over bonded iteration,
-//      events-as-entities, and the deferred buffer as the one sync point
-//   3. parallel integration with selection::split across two threads
-//   4. save / load: pack into an in-memory archive, unpack into a fresh
-//      world, prove equivalence
-//   5. reinforcements: graft a squad archive into the live world with
-//      entity-handle relinking
-//   6. the inspector: runtime queries, footprint, validate
-//   7. the property grid: reflection-driven field reads and structural
-//      verbs by hash (the editor path)
+//   1. setup: blueprints, globals, bonds, hooks, trackers
+//   2. frame pipeline: bonded iteration, event entities, deferred sync point
+//   3. parallel integration via selection::split
+//   4. save / load: pack to an in-memory archive, unpack, prove equivalence
+//   5. reinforcements: graft an archive into the live world, relink handles
+//   6. inspector: runtime queries, footprint, validate
+//   7. property grid: reflected field reads and structural verbs by hash
 //
-// Everything prints deterministically; run it after changes and diff.
+// Output is deterministic; run after changes and diff.
 // ============================================================================
 
-#include <quiver.hpp>
+#include <ecs.hpp>
 
 #include <cmath>
 #include <cstddef>
@@ -26,8 +22,6 @@
 #include <cstring>
 #include <thread>
 #include <vector>
-
-namespace ecs = quiver;
 
 // ----------------------------------------------------------------- components
 
@@ -66,7 +60,7 @@ struct Health
     int value = 0;
 };
 
-struct Burning  // tag: bonded to Health for "fast filtered iteration"
+struct Burning  // tag: bonded to Health for filtered iteration
 {
 };
 
@@ -78,7 +72,7 @@ struct Squad  // stores entity handles; relinks them across a graft
 {
     ecs::entity leader;
 
-    void quiver_relink(const ecs::graft_map& map) { leader = map.resolve(leader); }
+    void ecs_relink(const ecs::graft_map& map) { leader = map.resolve(leader); }
 };
 
 struct MatchClock  // lives on world.globals()
@@ -94,8 +88,7 @@ struct Explosion  // an EVENT, modeled as a short-lived entity
 };
 
 // ------------------------------------------------- an in-memory archive shape
-// quiver's pack/unpack/graft call YOUR archive for every value; this one is
-// the simplest possible: raw bytes of trivially-copyable components.
+// pack/unpack/graft call your archive for every value; this one is raw bytes.
 
 struct byte_writer
 {
@@ -144,19 +137,18 @@ struct GpuSprites
     }
 };
 
-// NOLINTNEXTLINE(bugprone-exception-escape) — only bad_alloc can escape; that is fatal anyway
+// NOLINTNEXTLINE(bugprone-exception-escape) -- only bad_alloc can escape
 int main()
 {
     std::puts("=== act 1: setup ===");
     ecs::world world;
 
-    // Bonds: the movement hot path iterates Transform∩Velocity as two
-    // parallel arrays (zero probes); Burning∩Health gives damage-over-time a
-    // dense filtered walk.
+    // Bonds: Transform & Velocity iterate as parallel arrays (zero probes);
+    // Health & Burning gives damage-over-time a dense filtered walk.
     auto movers = world.bond<Transform, Velocity>();
     auto burning = world.bond<Health, Burning>();
 
-    // GPU bookkeeping reacts to SpriteRef structurally appearing/dying.
+    // GPU bookkeeping reacts to SpriteRef add/remove.
     GpuSprites gpu(world);
 
     // The UI drains health changes once per frame.
@@ -165,8 +157,7 @@ int main()
     // World state without a singleton framework: components on globals().
     world.globals().obtain<MatchClock>();
 
-    // A reusable spawn recipe, recorded in one expression; the batch stamp
-    // hands each goblin back for its per-entity tweaks.
+    // A reusable spawn recipe; the batch spawn hands each goblin back for tweaks.
     ecs::blueprint goblin{Transform{Vec2{0, 0}}, Velocity{Vec2{1, 0}}, SpriteRef{7U}, Health{20}};
 
     int column = 0;
@@ -177,7 +168,7 @@ int main()
                     world.get<Transform>(g).position = {static_cast<float>(column) * 10.0F, 0};
                     if (column % 2 == 0)
                     {
-                        world.add<Burning>(g);  // enters the Health∩Burning bond
+                        world.add<Burning>(g);  // enters the Health & Burning bond
                     }
                     ++column;
                 });
@@ -219,8 +210,7 @@ int main()
         .stage("explosions",
                [&frame](ecs::world& w, float)
                {
-                   // Events as entities: drain every Explosion, apply damage,
-                   // and kill the event through the deferred buffer.
+                   // Events as entities: drain each Explosion, kill it via the deferred buffer.
                    w.each<const Explosion>(
                        [&](ecs::entity ev, const Explosion& boom)
                        {
@@ -374,10 +364,8 @@ int main()
 
     std::puts("=== act 7: the property grid ===");
     {
-        // Reflection identity == pool identity (the same name hash), so a
-        // registered subset of components becomes an editor property grid:
-        // enumerate with components_of, resolve each pool's hash, and read
-        // fields straight from the live component bytes.
+        // Reflection identity == pool identity (same name hash): enumerate with
+        // components_of, resolve each hash, read fields from the live bytes.
         ecs::reflect<Health>().field<&Health::value>("value");
         ecs::reflect<SpriteRef>().field<&SpriteRef::atlas_index>("atlas_index");
 
