@@ -1,78 +1,39 @@
 #pragma once
 // ============================================================================
-// quiver.hpp — a single-header Entity Component System for real-time games.
+// ecs.hpp -- a single-header Entity Component System for real-time games.
 //
 //   C++23 - no dependencies - no RTTI - no exceptions of its own - MIT.
 //
-// The thirty-second tour:
+//   ecs::world w;
+//   ecs::entity e = w.spawn(Transform{...}, Velocity{...});
+//   w.each<Transform, Velocity>([](ecs::entity, Transform& t, Velocity& v) { ... });
 //
-//   quiver::world w;
-//   quiver::entity e = w.spawn(Transform{...}, Velocity{...});
+// Also in the box: reusable selections (select / range / split), bonded pool
+// pairs, maybe<T> / except<T>, command_buffer, sort / sort_along, add/remove
+// hooks (fn / member / RAII / tracker), pack/unpack serialization, globals,
+// pipeline stages, blueprints, entity refs, type-erased runtime pools and
+// queries, the pool_of<T> storage seam, ecs::types<...> manifests, std::pmr.
 //
-//   w.each<Transform, Velocity>([](quiver::entity e, Transform& t, Velocity& v)
-//   {
-//       t.position += v.value;
-//   });
-//
-//   auto movers = w.select<Transform, Velocity>(quiver::except<Frozen>{});  // reusable
-//   movers.each([](Transform& t, Velocity& v) { ... });                     // zero setup
-//
-//   quiver::command_buffer cmd;
-//   w.each<Health>([&](quiver::entity e, Health& h) { if (h.value <= 0) cmd.kill(e); });
-//   w.apply(cmd);
-//
-// And the rest of the toolbox:
-//
-//   w.bond<Transform, Velocity>();                           // mirrored pair: two
-//   w.bonded<Transform, Velocity>().each(...);               // pools, zero probes
-//   for (auto [e, t, v] : movers.range()) { ... }            // range-for + bindings
-//   w.select<Transform, quiver::maybe<Tint>>()               // optional components
-//   auto work = movers.split(4);  work.part(i).each(...);    // parallel chunks
-//   w.sort<Sprite>(by_atlas);  w.sort_along<Sprite, Transform>();   // (re)ordering
-//   w.on_add<Collider, &Physics::body>(&physics);            // hooks: fn/member/RAII
-//   quiver::scoped_hook guard(w, token);  quiver::tracker<Health> hurt(w);
-//   quiver::pack<Transform, Health>(w, writer);              // save/load/graft
-//   w.globals().obtain<MatchClock>();                        // singletons, ECS-style
-//   quiver::pipeline frame; frame.stage("move", fn);         // stages + deferred()
-//   quiver::blueprint goblin; ... w.spawn(goblin);           // reusable spawn recipes
-//   w.duplicate(e);  w.ref(e).add<Burning>();  w.obtain<Timer>(e);  // conveniences
-//   quiver::runtime_selection q; q.include(w.find_pool_by_hash(h)); // editor queries
-//   w.find_pool<T>().raw(e)                                  // type-erased bytes
-//   template <> struct quiver::pool_of<T> {...};             // custom storage seam
-//   static constexpr std::string_view quiver_label = "...";  // portable identity
-//   using Saved = quiver::types<Transform, Health>;          // component manifests:
-//   w.select(Saved{});  quiver::pack(w, out, Saved{});       // one list, everywhere
-//   quiver::world w2{&my_arena_resource};                    // std::pmr, no templates
-//
-// Mutation rules during iteration (each / entities / range / split / bonded
-// views / children_of):
+// Mutation rules during iteration (each/entities/range/split/bonded/children_of):
 //   ALLOWED:  writing component values; bare spawn(); recording into a
-//             command_buffer; structural changes to pools that are not part
-//             of any running iteration.
+//             command_buffer; structural changes to non-iterated pools.
 //   REFUSED (checked builds report a violation, then nothing happens):
-//             remove on an iterated pool, tag adds to an iterated pool,
-//             kill()/duplicate() of an entity belonging to an iterated pool,
-//             purge/sort of an iterated pool, hook connect/disconnect on it,
-//             and reset()/shrink()/apply()/world-teardown while anything
-//             iterates — all checked before any state changes. (Full list:
-//             DESIGN.md §10.)
+//             structural changes to an iterated pool -- remove, tag add,
+//             kill/duplicate of its entities, purge/sort, hook (dis)connect --
+//             plus reset/shrink/apply/world-teardown while anything iterates.
 //   REPORTED, THEN PROCEEDS: value add/put on an iterated pool (a reference
-//             must be returned). The loop itself stays safe, but component
-//             references the callback already holds may dangle — use the
-//             command_buffer.
+//             must be returned); references the callback already holds may
+//             dangle -- use the command_buffer.
 //
-// Thread model: a world and the buffers feeding it are externally
-// synchronized (single-threaded by contract). Component type ids and the
-// violation handler are process-global and thread-safe.
+// Thread model: a world and the buffers feeding it are externally synchronized.
+// Component type ids and the violation handler are process-global, thread-safe.
 //
-// Exception policy: quiver itself throws nothing. Cold grow/reserve paths may
-// propagate std::bad_alloc from the standard allocator. Hot lookups and
-// iteration do not allocate.
+// Exceptions: ecs throws nothing; cold grow/reserve paths may propagate
+// std::bad_alloc. Hot lookups and iteration do not allocate.
 //
-// Configuration: QUIVER_CHECKS is the single toggle (default: on when NDEBUG
-// is not defined). It enables stale-handle detection, iteration locks, and
-// internal consistency asserts, all routed through a replaceable violation
-// handler (see set_violation_handler). There are no API-usage macros.
+// ECS_CHECKS (default: on when NDEBUG is undefined) enables stale-handle
+// detection, iteration locks, and consistency asserts, routed through a
+// replaceable violation handler (see set_violation_handler).
 // ============================================================================
 
 #include <algorithm>
@@ -98,18 +59,18 @@
 #include <utility>
 #include <vector>
 
-#ifndef QUIVER_CHECKS
+#ifndef ECS_CHECKS
 #ifdef NDEBUG
-#define QUIVER_CHECKS 0
+#define ECS_CHECKS 0
 #else
-#define QUIVER_CHECKS 1
+#define ECS_CHECKS 1
 #endif
 #endif
 
-namespace quiver
+namespace ecs
 {
 
-inline constexpr bool checks_enabled = (QUIVER_CHECKS != 0);
+inline constexpr bool checks_enabled = (ECS_CHECKS != 0);
 
 template <class Traits>
 class basic_world;
@@ -129,7 +90,7 @@ template <class Traits, class Excludes, class... Ts>
 class basic_bonded_view;
 template <class Traits, class Excludes, class... Ts>
 class basic_selection;
-struct test_access;  // checked-build test backdoor; defined only when QUIVER_CHECKS is on
+struct test_access;  // checked-build test backdoor; defined only when ECS_CHECKS is on
 
 namespace detail
 {
@@ -140,11 +101,9 @@ struct basic_kin;  // internal parent/child link component; managed via adopt/or
 // ----------------------------------------------------------------------------
 // Violation handler
 //
-// Every checked-build safety violation (stale handle, structural change during
-// iteration, ...) calls the installed handler before quiver decides what to do
-// next. The default handler prints and aborts. A custom handler may return, in
-// which case the offending operation is skipped where that is safe and
-// proceeds (documented per call site) where a result must be produced.
+// Checked-build safety violations call the installed handler (default: print
+// and abort). A handler that returns makes the offending operation skip where
+// safe, or proceed (documented per call site) where a result must be produced.
 // ----------------------------------------------------------------------------
 
 using violation_handler = void (*)(const char* message);
@@ -153,7 +112,7 @@ namespace detail
 {
 inline void default_violation(const char* message)
 {
-    std::fputs("quiver violation: ", stderr);
+    std::fputs("ecs violation: ", stderr);
     std::fputs(message, stderr);
     std::fputc('\n', stderr);
     std::abort();
@@ -199,18 +158,9 @@ inline violation_handler set_violation_handler(violation_handler handler) noexce
 // ----------------------------------------------------------------------------
 // Compile-time toolkit
 //
-// The vocabulary quiver's own metaprogramming runs on, published because the
-// same shapes are useful around any ECS: bundles of component types travel
-// between systems, archives, and queries as first-class values.
-//
-//   using Saved = quiver::types<Transform, Health, Burning>;
-//   quiver::pack(world, writer, Saved{});            // archive manifests
-//   auto sel = world.select(Saved{});                 // queries from lists
-//   quiver::for_each_type(Saved{}, []<class T>() { register_editor<T>(); });
-//
-// Type-returning operations are traits (with _t aliases); value-returning
-// ones are consteval functions or variable templates, matching name_of /
-// hash_of. Everything is O(list) instantiations and self-contained.
+// Type-list vocabulary (ecs::types and friends), published because bundles of
+// component types travel between systems, archives, and queries. Traits yield
+// types (_t aliases); consteval fns yield values. O(list) instantiations.
 // ----------------------------------------------------------------------------
 
 // One compile-time constant carried as a type.
@@ -255,7 +205,7 @@ inline constexpr bool contains_type<T, types<Ts...>> = (std::same_as<T, Ts> || .
 template <class T, class... Ts>
 [[nodiscard]] consteval std::size_t index_of(types<Ts...>) noexcept
 {
-    static_assert((std::same_as<T, Ts> || ...), "quiver: T is not in this types<> list");
+    static_assert((std::same_as<T, Ts> || ...), "ecs: T is not in this types<> list");
     constexpr bool hits[]{std::same_as<T, Ts>...};
     for (std::size_t i = 0; i < sizeof...(Ts); ++i)
     {
@@ -357,7 +307,7 @@ struct values
 template <std::size_t I, auto First, auto... Rest>
 [[nodiscard]] consteval auto value_at(values<First, Rest...>) noexcept
 {
-    static_assert(I <= sizeof...(Rest), "quiver: values<> index out of range");
+    static_assert(I <= sizeof...(Rest), "ecs: values<> index out of range");
     if constexpr (I == 0)
     {
         return First;
@@ -377,7 +327,7 @@ inline constexpr bool contains_value<V, values<Vs...>> = ((V == Vs) || ...);
 template <auto V, auto... Vs>
 [[nodiscard]] consteval std::size_t index_of_value(values<Vs...>) noexcept
 {
-    static_assert(((V == Vs) || ...), "quiver: V is not in this values<> list");
+    static_assert(((V == Vs) || ...), "ecs: V is not in this values<> list");
     constexpr bool hits[]{(V == Vs)...};
     for (std::size_t i = 0; i < sizeof...(Vs); ++i)
     {
@@ -400,26 +350,18 @@ template <auto V, auto... Vs>
 namespace detail
 {
 inline constexpr std::uint32_t npos32 = 0xFFFFFFFFu;
-// The default 32+32 handle layout has four mechanisms welded to it; under
-// entity TRAITS those welds become the documented per-traits contract:
-//   1. one index bit above index_bits marks provisional handles issued by
-//      command_buffer::spawn() (the traits concept RESERVES that spare bit),
-//      so real slot indices stay below 2^index_bits;
-//   2. provisional handles carry their buffer's nonce in the generation
-//      field (world::apply refuses foreign/pre-clear provisionals through
-//      it; narrower generation types narrow the nonce, which is misuse
-//      detection, not security);
-//   3. entity_table::max_slots is therefore 2^index_bits - 1;
-//   4. bits() packs index and generation into one stable 64-bit encoding
-//      for hashing and serialization (the traits concept caps the total at
-//      64 bits).
+// Four mechanisms are welded to the handle layout (the per-traits contract):
+//   1. the spare index bit above index_bits flags provisional handles from
+//      command_buffer::spawn() -- real slots stay below 2^index_bits;
+//   2. provisional generations carry the buffer nonce (apply() refuses
+//      foreign/pre-clear provisionals; misuse detection, not security);
+//   3. entity_table::max_slots = 2^index_bits - 1;
+//   4. bits() packs index + generation into one stable 64-bit encoding.
 inline constexpr std::uint32_t provisional_bit = 0x80000000u;
 }  // namespace detail
 
-// The handle layout contract. Widths choose field TYPES, not shift math —
-// a basic_entity stays two plain fields, readable in any debugger, at every
-// width. The defaults are quiver's classic 31-bit slots + 32-bit
-// generations in 8 bytes.
+// The handle layout contract. Widths choose field TYPES, not shift math; the
+// defaults are the classic 31-bit slots + 32-bit generations in 8 bytes.
 struct default_entity_traits
 {
     using index_type = std::uint32_t;
@@ -441,8 +383,8 @@ concept entity_traits =
 
 namespace detail
 {
-// The per-traits constants the welds generalize to. For the default traits
-// these reproduce npos32 / provisional_bit / 2^31-1 exactly.
+// Per-traits weld constants; for the default traits these reproduce
+// npos32 / provisional_bit / 2^31-1 exactly.
 template <entity_traits Traits>
 struct entity_limits
 {
@@ -483,8 +425,7 @@ public:
                static_cast<std::uint64_t>(generation_);
     }
 
-    // True for any handle other than the null handle (says nothing about
-    // liveness; ask world::alive for that).
+    // Non-null check only; liveness is world::alive's job.
     constexpr explicit operator bool() const noexcept
     {
         return index_ != detail::entity_limits<Traits>::npos;
@@ -504,8 +445,7 @@ using entity = basic_entity<default_entity_traits>;
 
 inline constexpr entity no_entity{};
 
-// The alias-identity pins: the traits machinery must reproduce the historic
-// layout and encoding bit for bit.
+// Pins: the traits machinery must reproduce the historic layout bit for bit.
 static_assert(sizeof(entity) == 8);
 static_assert(entity::index_bits == 31 && entity::generation_bits == 32);
 static_assert(entity{5, 7}.bits() == ((std::uint64_t{5} << 32) | 7));
@@ -527,20 +467,15 @@ template <entity_traits Traits>
 // ----------------------------------------------------------------------------
 // Storage policies
 //
-//   packed  - parallel dense arrays, swap-remove. Fastest iteration; pointers
-//             and references are invalidated by add/remove on the same pool.
-//             The default.
-//   stable  - components live in fixed chunks that never move; pointers stay
-//             valid until that component is removed (or the pool is purged /
-//             the world reset). One extra indirection on access.
+//   packed  - dense arrays, swap-remove; fastest iteration; add/remove on the
+//             pool invalidates pointers/references. The default.
+//   stable  - fixed chunks, components never move; pointers valid until that
+//             component is removed (or pool purged / world reset). One extra
+//             indirection on access.
 //   tag     - membership only, no per-entity data. Automatic for empty types.
 //
-// Selection, in precedence order:
-//   1. explicit specialization of quiver::storage_policy<T>
-//   2. a `static constexpr auto quiver_storage = quiver::storage::...;` member
-//   3. tag, if T is an empty type
-//   4. packed
-// The policy must be identical in every translation unit and must not change
+// Precedence: ecs::storage_policy<T> specialization > T::ecs_storage member >
+// tag for empty types > packed. Must be identical in every TU and never change
 // after a world has first used T.
 // ----------------------------------------------------------------------------
 
@@ -554,16 +489,16 @@ enum class storage : std::uint8_t
 namespace detail
 {
 template <class T>
-concept has_storage_member = requires { T::quiver_storage; };
+concept has_storage_member = requires { T::ecs_storage; };
 
 template <class T>
 consteval storage default_storage()
 {
     if constexpr (has_storage_member<T>)
     {
-        static_assert(std::convertible_to<decltype(T::quiver_storage), storage>,
-                      "quiver: T::quiver_storage must be a quiver::storage value");
-        return T::quiver_storage;
+        static_assert(std::convertible_to<decltype(T::ecs_storage), storage>,
+                      "ecs: T::ecs_storage must be a ecs::storage value");
+        return T::ecs_storage;
     }
     else if constexpr (std::is_empty_v<T>)
     {
@@ -577,8 +512,8 @@ consteval storage default_storage()
 }  // namespace detail
 
 // Specialize for types you do not own:
-//   template <> inline constexpr quiver::storage quiver::storage_policy<Name>
-//       = quiver::storage::stable;
+//   template <> inline constexpr ecs::storage ecs::storage_policy<Name>
+//       = ecs::storage::stable;
 template <class T>
 inline constexpr storage storage_policy = detail::default_storage<T>();
 
@@ -586,7 +521,7 @@ namespace detail
 {
 template <class T>
 concept has_chunk_member = requires {
-    { T::quiver_chunk_items } -> std::convertible_to<std::size_t>;
+    { T::ecs_chunk_items } -> std::convertible_to<std::size_t>;
 };
 
 template <class T>
@@ -594,7 +529,7 @@ consteval std::size_t default_chunk_items()
 {
     if constexpr (has_chunk_member<T>)
     {
-        return T::quiver_chunk_items;
+        return T::ecs_chunk_items;
     }
     else
     {
@@ -603,23 +538,18 @@ consteval std::size_t default_chunk_items()
 }
 }  // namespace detail
 
-// Stable-storage tuning: components per chunk. Defaults to ~4 KiB chunks;
-// override for pools you know are huge (fewer allocations) or near-singleton
-// (less slack), in the same shape as storage selection — a trait
-// specialization or a `static constexpr std::size_t quiver_chunk_items`
-// member. Must be identical in every TU, like storage_policy.
+// Stable-storage tuning: components per chunk (~4 KiB default). Override via
+// trait specialization or an ecs_chunk_items member; same every-TU rule as
+// storage_policy.
 template <class T>
 inline constexpr std::size_t chunk_capacity = detail::default_chunk_items<T>();
 
 // ----------------------------------------------------------------------------
 // Component concept
 //
-// Deliberately does NOT require movability: stable storage constructs and
-// destroys components in place, so pinned types (atomics, mutexes,
-// self-referential objects) are legal there. The operations that genuinely
-// move components re-impose the requirement with named static_asserts:
-// packed storage (swap-remove, dense reallocation) and command_buffer
-// payloads (moved into the world at apply()).
+// Movability is deliberately NOT required: stable storage builds/destroys in
+// place, so pinned types (atomics, mutexes) are legal there. Packed storage
+// and command_buffer payloads re-impose it with named static_asserts.
 // ----------------------------------------------------------------------------
 
 template <class T>
@@ -688,25 +618,13 @@ constexpr std::string_view extract_type_name(std::string_view raw) noexcept
 }
 }  // namespace detail
 
-// User-pinned component identity. The compiler-derived spelling of T is
-// toolchain-specific; pinning a label makes name_of<T>() — and therefore
-// hash_of<T>(), the key archives persist — portable across compilers and
-// rename refactors. Two equivalent forms, the member preferred for types you
-// own:
-//
-//   struct Transform { ...
-//       static constexpr std::string_view quiver_label = "game.Transform"; };
-//
-//   template <> inline constexpr std::string_view
-//   quiver::component_label<foreign::Vec3> = "foreign.Vec3";
-//
-// Namespace your labels ("game.Transform", not "Transform") so they can
-// never collide with another type's compiler-derived spelling — collisions
-// are only caught when both pools register in one checked world. Labels are
-// INHERITED: a strong typedef (`struct RagdollTransform : Transform`) must
-// re-pin its own quiver_label or it shares the base's archive key. Must be
-// unique per world (the registration-time hash-collision check covers them
-// like any other name) and non-empty.
+// User-pinned component identity: makes name_of<T>() -- and hash_of<T>(), the
+// key archives persist -- portable across compilers and renames. Two forms: a
+// `static constexpr std::string_view ecs_label` member (preferred for types
+// you own) or a component_label<T> specialization. Namespace labels
+// ("game.Transform") so they cannot collide with compiler-derived spellings.
+// Labels are INHERITED: a strong typedef must re-pin its own ecs_label or it
+// shares the base's archive key. Must be unique per world and non-empty.
 template <class T>
 inline constexpr std::string_view component_label{};  // empty: compiler-derived name
 
@@ -714,7 +632,7 @@ namespace detail
 {
 template <class T>
 concept has_label_member = requires {
-    { T::quiver_label } -> std::convertible_to<std::string_view>;
+    { T::ecs_label } -> std::convertible_to<std::string_view>;
 };
 }  // namespace detail
 
@@ -726,12 +644,12 @@ template <class T>
     if constexpr (detail::has_label_member<T>)
     {
         static_assert(
-            requires { typename std::integral_constant<std::size_t, T::quiver_label.size()>; },
-            "quiver: quiver_label must be a constexpr std::string_view");
-        static_assert(!std::string_view{T::quiver_label}.empty(),
-                      "quiver: quiver_label must not be empty (omit it for the "
+            requires { typename std::integral_constant<std::size_t, T::ecs_label.size()>; },
+            "ecs: ecs_label must be a constexpr std::string_view");
+        static_assert(!std::string_view{T::ecs_label}.empty(),
+                      "ecs: ecs_label must not be empty (omit it for the "
                       "compiler-derived name)");
-        return T::quiver_label;
+        return T::ecs_label;
     }
     else if constexpr (!component_label<T>.empty())
     {
@@ -758,15 +676,10 @@ constexpr std::uint64_t fnv1a(std::string_view text) noexcept
 }
 }  // namespace detail
 
-// Stable, RTTI-free identity for T: a 64-bit hash of name_of<T>(). Unlike the
-// internal dense type ids (first-use-order, never persist them), this is
-// stable across runs and build configurations of the same toolchain — use it
-// as the component key in snapshots and tools. Caveat: without a pinned
-// label it follows the compiler's spelling of the name, so anonymous-
-// namespace types differ per TU and different compilers may disagree; pin a
-// quiver_label / component_label (namespaced, so it cannot alias another
-// type's spelling) for keys that cross toolchains. Checked builds report a
-// collision if two registered components ever hash alike — within one world.
+// Stable, RTTI-free identity: a 64-bit hash of name_of<T>(), persistable
+// across runs (unlike the first-use-order dense type ids). Without a pinned
+// label it follows the compiler's spelling, so pin an ecs_label for keys that
+// cross toolchains. Checked builds report per-world hash collisions.
 template <class T>
 [[nodiscard]] constexpr std::uint64_t hash_of() noexcept
 {
@@ -777,10 +690,9 @@ template <class T>
 // ----------------------------------------------------------------------------
 // Component type ids
 //
-// Dense process-wide ids handed out on first use (thread-safe). Ids depend on
-// first-use order, so they are not stable across runs or modules; quiver never
-// persists them. Keep one world inside one module (DLL boundaries may disagree
-// about ids).
+// Dense process-wide ids handed out on first use (thread-safe). First-use
+// order means not stable across runs or modules; never persisted. Keep one
+// world inside one module (DLL boundaries may disagree about ids).
 // ----------------------------------------------------------------------------
 
 namespace detail
@@ -863,7 +775,7 @@ struct duplicate_result
     std::uint32_t skipped = 0;  // components whose type is not copy-constructible
 };
 
-// Result of world::footprint — truthful budget numbers for a stats HUD.
+// Result of world::footprint -- per-category byte counts.
 struct memory_footprint
 {
     std::size_t entity_table_bytes = 0;
@@ -877,9 +789,8 @@ struct memory_footprint
     }
 };
 
-// Marks the world's globals entity (see world::globals()). Public so that
-// archives can round-trip it (pack<globals_mark, ...>) and broad tools can
-// except<globals_mark> it out.
+// Marks the world's globals entity (see world::globals()). Public so archives
+// can round-trip it and broad tools can except<globals_mark> it out.
 struct globals_mark
 {
 };
@@ -887,27 +798,15 @@ struct globals_mark
 // ----------------------------------------------------------------------------
 // Reactive hooks
 //
-// Per-pool callbacks fired on structural changes, for invariant maintenance
-// (attach a physics body when a Collider appears, free a GPU handle when a
-// Sprite dies):
-//
-//   auto token = world.on_add<Collider>(
-//       [](quiver::world& w, quiver::entity e, void*) { ... });
-//   ...
-//   world.unhook(token);
-//
-// Cost model: pools with no hooks pay one pointer test per structural op;
-// dispatch happens under the pool's iteration lock, so a hook that
-// structurally mutates ITS OWN pool is a reported violation instead of UB
-// (other pools are fair game — chain reactions work). on_remove fires before
-// the component is destroyed, so the hook may read it. Hooks do not fire
-// during world destruction, and must not throw. The user pointer passes
-// through untouched.
-//
-// Connection forms (each returns a hook_token; scoped_hook wraps one in RAII):
-//   world.on_add<T>(fn, user)              — function pointer + user data
-//   world.on_add<T, &on_collider>()        — free function: (world&, entity) or (entity)
-//   world.on_add<T, &Phys::body>(&phys)    — member function on an instance
+// Per-pool callbacks fired on structural changes (on_add / on_remove). No-hook
+// pools pay one pointer test per structural op. Dispatch holds the pool's
+// iteration lock, so a hook structurally mutating ITS OWN pool is a reported
+// violation, not UB (other pools are fair game). on_remove fires before the
+// component is destroyed, so the hook may read it. Hooks do not fire during
+// world destruction and must not throw; the user pointer passes through.
+// Connect via world.on_add<T>(fn, user), <T, &free_fn>(), or
+// <T, &Class::member>(&instance); each returns a hook_token (scoped_hook =
+// RAII).
 // ----------------------------------------------------------------------------
 
 template <class Traits>
@@ -925,9 +824,8 @@ struct hook_token
 
 namespace detail
 {
-// Adapts a compile-time callable (free function, capture-less function
-// object) to the component_hook convention. Candidates may take
-// (world&, entity) or just (entity).
+// Adapts a compile-time callable to the component_hook convention; candidates
+// may take (world&, entity) or just (entity).
 template <class Traits, auto Candidate>
 consteval basic_component_hook<Traits> free_hook_thunk()
 {
@@ -940,15 +838,14 @@ consteval basic_component_hook<Traits> free_hook_thunk()
     else
     {
         static_assert(std::invocable<decltype(Candidate), entity>,
-                      "quiver: a hook candidate must be callable as (world&, entity) or "
+                      "ecs: a hook candidate must be callable as (world&, entity) or "
                       "(entity)");
         return +[](world&, entity e, void*) { std::invoke(Candidate, e); };
     }
 }
 
-// Adapts a member function (or any callable taking the instance first) plus
-// an instance pointer. Constness flows through Inst: connecting through a
-// const instance only compiles for const-invocable candidates.
+// Adapts a member function (or instance-first callable) plus an instance
+// pointer. Constness flows through Inst.
 template <class Traits, auto Candidate, class Inst>
 consteval basic_component_hook<Traits> bound_hook_thunk()
 {
@@ -962,7 +859,7 @@ consteval basic_component_hook<Traits> bound_hook_thunk()
     else
     {
         static_assert(std::invocable<decltype(Candidate), Inst&, entity>,
-                      "quiver: a bound hook candidate must be callable as "
+                      "ecs: a bound hook candidate must be callable as "
                       "(Inst&, world&, entity) or (Inst&, entity)");
         return +[](world&, entity e, void* user)
         { std::invoke(Candidate, *static_cast<Inst*>(user), e); };
@@ -976,9 +873,8 @@ consteval basic_component_hook<Traits> bound_hook_thunk()
 
 namespace detail
 {
-// Doubles a vector's capacity when it is full, so the push_back that follows
-// cannot throw. Used to sequence "allocate bookkeeping first, construct the
-// component last" in the structural paths.
+// Doubles capacity when full so the push_back that follows cannot throw;
+// sequences "allocate bookkeeping first, construct the component last".
 template <class Vector>
 void grow_if_full(Vector& v)
 {
@@ -1032,7 +928,7 @@ public:
         pages_[key / page_size][key % page_size] = value;
     }
 
-    // Honest accounting: allocated pages plus the page-table vector itself.
+    // Allocated pages plus the page-table vector itself.
     [[nodiscard]] std::size_t bytes() const noexcept
     {
         std::size_t pages = 0;
@@ -1108,17 +1004,16 @@ private:
 // ----------------------------------------------------------------------------
 // detail: entity table
 //
-// Per slot: a generation and a free flag. Free slots are recycled through a
-// stack with lazy invalidation: restore_entity may claim a slot that is still
-// recorded on the stack, so spawn discards stack entries whose flag says the
-// slot is no longer free. Amortized O(1), and no free-list surgery on restore.
+// Per slot: a generation and a free flag. Free slots recycle through a stack
+// with lazy invalidation: restore_entity may claim a stacked slot, so spawn
+// discards entries whose flag says the slot is taken. Amortized O(1).
 // ----------------------------------------------------------------------------
 
 template <entity_traits Traits>
 class basic_entity_table
 {
 public:
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using generation_type = typename Traits::generation_type;
 
@@ -1140,8 +1035,8 @@ public:
     {
     }
 
-    // Not noexcept: assigning between tables on different memory resources
-    // falls back to element-wise moves, which may allocate.
+    // Not noexcept: cross-resource assignment falls back to element-wise
+    // moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
     basic_entity_table& operator=(basic_entity_table&& other)
     {
@@ -1192,9 +1087,8 @@ public:
         return entity(index, 0);
     }
 
-    // O(1). The generation bump is what invalidates outstanding handles.
-    // Never allocates: create()/restore() maintain enough free-stack slack for
-    // every live entity, which is what makes kill() noexcept end-to-end.
+    // O(1). The generation bump invalidates old handles. Never allocates:
+    // create()/restore() keep free-stack slack, so kill() stays noexcept.
     // NOLINTNEXTLINE(bugprone-exception-escape) -- nofail push_back: slack invariant above
     void destroy(index_type index) noexcept
     {
@@ -1221,9 +1115,8 @@ public:
         return generation_[index];
     }
 
-    // Claims an exact slot at an exact generation (snapshot restore). The slot
-    // may sit anywhere in the free stack; its stack entries go stale and are
-    // discarded lazily by create().
+    // Claims an exact slot at an exact generation (snapshot restore); stale
+    // free-stack entries for the slot are discarded lazily by create().
     std::expected<entity, fault> restore(entity e)
     {
         if (!e || is_provisional(e) || e.index() >= max_slots)
@@ -1344,11 +1237,10 @@ public:
     }
 
 private:
-    friend struct quiver::test_access;
+    friend struct ecs::test_access;
 
-    // Invariant: free_stack_ has reserved room for one entry per live entity,
-    // so destroy() never reallocates. Re-established by every operation that
-    // raises live_ (create, restore) and by shrink().
+    // Invariant: free_stack_ has room for one entry per live entity, so
+    // destroy() never reallocates. Re-established by create/restore/shrink.
     void ensure_destroy_slack()
     {
         const std::size_t needed = free_stack_.size() + live_;
@@ -1383,9 +1275,8 @@ class basic_pool_base;
 template <entity_traits Traits>
 class basic_single_pool_lock;
 
-// The default sorting algorithm, injectable through world::sort's Algorithm
-// parameter. Replacements must permute the random-access range exactly as a
-// comparison sort over cmp would (the cycle-walk below consumes a gather
+// Default sorting algorithm, injectable via world::sort's Algorithm parameter.
+// Replacements must fully sort the range (the cycle-walk consumes a gather
 // permutation): std::stable_sort qualifies, a partial sort does not.
 struct std_sort
 {
@@ -1397,12 +1288,9 @@ struct std_sort
 };
 
 // One bonded group (world::bond<Ts...>): every owner keeps the N-way
-// intersection mirror-partitioned at dense positions [0, paired) — the same
-// entity at the same position in ALL owners. Heap-stable, owned by the
-// world; unbond() tombstones (owner_count = 0, paired = 0) so stored bonded
-// views degrade to empty instead of dangling. The owner array is bounded so
-// the object stays allocation-free and debugger-plain; pairs (N = 2) are
-// the common case and generate exactly the historical two-pool work.
+// intersection mirror-partitioned at dense positions [0, paired) -- the same
+// entity at the same position in ALL owners. Heap-stable, owned by the world;
+// unbond() tombstones it so stored bonded views degrade to empty.
 template <entity_traits Traits>
 struct basic_group_core
 {
@@ -1434,14 +1322,14 @@ template <entity_traits Traits>
 class basic_pool_base
 {
 public:
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using entity_table = basic_entity_table<Traits>;
     using group_core = basic_group_core<Traits>;
     using index_type = typename Traits::index_type;  // slot indices AND dense positions
     using pool_base = basic_pool_base;               // the historical body spelling
     using single_pool_lock = basic_single_pool_lock<Traits>;
-    using world = quiver::basic_world<Traits>;
-    using component_hook = quiver::basic_component_hook<Traits>;
+    using world = ecs::basic_world<Traits>;
+    using component_hook = ecs::basic_component_hook<Traits>;
 
     // Positions are bounded by slots (rows <= live <= max_slots < npos), so
     // one sentinel serves both lanes.
@@ -1491,10 +1379,8 @@ public:
     virtual void wipe() noexcept = 0;  // destroy all components, keep the pool object
     virtual void compact() = 0;
 
-    // Type-erased payload access for tooling (pool_ref::raw): the component
-    // bytes at a dense position, or null for tag pools. Pair with
-    // pool_info::bytes_per_item; the pointer obeys the pool's invalidation
-    // rules like any component reference.
+    // Type-erased payload bytes at a dense position; null for tag pools
+    // (pool_ref::raw). Obeys the pool's usual invalidation rules.
     [[nodiscard]] virtual void* item_address(index_type /*pos*/) noexcept { return nullptr; }
 
     [[nodiscard]] virtual std::size_t item_capacity() const noexcept = 0;
@@ -1581,8 +1467,8 @@ public:
     {
         if (hooks_ && !hooks_->on_remove.empty())
         {
-            // Index loop, like dispatch_if: stays valid even if a misbehaving
-            // hook grows dense_ through the report-then-proceed add path.
+            // Index loop: stays valid if a hook grows dense_ via the
+            // report-then-proceed add path.
             // NOLINTNEXTLINE(modernize-loop-convert)
             for (std::size_t i = 0; i < dense_.size(); ++i)
             {
@@ -1593,8 +1479,7 @@ public:
 
 protected:
     // Swaps two dense positions INCLUDING the derived pool's payload mirror.
-    // The cross-pool half of bond maintenance (and the bond build pass) runs
-    // through this; cold, and compiled per pool type.
+    // Cold; bond maintenance and the bond build pass run through this.
     virtual void mirror_swap(index_type a, index_type b) noexcept = 0;
 
     // Membership insert; the caller appends payload first (so a throwing
@@ -1629,11 +1514,9 @@ protected:
         return pos;
     }
 
-    // This pool just attached e at the back. If EVERY other owner holds e
-    // too, the entity enters the intersection: swap e to slot `paired` in
-    // ALL owners. Each owner's prior position is >= paired (e was not
-    // intersecting), so the mirrored prefix is untouched and gains e at the
-    // same index everywhere. O(owners).
+    // Called after this pool attached e at the back. If EVERY other owner
+    // holds e too, swap e to slot `paired` in ALL owners: the mirrored prefix
+    // gains e at the same index everywhere. O(owners).
     void bond_on_attach(entity e) noexcept
     {
         for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
@@ -1657,10 +1540,9 @@ protected:
         bond_->paired = static_cast<index_type>(k + 1);
     }
 
-    // This pool is about to swap-remove the entity at slot `index`. If it is
-    // paired, move it (mirrored in every owner) to the partition edge first
-    // so the removal's own swap stays entirely in the unpaired tail. The
-    // entity remains in the other owners, correctly unpaired. O(owners).
+    // Before swap-removing the entity at slot `index`: if paired, move it
+    // (mirrored in every owner) to the partition edge so the removal's swap
+    // stays in the unpaired tail. It stays in other owners, unpaired. O(owners).
     void bond_on_detach(index_type index) noexcept
     {
         const index_type pos = sparse_.get(index);
@@ -1699,10 +1581,9 @@ protected:
         sparse_.set_existing(dense_[b].index(), b);
     }
 
-    // Sorts the dense order by a position comparator, then applies the
-    // permutation with cycle-walking swaps (swap_payload(a, b) mirrors each
-    // swap into the derived pool's arrays). Cold path: one O(n) scratch
-    // allocation (from the pool's resource) plus the O(n log n) sort.
+    // Sorts the dense order by a position comparator, then applies the gather
+    // permutation with cycle-walking swaps (swap_payload mirrors each swap).
+    // Cold: one O(n) scratch allocation plus the O(n log n) sort.
     template <class PosCompare, class SwapPayload, class Algo = std_sort>
     void sort_dense_impl(PosCompare cmp, SwapPayload swap_payload, Algo&& algo = {})
     {
@@ -1764,16 +1645,16 @@ protected:
     }
 
     template <class>
-    friend class quiver::basic_world;
+    friend class ecs::basic_world;
     template <entity_traits>
     friend class basic_single_pool_lock;
     template <class>
-    friend class quiver::basic_runtime_selection;
+    friend class ecs::basic_runtime_selection;
     template <class, class, class...>
-    friend class quiver::basic_selection;
+    friend class ecs::basic_selection;
     template <class, class, class...>
-    friend class quiver::basic_bonded_view;
-    friend struct quiver::test_access;  // declared unconditionally; defined only under checks
+    friend class ecs::basic_bonded_view;
+    friend struct ecs::test_access;  // declared unconditionally; defined only under checks
 
     struct hook_entry
     {
@@ -1824,7 +1705,7 @@ protected:
 using pool_base = basic_pool_base<default_entity_traits>;
 
 // RAII iteration lock over one pool (children_of and friends). Counter
-// maintenance is compiled out with QUIVER_CHECKS off, like selection locks.
+// maintenance is compiled out with ECS_CHECKS off, like selection locks.
 template <entity_traits Traits>
 class basic_single_pool_lock
 {
@@ -1856,8 +1737,7 @@ private:
 using single_pool_lock = basic_single_pool_lock<default_entity_traits>;
 
 // Hook dispatch runs under the pool's iteration lock: a hook structurally
-// mutating its own pool is a reported violation, not UB. Hooks must not throw
-// (several call sites are noexcept).
+// mutating its own pool is a reported violation, not UB. Hooks must not throw.
 template <entity_traits Traits>
 void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, entity e)
 {
@@ -1866,8 +1746,7 @@ void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, e
         return;
     }
     const single_pool_lock lock(this);
-    // Index loop: connect/disconnect on a locked pool is refused, but stay
-    // robust against a hook that ignores the violation and proceeds.
+    // Index loop: robust against a hook that ignores the refusal and proceeds.
     // NOLINTNEXTLINE(modernize-loop-convert)
     for (std::size_t i = 0; i < list->size(); ++i)
     {
@@ -1877,14 +1756,13 @@ void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, e
 }
 
 // Packed: components in one dense vector parallel to the entity array.
-// The Traits default keeps every existing spelling (packed_pool<T>) intact.
 template <component T, entity_traits Traits = default_entity_traits>
 class packed_pool : public basic_pool_base<Traits>
 {
 public:
     static_assert(std::is_move_constructible_v<T>,
-                  "quiver: packed storage moves components on add/remove; give T a move "
-                  "constructor or select quiver::storage::stable for it");
+                  "ecs: packed storage moves components on add/remove; give T a move "
+                  "constructor or select ecs::storage::stable for it");
 
     using base = basic_pool_base<Traits>;
     using entity = typename base::entity;
@@ -1920,17 +1798,15 @@ public:
     template <class... Args>
     T& emplace(entity e, Args&&... args)
     {
-        // Bookkeeping capacity first: once it is secured, neither a throwing
-        // T constructor (vector strong guarantee) nor attach() can leave the
-        // pool half-updated.
+        // Secure bookkeeping capacity first: then neither a throwing T
+        // constructor nor attach() can leave the pool half-updated.
         grow_if_full(items_);
         grow_if_full(dense_);
         sparse_.ensure(e.index());
         items_.emplace_back(std::forward<Args>(args)...);
         attach(e);
         fire_add(e);
-        // Re-read the position last: a bond fix-up in attach() (or one caused
-        // by a misbehaving hook) may have relocated the new item.
+        // Re-read last: a bond fix-up in attach() or a hook may have moved it.
         return items_[sparse_.get(e.index())];
     }
 
@@ -1955,7 +1831,7 @@ public:
     void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
         static_assert(std::is_swappable_v<T>,
-                      "quiver: sorting a packed pool swaps components; T must be swappable "
+                      "ecs: sorting a packed pool swaps components; T must be swappable "
                       "(stable storage sorts without touching payloads)");
         sort_dense_impl(
             cmp,
@@ -1967,8 +1843,7 @@ public:
     {
         if constexpr (std::copy_constructible<T>)
         {
-            // Copy first: emplace may reallocate items_, which would dangle a
-            // reference into the pool's own payload vector.
+            // Copy first: emplace may reallocate items_ and dangle the source.
             T detached(items_[sparse_.get(src_index)]);
             emplace(dst, std::move(detached));
             return true;
@@ -1982,16 +1857,15 @@ public:
     void swap_positions(index_type a, index_type b)
     {
         static_assert(std::is_swappable_v<T>,
-                      "quiver: reordering a packed pool swaps components; T must be swappable "
+                      "ecs: reordering a packed pool swaps components; T must be swappable "
                       "(stable storage reorders without touching payloads)");
         swap_dense(a, b);
         std::swap(items_[a], items_[b]);
     }
 
     // The if constexpr is load-bearing: virtuals instantiate with the class,
-    // and non-swappable packed pools exist legally as long as they are never
-    // bonded (bond<A, B>() statically walls off packed-derived pools of
-    // non-swappable components — derived_from, so custom pools are covered).
+    // and non-swappable packed pools are legal as long as they are never
+    // bonded (bond() statically refuses them).
     void mirror_swap(index_type a, index_type b) noexcept override
     {
         if constexpr (std::is_swappable_v<T>)
@@ -2179,9 +2053,9 @@ protected:
     using base::swap_dense;
 
 public:
-    // Per-component via quiver::chunk_capacity<T>; defaults to ~4 KiB chunks.
+    // Per-component via ecs::chunk_capacity<T>; defaults to ~4 KiB chunks.
     static constexpr std::size_t chunk_items = chunk_capacity<T>;
-    static_assert(chunk_items > 0, "quiver: chunk_capacity<T> must be at least 1");
+    static_assert(chunk_items > 0, "ecs: chunk_capacity<T> must be at least 1");
 
     explicit stable_pool(std::pmr::memory_resource* memory) noexcept
         : base(memory, name_of<T>(), hash_of<T>(), storage::stable, sizeof(T)),
@@ -2200,8 +2074,8 @@ public:
     template <class... Args>
     T& emplace(entity e, Args&&... args)
     {
-        // Bookkeeping capacity first, component construction last: a throwing
-        // step leaves the pool exactly as it was.
+        // Bookkeeping first, construction last: a throwing step leaves the
+        // pool exactly as it was.
         grow_if_full(dense_);
         grow_if_full(slot_of_);
         sparse_.ensure(e.index());
@@ -2239,7 +2113,7 @@ public:
     }
 
     // Payloads never move: only the dense/slot mirrors permute, so stable
-    // pointers survive sorting (worth choosing stable storage for).
+    // pointers survive sorting.
     template <class PosCompare, class Algo = std_sort>
     void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
@@ -2277,8 +2151,7 @@ public:
                (chunks_.capacity() * sizeof(std::byte*));
     }
 
-    // add_chunk pre-reserves one free-list entry per slot, so the push_back
-    // below can never reallocate (which is what the lint cannot see).
+    // add_chunk pre-reserves one free-list entry per slot: nofail push_back.
     // NOLINTNEXTLINE(bugprone-exception-escape)
     void erase_if_present(index_type index) noexcept override
     {
@@ -2446,51 +2319,19 @@ using pool_for = std::conditional_t<storage_policy<T> == storage::tag,
 }  // namespace detail
 
 // ----------------------------------------------------------------------------
-// Custom storage backends — the pool_of seam
+// Custom storage backends -- the pool_of seam
 //
-// Every internal pool lookup goes through pool_of<T>, which by default
-// selects the built-in pool for T's storage_policy. Specialize it to supply
-// your own storage for one component type — instrumentation, history
-// tracking, exotic layouts — and selections, hooks, bonds, sorting, and
-// archives keep working unchanged:
-//
-//   struct telemetry_pool : quiver::packed_pool_of<Telemetry> {
-//       using base = quiver::packed_pool_of<Telemetry>;
-//       using base::base;                                // (memory_resource*)
-//       void erase_if_present(std::uint32_t i) noexcept override { ++erases; ... }
-//   };
-//
-// Slot indices and dense positions in the pool surface are the traits'
-// index_type — std::uint32_t for the default traits, so existing overrides
-// keep their spellings; custom-traits pools write base::index_type.
-//   template <> struct quiver::pool_of<Telemetry> { using type = telemetry_pool; };
-//
-// The contract (checked at registration by the component_pool concept):
-// derive from THE built-in pool matching storage_policy<T> —
-// packed_pool_of / stable_pool_of / tag_pool_of carry the typed surface the
-// world drives (emplace, at, at_pos, sort_dense, swap_positions, reserve) —
-// or, for a from-scratch backend, from quiver::basic_pool implementing that
-// surface, its cold virtuals (erase_if_present, wipe, compact, copy_item,
-// mirror_swap, item_capacity, item_address, check), and the basic_pool
-// constructor arguments (memory, name_of<T>(), hash_of<T>(), kind, size).
-// Construct from a std::pmr::memory_resource* that outlives the world.
-// Overriders of the structural virtuals must uphold their noexcept contracts
-// and call (or reproduce) the base behavior — membership bookkeeping is not
-// optional, and validate() audits membership, not whether your override did
-// its advertised job. The typed surface is NON-virtual: a shadowed emplace
-// is called on the world's add paths but bypassed by base-internal ones
-// (copy_item -> duplicate) — keep per-add side effects in on_add hooks
-// (which fire on every path) or override copy_item too. Like every trait
-// here, the specialization must be identical in every TU (ODR). Storage
-// TUNING still belongs in storage_policy<T> / chunk_capacity<T>, not here.
+// Specialize pool_of<T> (identical in every TU) to supply custom storage for
+// one component type: derive from the built-in pool matching storage_policy<T>,
+// override the cold virtuals, and call the base -- membership bookkeeping is
+// not optional. The typed surface is non-virtual: copy_item drives duplicate,
+// so keep per-add side effects in on_add hooks or override copy_item too.
 // ----------------------------------------------------------------------------
 
 using basic_pool = detail::pool_base;
 
-// Every seam name carries a defaulted Traits parameter, so existing
-// specializations and derivations keep their spellings; a `template <>
-// struct pool_of<T> { ... };` specializes the default-traits pool exactly
-// as before.
+// Seam names default the Traits parameter, so existing default-traits
+// specializations and derivations keep their spellings.
 template <component T, entity_traits Traits = default_entity_traits>
 using packed_pool_of = detail::packed_pool<T, Traits>;
 template <component T, entity_traits Traits = default_entity_traits>
@@ -2514,8 +2355,7 @@ concept component_pool = std::derived_from<P, detail::basic_pool_base<Traits>> &
 
 namespace detail
 {
-// select<>'s static_asserts, expressed over the public compile-time toolkit
-// (the library runs on its own abstractions).
+// Helpers for select<>'s static_asserts, built on the public type toolkit.
 
 template <class T, class... Us>
 inline constexpr bool type_among = contains_type<bare<T>, types<bare<Us>...>>;
@@ -2529,30 +2369,24 @@ inline constexpr bool all_distinct = distinct_t<types<bare<Ts>...>>::size == siz
 // ----------------------------------------------------------------------------
 
 // Exclude filter for select()/each(): entities holding any of these components
-// do not match.   world.select<A, B>(quiver::except<C>{})
+// do not match.   world.select<A, B>(ecs::except<C>{})
 template <class... Ts>
 struct except
 {
 };
 
-// Optional-component marker for select(): a maybe<T> never filters and never
-// drives iteration; the callback receives T* (nullptr when the entity lacks
-// it), const-propagated like everything else.
-//   world.select<Transform, quiver::maybe<Tint>>().each(
-//       [](Transform& t, Tint* tint) { ... });
+// Optional marker for select(): maybe<T> never filters and never drives
+// iteration; the callback receives T* (nullptr when absent), const-propagated.
 template <class T>
 struct maybe
 {
 };
 
-// OR-alternatives inside select(): an any_of<A, B, ...> element matches
-// entities holding AT LEAST ONE alternative. The callback receives one
-// (const-propagated) pointer per non-tag alternative, of which at least one
-// is non-null per row; tag alternatives filter without contributing an
-// argument. One type-level combinator, not a query language: alternatives
-// are plain (possibly const) component types — no nesting, no negation.
-//   world.select<Transform, quiver::any_of<Cat, Dog>>().each(
-//       [](Transform& t, Cat* c, Dog* d) { /* c or d is non-null */ });
+// OR-alternatives inside select(): any_of<A, B, ...> matches entities holding
+// at least one alternative. The callback receives one (const-propagated)
+// pointer per non-tag alternative, at least one non-null per row; tag
+// alternatives filter without contributing an argument. Alternatives are
+// plain (possibly const) component types -- no nesting, no negation.
 template <class... Alternatives>
 struct any_of
 {
@@ -2610,13 +2444,13 @@ struct group_ok : std::true_type
 template <class... As>
 struct group_ok<any_of<As...>> : std::true_type
 {
-    static_assert(sizeof...(As) >= 2, "quiver: any_of<> needs at least two alternatives");
+    static_assert(sizeof...(As) >= 2, "ecs: any_of<> needs at least two alternatives");
     static_assert((component<bare<As>> && ...),
-                  "quiver: any_of<> alternatives must be plain component types "
+                  "ecs: any_of<> alternatives must be plain component types "
                   "(const-qualified is fine)");
     static_assert((!is_maybe_v<bare<As>> && ...) && (!is_any_of_v<bare<As>> && ...),
-                  "quiver: any_of<> alternatives cannot nest maybe<> or any_of<>");
-    static_assert(all_distinct<bare<As>...>, "quiver: duplicate alternative in any_of<>");
+                  "ecs: any_of<> alternatives cannot nest maybe<> or any_of<>");
+    static_assert(all_distinct<bare<As>...>, "ecs: duplicate alternative in any_of<>");
 };
 
 // The flattened inner component list one element contributes (for global
@@ -2651,10 +2485,9 @@ struct list_none_among<types<Us...>, Xs...>
     static constexpr bool value = (!type_among<Us, Xs...> && ...);
 };
 
-// The callback-argument tuple fragment contributed by one select<> element:
-// nothing for tags, a (const-propagated) pointer for maybe<T>, one pointer
-// per non-tag alternative for any_of<>, a reference otherwise. Shared by
-// each() and the range iterator's value_type.
+// The callback-argument fragment of one select<> element: nothing for tags,
+// a pointer for maybe<T>, one pointer per non-tag any_of<> alternative, a
+// reference otherwise. Shared by each() and the range iterator's value_type.
 template <class T>
 struct sel_part
 {
@@ -2707,17 +2540,11 @@ struct as_const_part<any_of<As...>>
 // ----------------------------------------------------------------------------
 // Selections
 //
-// A selection is quiver's query object: a handful of raw pool pointers, cheap
-// to copy, allocation-free. Build one with world::select. A selection kept
-// across frames *is* the compiled query: pools are created once per world and
-// never move or die before the world does, so there is no per-frame setup.
-//
-// Iteration drives from the smallest included pool (re-chosen every call, one
-// size comparison per pool) and probes the other pools' indices per entity.
-//
-// Component types may be const-qualified for read-only access; a selection
-// obtained from a const world is all-const. Tag components filter but are not
-// passed to callbacks.
+// The query object, built by world::select: raw pool pointers, cheap to copy,
+// allocation-free, valid for the world's lifetime -- keep one across frames.
+// Iteration drives from the smallest included pool (re-chosen each call) and
+// probes the others. const-qualified types are read-only (a const world is
+// all-const); tags filter but are not passed to callbacks.
 // ----------------------------------------------------------------------------
 
 namespace detail
@@ -2738,43 +2565,43 @@ struct callback_traits<F, Entity, std::tuple<Refs...>>
 template <class Traits, class... Ts, class... Xs>
 class basic_selection<Traits, except<Xs...>, Ts...>
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using selection_t = basic_selection;  // the historical body spelling
     template <class T>
-    using pool_of_t = quiver::pool_of_t<T, Traits>;
+    using pool_of_t = ecs::pool_of_t<T, Traits>;
 
-    static_assert(sizeof...(Ts) > 0, "quiver: select() needs at least one component type");
+    static_assert(sizeof...(Ts) > 0, "ecs: select() needs at least one component type");
     static_assert(((detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> ||
                     component<detail::bare<detail::maybe_inner<Ts>>>) &&
                    ...),
-                  "quiver: select() component types must be plain object types "
+                  "ecs: select() component types must be plain object types "
                   "(no references, pointers-to-const, arrays, or cv-qualified types)");
     static_assert((detail::group_ok<detail::bare<detail::maybe_inner<Ts>>>::value && ...));
     static_assert((!(detail::is_maybe_v<Ts> &&
                      detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) &&
                    ...),
-                  "quiver: maybe<any_of<...>> is meaningless — any_of alternatives already "
+                  "ecs: maybe<any_of<...>> is meaningless -- any_of alternatives already "
                   "arrive as nullable pointers");
     static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
-                  "quiver: maybe<T> of a tag component carries no data to point at; tags are "
-                  "filter-only — include the tag directly or use has<T>");
+                  "ecs: maybe<T> of a tag component carries no data to point at; tags are "
+                  "filter-only -- include the tag directly or use has<T>");
     static_assert(!(detail::is_maybe_v<Ts> && ...),
-                  "quiver: a selection needs at least one required (non-maybe) component to "
+                  "ecs: a selection needs at least one required (non-maybe) component to "
                   "drive iteration");
     static_assert((component<Xs> && ...),
-                  "quiver: except<> types must be plain, non-const component types");
+                  "ecs: except<> types must be plain, non-const component types");
     static_assert(
         detail::list_distinct<joined_t<
             typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>>::value,
-        "quiver: duplicate component type in select<...> (any_of alternatives count)");
-    static_assert(detail::all_distinct<Xs...>, "quiver: duplicate component type in except<...>");
+        "ecs: duplicate component type in select<...> (any_of alternatives count)");
+    static_assert(detail::all_distinct<Xs...>, "ecs: duplicate component type in except<...>");
     static_assert(
         detail::list_none_among<
             joined_t<typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>,
             Xs...>::value,
-        "quiver: a component type appears in both select<...> and except<...> "
+        "ecs: a component type appears in both select<...> and except<...> "
         "(any_of alternatives count)");
 
     // Per-element flags/positions, indexable at runtime alongside includes_.
@@ -2788,10 +2615,9 @@ class basic_selection<Traits, except<Xs...>, Ts...>
         ((!detail::is_maybe_v<Ts> && !detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) ||
          ...);
 
-    // The flattened include array: an any_of element contributes one pool
-    // slot per alternative; everything else contributes one slot. With no
-    // any_of in the selection, the mapping is the identity and every loop
-    // below collapses to the historical single-slot-per-element shape.
+    // Flattened include array: an any_of element contributes one pool slot
+    // per alternative, everything else one. Without any_of the mapping is
+    // the identity.
     static constexpr std::array<std::size_t, sizeof...(Ts)> element_width{
         detail::any_of_traits<detail::bare<detail::maybe_inner<Ts>>>::width...};
     static constexpr std::size_t flat_count =
@@ -2898,20 +2724,17 @@ class basic_selection<Traits, except<Xs...>, Ts...>
     };
 
 public:
-    // Introspection for generic code over selections: the include/exclude
-    // lists as toolkit types<>, markers (const, maybe<>) preserved as
-    // spelled. Pairs with for_each_type / mapped_t for system wrappers that
-    // adapt to any selection.
+    // Introspection: the include/exclude lists as toolkit types<>, markers
+    // (const, maybe<>) preserved as spelled.
     using included = types<Ts...>;
     using excluded = types<Xs...>;
 
     basic_selection() = default;  // empty selection; matches nothing
 
-    // Invokes fn for every matching entity. fn is called as fn(entity, refs...)
-    // or fn(refs...) — entity-first wins when both compile. refs are the
-    // non-tag components in declaration order, const where the type was const.
-    // If fn returns something bool-like, returning false stops the loop.
-    // O(size of smallest included pool) pool probes; no allocation.
+    // Calls fn(entity, refs...) or fn(refs...) for every match -- entity-first
+    // wins when both compile. refs are the non-tag components in declaration
+    // order, const where spelled const. A bool-like false return stops the
+    // loop. O(smallest included pool) probes; no allocation.
     template <class F>
     void each(F&& fn) const
     {
@@ -2933,9 +2756,8 @@ public:
                 }
                 else
                 {
-                    static_assert(
-                        std::invocable<G&, entity>,
-                        "quiver: entities() callback must be callable with (quiver::entity)");
+                    static_assert(std::invocable<G&, entity>,
+                                  "ecs: entities() callback must be callable with (ecs::entity)");
                     f(e);
                     return true;
                 }
@@ -3054,8 +2876,7 @@ public:
         }
     }
 
-    // The first matching entity, or no_entity — the singleton-query idiom:
-    //   entity player = world.select<PlayerTag>().first();
+    // The first matching entity, or no_entity.
     [[nodiscard]] entity first() const noexcept
     {
         entity result = no_entity;
@@ -3068,32 +2889,24 @@ public:
         return result;
     }
 
-    // Returns a copy of the selection that drives iteration from T's pool
-    // instead of the smallest required include. The override changes WHICH
-    // pool walks (and therefore visit order and probe count), never the match
-    // set; each(), entities(), range(), split(), count(), and first() all
-    // honor it. Pair with sort<T> for ordered multi-component iteration:
-    //
-    //   world.sort<Order>(cmp);
-    //   world.select<Order, Sprite>().driven_by<Order>().each(...);
-    //
-    // T must be a required (non-maybe) include, spelled with or without
-    // const. A missing T pool (const world, never registered) yields the
-    // empty selection, like any missing required include.
+    // A copy of the selection that drives iteration from T's pool (pair with
+    // sort<T> for ordered iteration). Changes visit order and probe count,
+    // never the match set. T must be a required (non-maybe) include, const or
+    // not; a missing T pool yields the empty selection.
     template <class T>
     [[nodiscard]] selection_t driven_by() const noexcept
     {
         constexpr std::size_t slot = driver_slot_of<T>();
         static_assert(slot < sizeof...(Ts),
-                      "quiver: driven_by<T> needs T to be one of the selection's component "
+                      "ecs: driven_by<T> needs T to be one of the selection's component "
                       "types (const-qualified spelling is fine)");
         if constexpr (slot < sizeof...(Ts))
         {
             static_assert(!optional_include[slot],
-                          "quiver: driven_by<T> cannot drive from a maybe<> component — "
+                          "ecs: driven_by<T> cannot drive from a maybe<> component -- "
                           "optional pools never drive iteration");
             static_assert(!group_include[slot],
-                          "quiver: driven_by<T> cannot name an any_of<> group — union driving "
+                          "ecs: driven_by<T> cannot name an any_of<> group -- union driving "
                           "is automatic; force a PLAIN include instead");
         }
         selection_t out = *this;
@@ -3101,18 +2914,12 @@ public:
         return out;
     }
 
-    // Range-for iteration with the same matching, constness, tag, and lock
-    // rules as each(). The returned object owns the iteration lock for its
-    // whole lifetime (break/return/exceptions unwind it exactly like the
-    // callback path) and is deliberately pinned in place — bind it directly:
-    //
-    //   for (auto [e, t, v] : sel.range()) { ... }
-    //
-    // Rows are std::tuple<entity, components&...> (maybe<> elements appear as
-    // pointers, tags do not appear).
-    //
-    // (A template so it can hold the enclosing selection by value; always
-    // instantiated as range_t via range().)
+    // Range-for iteration with each()'s matching, constness, tag, and lock
+    // rules. The range owns the iteration lock for its whole lifetime and is
+    // pinned in place -- bind it directly: for (auto [e, t, v] : sel.range()).
+    // Rows are std::tuple<entity, components&...>; maybe<> elements appear as
+    // pointers, tags not at all.
+    // (A template so it can hold the selection by value; instantiated via range().)
     template <class Self = selection_t>
     class basic_range
     {
@@ -3197,8 +3004,7 @@ public:
             }
 
         private:
-            // A member (unlike the hidden friend above) may reach the
-            // enclosing range's private size_.
+            // A member (unlike the hidden friend) may reach the private size_.
             [[nodiscard]] bool at_end() const noexcept { return pos_ >= owner_->size_; }
 
             void settle() noexcept
@@ -3229,7 +3035,7 @@ public:
     [[nodiscard]] auto range() const noexcept
     {
         static_assert(group_count == 0 || has_plain_include,
-                      "quiver: range() needs at least one plain include to drive; iterate "
+                      "ecs: range() needs at least one plain include to drive; iterate "
                       "pure any_of selections with each()/entities()");
         return basic_range<>(*this);
     }
@@ -3237,20 +3043,13 @@ public:
     // ------------------------------------------------------------- splitting
     //
     // split(n) carves the driver pool's dense order into n near-equal slices
-    // for parallel const iteration. The split object owns the iteration locks
-    // (taken and released on the constructing thread — lock counters are not
-    // atomic); the parts are passive value handles a worker can copy. Parts
-    // are views INTO the split: the split object must outlive every part.
-    //
-    //   auto work = sel.split(threads.size());
-    //   parallel-for i: work.part(i).each([](Transform& t, const Velocity& v) { ... });
-    //
-    // Worker contract: only write through the references handed to the
-    // callback (parts never share an entity, so they never share a component
-    // object); no structural verbs, no spawning, no apply() — record into
-    // per-worker command buffers and apply after joining. A violation raised
-    // on a worker reaches the process-global handler, which must then be
-    // thread-safe.
+    // for parallel const iteration. The split owns the iteration locks (taken
+    // and released on the constructing thread -- lock counters are not atomic)
+    // and must outlive its parts, which are passive copyable views into it.
+    // Workers write only through the callback references (parts never share
+    // an entity); no structural verbs, spawning, or apply() -- record into
+    // per-worker command buffers and apply after joining. Violations raised
+    // on workers reach the process-global handler, which must be thread-safe.
 
     template <class Self = selection_t>
     class basic_split;
@@ -3295,8 +3094,8 @@ public:
                     else
                     {
                         static_assert(std::invocable<G&, entity>,
-                                      "quiver: entities() callback must be callable with "
-                                      "(quiver::entity)");
+                                      "ecs: entities() callback must be callable with "
+                                      "(ecs::entity)");
                         f(e);
                         return true;
                     }
@@ -3365,7 +3164,7 @@ public:
     [[nodiscard]] auto split(std::size_t parts) const noexcept
     {
         static_assert(group_count == 0 || has_plain_include,
-                      "quiver: split() needs at least one plain include to carve; iterate "
+                      "ecs: split() needs at least one plain include to carve; iterate "
                       "pure any_of selections with each()/entities()");
         return basic_split<selection_t>(*this, parts);
     }
@@ -3382,11 +3181,10 @@ private:
     {
     }
 
-    // The PLAIN driver pool: the smallest required non-group include — or
-    // the driven_by<T> choice when set; null when a plain include pool is
-    // missing (const world) or when the selection has no plain includes at
-    // all (pure any_of: the union drives instead, in run()). maybe<> pools
-    // never drive and a missing one never disqualifies the selection.
+    // The plain driver pool: the smallest required non-group include, or the
+    // driven_by<T> choice; null when a plain include pool is missing (const
+    // world) or the selection is pure any_of (the union drives in run()).
+    // maybe<> pools never drive; a missing one never disqualifies.
     [[nodiscard]] pool_base* smallest() const noexcept
     {
         if (driver_override_ != no_driver_override)
@@ -3529,10 +3327,9 @@ private:
                 run_span(fn, invoke, driver, 0, driver->size());
                 return;
             }
-            // Union drive: walk each alternative's dense array; an entity
-            // already seen through an EARLIER alternative is skipped (O(1)
-            // sparse probes — exact dedup, since pools hold each live entity
-            // at most once).
+            // Union drive: walk each alternative's dense array, skipping
+            // entities already seen through an earlier alternative (O(1)
+            // sparse probes, exact dedup).
             const iteration_lock lock(includes_);
             const std::size_t off = flat_offset[best_group_elem];
             for (std::size_t k = 0; k < element_width[best_group_elem]; ++k)
@@ -3667,7 +3464,7 @@ private:
             // Terminal branch: nothing below instantiates, so this message is
             // the only error the user sees.
             static_assert(traits::with_entity || traits::without_entity,
-                          "quiver: each() callback must be callable as (entity, components&...) "
+                          "ecs: each() callback must be callable as (entity, components&...) "
                           "or (components&...). Components from a const world or marked const in "
                           "select<...> are passed as const&. Tag components are filter-only and "
                           "are not passed at all.");
@@ -3692,7 +3489,7 @@ private:
 
     static constexpr std::uint8_t no_driver_override = 0xFF;
     static_assert(flat_count < no_driver_override,
-                  "quiver: selections cap at 254 flattened include slots");
+                  "ecs: selections cap at 254 flattened include slots");
 
     std::array<pool_base*, flat_count> includes_{};
     std::array<pool_base*, sizeof...(Xs)> excludes_{};
@@ -3716,45 +3513,30 @@ struct is_except<except<Xs...>> : std::true_type
 };
 }  // namespace detail
 
-// The public spelling: selection<A, const B>, or selection<except<C>, A, B>
-// when an exclude filter is part of the type. world::select deduces this for
-// you; spell it out only when storing a selection as a member.
+// The public spelling: selection<A, const B> or selection<except<C>, A, B>.
+// world::select deduces this; spell it out only for stored members.
 template <class First, class... Rest>
 using selection = std::conditional_t<detail::is_except<First>::value,
                                      selection_t<First, Rest...>,
                                      selection_t<except<>, First, Rest...>>;
 
 // ----------------------------------------------------------------------------
-// Bonded pools — mirrored partitions, 2..N owners
+// Bonded pools -- mirrored partitions, 2..N owners
 //
 // world.bond<Ts...>() keeps the N-way intersection mirror-partitioned at the
-// front of EVERY owner pool — the same entity at the same dense position in
-// all of them — and the world maintains the partition with at most one O(1)
-// mirrored swap per owner on every add/remove. bonded<Ts...>() then iterates
-// the intersection as N parallel arrays: zero sparse probes, the layout
-// EnTT-style owning groups buy, without claiming any pool's order beyond the
-// partition or coupling pools outside the owned set.
-//
-//   world.bond<Transform, Velocity>();                  // the common pair
-//   world.bond<Transform, Velocity, Burning>();         // or any set up to 8
-//   world.bonded<Transform, Velocity>().each([](Transform& t, Velocity& v) { ... });
-//
-// The price (everything but the co-owner-lock refusals holds in EVERY build):
-// one bond per pool — owned sets may not overlap or nest (that conflict
-// matrix is exactly why owning groups were long rejected here; one partition
-// owner per pool keeps every refusal explainable in one sentence). Structural
-// changes on an owned pool are also refused while ANY co-owner iterates
-// (checked builds); a hook on one owner may not structurally touch a
-// co-owner (use a command buffer); sort<T> and sort_along<T, ...> on owned
-// pools are refused outright. Tag pools may be owned — a bonded tag is "fast
-// filtered iteration" of the other components.
+// front of every owner pool -- the same entity at the same dense position in
+// each, within [0, paired) -- maintained by O(1) mirrored swaps, and
+// bonded<Ts...>() iterates it as N parallel arrays with zero sparse probes.
+// One bond per pool: owned sets may not overlap or nest; tags may be owned.
+// Refused: structural changes to an owned pool while any co-owner iterates
+// (checked builds), hooks structurally touching a co-owner (use a command
+// buffer), and sort<T> / sort_along on owned pools.
 // ----------------------------------------------------------------------------
 
 namespace detail
 {
-// Invocability over a tuple's element types, checked WITHOUT naming
-// std::apply (whose noexcept specification hard-errors outside the immediate
-// context on some standard libraries).
+// Invocability over a tuple's element types, checked without naming
+// std::apply (whose noexcept spec hard-errors on some standard libraries).
 template <class F, class Tuple>
 inline constexpr bool row_invocable = false;
 template <class F, class... Es>
@@ -3771,33 +3553,32 @@ inline constexpr bool row_stops<F, std::tuple<Es...>> =
 template <class Traits, class... Ts, class... Xs>  // const-qualify for read-only payload access
 class basic_bonded_view<Traits, except<Xs...>, Ts...>
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using group_core = detail::basic_group_core<Traits>;
     using bonded_view_t = basic_bonded_view;  // the historical body spelling
     template <class T>
-    using pool_of_t = quiver::pool_of_t<T, Traits>;
+    using pool_of_t = ecs::pool_of_t<T, Traits>;
 
-    static_assert(sizeof...(Ts) >= 2, "quiver: a bonded view spans at least two pools");
+    static_assert(sizeof...(Ts) >= 2, "ecs: a bonded view spans at least two pools");
     static_assert((!detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> && ...),
-                  "quiver: bonds own pools, not alternatives — any_of<> belongs in select");
+                  "ecs: bonds own pools, not alternatives -- any_of<> belongs in select");
     static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
-                  "quiver: bonded view component types must be plain object types");
+                  "ecs: bonded view component types must be plain object types");
     static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
-                  "quiver: maybe<T> of a tag component carries no data to point at; probe "
+                  "ecs: maybe<T> of a tag component carries no data to point at; probe "
                   "has<T> in the callback body instead");
     static_assert(detail::all_distinct<detail::maybe_inner<Ts>...>,
-                  "quiver: duplicate component type in bonded<...>");
+                  "ecs: duplicate component type in bonded<...>");
     static_assert((component<Xs> && ...),
-                  "quiver: except<> types must be plain, non-const component types");
-    static_assert(detail::all_distinct<Xs...>, "quiver: duplicate component type in except<...>");
+                  "ecs: except<> types must be plain, non-const component types");
+    static_assert(detail::all_distinct<Xs...>, "ecs: duplicate component type in except<...>");
     static_assert((!detail::type_among<detail::maybe_inner<Ts>, Xs...> && ...),
-                  "quiver: a component type appears in both bonded<...> and except<...>");
+                  "ecs: a component type appears in both bonded<...> and except<...>");
 
-    // Plain-listed types are the OWNED set (the partition's identity);
-    // maybe<>-marked types are OBSERVED — probed per row, pointer parts,
-    // null when absent, never part of the group identity.
+    // Plain-listed types are the OWNED set (the partition's identity); maybe<>
+    // types are OBSERVED -- probed per row as pointers, null when absent.
     static constexpr std::array<bool, sizeof...(Ts)> observed_part{detail::is_maybe_v<Ts>...};
 
     static consteval std::size_t find_first_owned()
@@ -3816,7 +3597,7 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
     static constexpr std::size_t owned_count =
         sizeof...(Ts) - (std::size_t{0} + ... + std::size_t{detail::is_maybe_v<Ts>});
     static_assert(owned_count >= 2,
-                  "quiver: a bonded view lists the standing owned set plain (at least two "
+                  "ecs: a bonded view lists the standing owned set plain (at least two "
                   "non-maybe types); observed extras are maybe<>");
 
     // Tags contribute nothing to callback arguments and rows; observed parts
@@ -3875,9 +3656,8 @@ class basic_bonded_view<Traits, except<Xs...>, Ts...>
         return true;
     }
 
-    // Locks every owner pool for a user-callback loop; tolerates null pools
-    // (the default-constructed empty view). Holds the array by value so
-    // range objects can own a copy of the view safely.
+    // Locks the listed pools for a user-callback loop; tolerates null pools
+    // (the empty view). Holds the array by value so ranges can own a copy.
     struct view_locks
     {
         explicit view_locks(const std::array<pool_base*, sizeof...(Ts)>& pools) noexcept
@@ -3965,10 +3745,9 @@ public:
         return pos < bond_->paired && bases_[first_owned]->entity_at(pos) == e && passes(e.index());
     }
 
-    // fn(entity, comps&...) or fn(comps&...); tags are filter-only; observed
-    // maybe<> parts arrive as pointers (null when absent); bool return stops
-    // the walk. Entity-first wins when both shapes bind. Locks EVERY listed
-    // pool (mutation rules apply to all of them).
+    // fn(entity, comps&...) or fn(comps&...) -- entity-first wins when both
+    // bind; tags are filter-only; observed maybe<> parts arrive as pointers
+    // (null when absent); bool return stops. Locks EVERY listed pool.
     template <class F>
     void each(F&& fn) const
     {
@@ -3977,7 +3756,7 @@ public:
             decltype(std::tuple_cat(std::declval<std::tuple<entity>>(), std::declval<parts_row>()));
         constexpr bool with_entity = detail::row_invocable<F, full_row>;
         static_assert(with_entity || detail::row_invocable<F, parts_row>,
-                      "quiver: bonded callback must take (entity, comps&...) or (comps&...); "
+                      "ecs: bonded callback must take (entity, comps&...) or (comps&...); "
                       "tags contribute no argument, observed maybe<T> parts arrive as T*");
         if (bond_ == nullptr || bond_->paired == 0)
         {
@@ -4057,13 +3836,11 @@ public:
         }
     }
 
-    // Reorders the partition itself — mirrored into EVERY owner, visible to
-    // every view of this bond and to the owners' dense prefixes. cmp compares
-    // entities (entity, entity); the sort<T> form compares an OWNED
-    // component's values. The optional algorithm follows world::sort's
-    // contract. Packed owners swap payloads (outstanding T* into the
-    // partition die); stable owners permute bookkeeping only. Refused while
-    // any listed pool iterates; a tombstoned or empty view is a no-op.
+    // Reorders the partition itself, mirrored into EVERY owner. cmp compares
+    // (entity, entity); sort<T> compares an OWNED component's values; the
+    // optional algorithm follows world::sort's contract. Packed owners swap
+    // payloads (outstanding T* die), stable owners permute bookkeeping only.
+    // Refused while any listed pool iterates; a tombstoned/empty view no-ops.
     template <class Compare, class Algorithm = detail::std_sort>
         requires std::invocable<Compare&, entity, entity>
     void sort(Compare cmp, Algorithm&& algo = {})
@@ -4082,14 +3859,14 @@ public:
     {
         constexpr std::size_t slot = sort_slot_of<T>();
         static_assert(slot < sizeof...(Ts),
-                      "quiver: bonded sort<T> needs T to be one of the view's OWNED component "
+                      "ecs: bonded sort<T> needs T to be one of the view's OWNED component "
                       "types (observed maybe<> parts have no partition order)");
         if constexpr (slot < sizeof...(Ts))
         {
             static_assert(!observed_part[slot],
-                          "quiver: bonded sort<T> cannot order by an observed maybe<> part");
+                          "ecs: bonded sort<T> cannot order by an observed maybe<> part");
             static_assert(!detail::is_tag_v<detail::bare<T>>,
-                          "quiver: T uses tag storage and carries no values to compare; sort by "
+                          "ecs: T uses tag storage and carries no values to compare; sort by "
                           "(entity, entity) instead");
             auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(bases_[slot]);
             sort_partition([&](index_type a, index_type b)
@@ -4223,7 +4000,7 @@ private:
     void sort_partition(PosCompare cmp, Algorithm&& algo)
     {
         static_assert((!std::is_const_v<detail::maybe_inner<Ts>> && ...),
-                      "quiver: sort on an all-const bonded view (const world) — sorting "
+                      "ecs: sort on an all-const bonded view (const world) -- sorting "
                       "reorders the owners' payloads");
         if (bond_ == nullptr || bond_->paired < 2)
         {
@@ -4290,9 +4067,8 @@ private:
 template <class Excludes, class... Ts>
 using bonded_view_t = basic_bonded_view<default_entity_traits, Excludes, Ts...>;
 
-// The public spelling: bonded_view<A, B>, or bonded_view<except<C>, A, B>
-// when an exclude filter is part of the type. world::bonded deduces this for
-// you; spell it out only when storing a view as a member.
+// The public spelling: bonded_view<A, B> or bonded_view<except<C>, A, B>.
+// world::bonded deduces this; spell it out only for stored members.
 template <class First, class... Rest>
 using bonded_view = std::conditional_t<detail::is_except<First>::value,
                                        bonded_view_t<First, Rest...>,
@@ -4301,23 +4077,16 @@ using bonded_view = std::conditional_t<detail::is_except<First>::value,
 // ----------------------------------------------------------------------------
 // Runtime queries
 //
-// The type-erased layer for editors, debug consoles, and scripting bindings:
-// pools are addressed by runtime ids (or stable name hashes) instead of
-// compile-time types, and matching entities are enumerated by id only —
-// payload access stays compile-time on purpose (tooling wants entity lists
-// and pool_info rows, which it already has).
-//
-//   quiver::runtime_selection q;
-//   q.include(world.find_pool_by_hash(saved_hash));
-//   q.exclude(world.find_pool<Hidden>());
-//   q.entities([&](quiver::entity e) { overlay.row(e); });
+// The type-erased layer for editors, debug consoles, and scripting: pools are
+// addressed by runtime ids or name hashes instead of compile-time types, and
+// matches are enumerated by entity only -- payload access stays compile-time.
 // ----------------------------------------------------------------------------
 
 // A nullable, opaque view of one component pool.
 template <class Traits>
 class basic_pool_ref
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using pool_base = detail::basic_pool_base<Traits>;
 
 public:
@@ -4352,10 +4121,8 @@ public:
 
     // Type-erased payload bytes of e, or null (absent entity, stale handle,
     // or a tag pool). Pair with info().bytes_per_item; the pointer obeys the
-    // pool's component-pointer invalidation rules. Writable exactly when the
-    // world this pool_ref came from was writable — treat it as read-only
-    // otherwise. This is what generic editors and byte-level serializers
-    // build on. O(1).
+    // pool's invalidation rules and is writable only when the source world
+    // was writable. O(1).
     [[nodiscard]] void* raw(entity e) const noexcept
     {
         if (pool_ == nullptr)
@@ -4367,8 +4134,7 @@ public:
         {
             return nullptr;
         }
-        // The runtime layer stores const pointers for const-world
-        // compatibility; mutability is the caller's documented contract.
+        // Stored const for const-world compatibility; mutability is the caller's contract.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         return const_cast<pool_base*>(pool_)->item_address(pos);
     }
@@ -4408,16 +4174,14 @@ private:
 
 using pool_ref = basic_pool_ref<default_entity_traits>;
 
-// A selection assembled at runtime from pool_refs. Entity-only iteration with
-// the same smallest-pool driving, matching, and lock rules as selection_t.
-// Owns small vectors (tooling path; building one allocates, iterating does
-// not). At least one include is required; an empty pool_ref include makes the
-// selection match nothing (the component was never registered, so no entity
-// can have it).
+// A selection assembled at runtime from pool_refs: entity-only iteration with
+// selection_t's smallest-pool driving, matching, and lock rules. Building one
+// allocates, iterating does not. At least one include is required; including
+// an empty pool_ref makes the selection match nothing.
 template <class Traits>
 class basic_runtime_selection
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using pool_ref = basic_pool_ref<Traits>;
@@ -4455,9 +4219,8 @@ public:
         impossible_ = false;
     }
 
-    // fn(entity), bool return = early exit. O(smallest include pool).
-    // The pool lists are snapshotted for the walk (this is the tooling path),
-    // so a callback editing the selection affects only future iterations.
+    // fn(entity), bool return = early exit. O(smallest include pool). The pool
+    // lists are snapshotted; edits mid-walk only affect future iterations.
     template <class F>
     void entities(F&& fn) const
     {
@@ -4487,8 +4250,8 @@ public:
             else
             {
                 static_assert(std::invocable<F&, entity>,
-                              "quiver: runtime_selection callback must be callable with "
-                              "(quiver::entity)");
+                              "ecs: runtime_selection callback must be callable with "
+                              "(ecs::entity)");
                 fn(e);
             }
         }
@@ -4623,10 +4386,9 @@ using runtime_selection = basic_runtime_selection<default_entity_traits>;
 // ----------------------------------------------------------------------------
 // detail: payload arena
 //
-// Bump allocation from chunks that never move once allocated, so payload
-// pointers recorded by command buffers and blueprints stay valid as they
-// grow. Chunks are retained and reused across reset() via the cursor;
-// payloads aligned beyond bump_align get dedicated, exactly-aligned chunks.
+// Bump allocation from chunks that never move, so payload pointers recorded
+// by command buffers and blueprints stay valid as they grow. Chunks are
+// reused across reset(); over-aligned payloads get dedicated chunks.
 // ----------------------------------------------------------------------------
 
 namespace detail
@@ -4671,7 +4433,7 @@ public:
     {
         if (align > bump_align)
         {
-            // Dedicated, exactly-aligned chunks — reused after reset(), so a
+            // Dedicated, exactly-aligned chunks -- reused after reset(), so a
             // warm buffer recording over-aligned payloads stays allocation-free.
             for (chunk& c : chunks_)
             {
@@ -4752,27 +4514,19 @@ private:
 // ----------------------------------------------------------------------------
 // Command buffer
 //
-// Records work now, mutates the world later, at a point you choose:
-//
-//   quiver::command_buffer cmd;
-//   cmd.kill(e);
-//   cmd.add<Burning>(e2);
-//   quiver::entity fresh = cmd.spawn();          // provisional handle
-//   cmd.add<Transform>(fresh, Transform{...});
-//   world.apply(cmd);                            // the only sync point
-//
-// Provisional handles are valid only as targets of later ops in the same
-// buffer; apply() resolves them to real entities in recording order. Every op
-// is skipped (and counted) if its target is not alive at the moment it would
-// run, so buffers never touch recycled slots by accident. Handles recorded in
-// a buffer are only meaningful to the world whose handles they are.
+// Records work now; world.apply(cmd) replays it later, in recording order.
+// spawn() returns a provisional handle, valid only as a target of later ops
+// in the same buffer; apply() resolves it to a real entity. An op whose
+// target is not alive when it would run is skipped (and counted), so buffers
+// never touch recycled slots. Recorded handles are only meaningful to the
+// world whose handles they are.
 // ----------------------------------------------------------------------------
 
 template <class Traits>
 class basic_command_buffer
 {
-    using entity = quiver::basic_entity<Traits>;
-    using world = quiver::basic_world<Traits>;
+    using entity = ecs::basic_entity<Traits>;
+    using world = ecs::basic_world<Traits>;
     using kin = detail::basic_kin<Traits>;
     using limits = detail::entity_limits<Traits>;
     using index_type = typename Traits::index_type;
@@ -4789,9 +4543,8 @@ public:
     {
     }
 
-    // The moved-from buffer is equivalent to a freshly constructed one (and
-    // gets a new identity, so provisional handles that moved away with the
-    // ops cannot be confused with handles it issues later).
+    // The moved-from buffer is as good as freshly constructed, with a new
+    // identity so moved-away provisional handles cannot match later ones.
     basic_command_buffer(basic_command_buffer&& other) noexcept
         : ops_(std::move(other.ops_)),
           arena_(std::move(other.arena_)),
@@ -4845,23 +4598,21 @@ public:
         return provisional;
     }
 
-    // Deferred create with initial components, mirroring world.spawn(Cs&&...).
-    // Payloads are constructed now and moved into place at apply time; tag
-    // components ride along as empty values. O(components).
+    // Deferred world.spawn(Cs&&...): payloads are constructed now and moved
+    // into place at apply time; tags ride along as empty values. O(components).
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint<Traits>> && ...))
     entity spawn(Cs&&... components)
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "quiver: duplicate component type in spawn(...)");
+                      "ecs: duplicate component type in spawn(...)");
         const entity provisional = spawn();
         (record_value(provisional, std::forward<Cs>(components)), ...);
         return provisional;
     }
 
-    // Deferred world.add<T>. The component is constructed now and moved into
-    // place at apply time.
+    // Deferred world.add<T>: constructed now, moved into place at apply time.
     template <component T, class... Args>
     void add(entity target, Args&&... args)
     {
@@ -4880,7 +4631,7 @@ public:
     void remove(entity target)
     {
         static_assert(!std::same_as<T, kin>,
-                      "quiver: parent/child links are managed via adopt/orphan/kill");
+                      "ecs: parent/child links are managed via adopt/orphan/kill");
         reserve_op();
         ops_.push_back(op{op_kind::remove,
                           target,
@@ -4899,10 +4650,9 @@ public:
     [[nodiscard]] bool empty() const noexcept { return ops_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return ops_.size(); }
 
-    // Destroys all unapplied payloads and resets the buffer for reuse. The
-    // payload arena is retained (per-frame reuse allocates nothing once warm);
-    // destroy the buffer to release it. Outstanding provisional handles from
-    // before the clear go stale and are refused by apply().
+    // Destroys unapplied payloads and resets for reuse; the arena is retained
+    // (warm reuse allocates nothing). Provisional handles from before the
+    // clear go stale and are refused by apply().
     void clear() noexcept
     {
         destroy_payloads();
@@ -4964,8 +4714,7 @@ private:
     }
 
     // Value-pack recording for spawn(Cs&&...): tags arrive as empty values,
-    // everything else is forwarded into the arena. Mirrors world's
-    // value-spawn dispatch.
+    // everything else is forwarded into the arena.
     template <class C>
     void record_value(entity target, C&& value)
     {
@@ -4987,7 +4736,7 @@ private:
         if constexpr (detail::is_tag_v<T>)
         {
             static_assert(sizeof...(Args) == 0,
-                          "quiver: T uses tag storage and carries no data; record add<T>(e) "
+                          "ecs: T uses tag storage and carries no data; record add<T>(e) "
                           "with no arguments");
             ops_.push_back(op{Kind,
                               target,
@@ -4998,7 +4747,7 @@ private:
         else
         {
             static_assert(std::is_move_constructible_v<T>,
-                          "quiver: command_buffer payloads are moved into the world at apply(); "
+                          "ecs: command_buffer payloads are moved into the world at apply(); "
                           "add non-movable components directly via world::add");
             T* payload = std::construct_at(static_cast<T*>(arena_.allocate(sizeof(T), alignof(T))),
                                            std::forward<Args>(args)...);
@@ -5064,27 +4813,17 @@ using command_buffer = basic_command_buffer<default_entity_traits>;
 // Blueprint
 //
 // A reusable spawn recipe: record component values once, stamp them onto any
-// number of fresh entities.
-//
-//   quiver::blueprint goblin;
-//   goblin.add<Transform>(Vec2{0, 0});
-//   goblin.add<Health>(30);
-//   goblin.add<Hostile>();                  // tags too
-//   entity g = world.spawn(goblin);         // as many times as you like
-//
-// Payloads are COPIED at every spawn, so blueprint components must be
-// copy-constructible (move-only types cannot be stamped repeatedly — the
-// static_assert says so). Blueprints are standalone, reusable, and move-only;
-// composition happens at build time in game code (build a second blueprint).
-// Stamping writes component pools, so world.spawn(blueprint) follows the same
-// iteration rules as spawn with components.
+// number of fresh entities via world.spawn(blueprint). Payloads are COPIED at
+// every spawn, so blueprint components must be copy-constructible. Blueprints
+// are move-only; stamping writes component pools, so spawn(blueprint) follows
+// the same iteration rules as spawn with components.
 // ----------------------------------------------------------------------------
 
 template <class Traits>
 class basic_blueprint
 {
-    using entity = quiver::basic_entity<Traits>;
-    using world = quiver::basic_world<Traits>;
+    using entity = ecs::basic_entity<Traits>;
+    using world = ecs::basic_world<Traits>;
     using blueprint = basic_blueprint;  // the historical body spelling
 
 public:
@@ -5097,10 +4836,8 @@ public:
     {
     }
 
-    // Records the whole recipe from component values in one expression; tag
-    // components ride along as empty values:
-    //   blueprint goblin{Transform{0, 0}, Health{20}, Burning{}};
-    // Equivalent to default construction followed by one add per value.
+    // Records the whole recipe from component values in one expression; tags
+    // ride along as empty values. Equivalent to one add per value.
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
@@ -5109,7 +4846,7 @@ public:
         : basic_blueprint()
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "quiver: duplicate component type in blueprint{...}");
+                      "ecs: duplicate component type in blueprint{...}");
         (record_value(std::forward<Cs>(components)), ...);
     }
 
@@ -5122,7 +4859,7 @@ public:
         : basic_blueprint(memory)
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "quiver: duplicate component type in blueprint{...}");
+                      "ecs: duplicate component type in blueprint{...}");
         (record_value(std::forward<Cs>(components)), ...);
     }
 
@@ -5154,9 +4891,8 @@ public:
 
     ~basic_blueprint() { destroy_payloads(); }
 
-    // Records one component for every future stamp. Constructor arguments are
-    // evaluated once, here; each spawn copy-constructs from the stored value.
-    // Returns *this, so conditional recipe-building chains.
+    // Records one component for every future stamp: arguments evaluate once,
+    // each spawn copy-constructs from the stored value. Returns *this.
     template <component T, class... Args>
     basic_blueprint& add(Args&&... args)
     {
@@ -5175,7 +4911,7 @@ public:
         if constexpr (detail::is_tag_v<T>)
         {
             static_assert(sizeof...(Args) == 0,
-                          "quiver: T uses tag storage and carries no data; record add<T>() "
+                          "ecs: T uses tag storage and carries no data; record add<T>() "
                           "with no arguments");
             ops_.push_back(op{detail::type_id<T>(),
                               [](world& w, entity e, const void*) { erased_stamp<T>(w, e); },
@@ -5185,10 +4921,10 @@ public:
         else
         {
             static_assert(std::copy_constructible<T>,
-                          "quiver: blueprint components are copied at every spawn; move-only "
-                          "types cannot be stamped repeatedly — add them per entity instead");
+                          "ecs: blueprint components are copied at every spawn; move-only "
+                          "types cannot be stamped repeatedly -- add them per entity instead");
             static_assert(std::constructible_from<T, Args&&...>,
-                          "quiver: T cannot be constructed from these blueprint arguments");
+                          "ecs: T cannot be constructed from these blueprint arguments");
             T* payload = std::construct_at(static_cast<T*>(arena_.allocate(sizeof(T), alignof(T))),
                                            std::forward<Args>(args)...);
             void (*destroy_fn)(void*) noexcept = nullptr;
@@ -5249,7 +4985,7 @@ private:
     }
 
     // Value-pack recording: tags arrive as empty values, everything else is
-    // forwarded into the arena. Mirrors world's value-spawn dispatch.
+    // forwarded into the arena.
     template <class C>
     void record_value(C&& value)
     {
@@ -5295,14 +5031,14 @@ namespace detail
 template <class Traits>
 struct basic_kin
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
 
     entity parent{};
     entity first_child{};
     entity prev_sibling{};
     entity next_sibling{};
 
-    static constexpr auto quiver_storage = storage::stable;
+    static constexpr auto ecs_storage = storage::stable;
 };
 
 // The parent/child link invariants, kept in one place: world::adopt/orphan/
@@ -5314,7 +5050,7 @@ namespace kin_links
 template <class Traits>
 void unlink(stable_pool<basic_kin<Traits>, Traits>& pool, basic_kin<Traits>& child_k) noexcept
 {
-    constexpr quiver::basic_entity<Traits> no_entity{};  // shadows the default-traits constant
+    constexpr ecs::basic_entity<Traits> no_entity{};  // shadows the default-traits constant
     if (child_k.prev_sibling != no_entity)
     {
         pool.at(child_k.prev_sibling.index())->next_sibling = child_k.next_sibling;
@@ -5332,9 +5068,9 @@ void unlink(stable_pool<basic_kin<Traits>, Traits>& pool, basic_kin<Traits>& chi
 // Pre-kill surgery: detach e from its parent's list and orphan all of its
 // children, so no other entity ever holds a link to the dying one.
 template <class Traits>
-void sever(stable_pool<basic_kin<Traits>, Traits>& pool, quiver::basic_entity<Traits> e) noexcept
+void sever(stable_pool<basic_kin<Traits>, Traits>& pool, ecs::basic_entity<Traits> e) noexcept
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using kin = basic_kin<Traits>;
     constexpr entity no_entity{};  // shadows the default-traits constant
     kin* k = pool.at(e.index());
@@ -5362,7 +5098,7 @@ template <class Traits>
 [[nodiscard]] std::expected<void, fault> check(const stable_pool<basic_kin<Traits>, Traits>& pool,
                                                const basic_entity_table<Traits>& table)
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using kin = basic_kin<Traits>;
     constexpr entity no_entity{};  // shadows the default-traits constant
     const auto broken = [&](const char* note)
@@ -5415,7 +5151,7 @@ class basic_world
 {
 public:
     using traits_type = Traits;
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
 
 private:
     using world = basic_world;  // the historical body spelling
@@ -5425,7 +5161,7 @@ private:
     using group_core = detail::basic_group_core<Traits>;
     using single_pool_lock = detail::basic_single_pool_lock<Traits>;
     using kin = detail::basic_kin<Traits>;
-    using component_hook = quiver::basic_component_hook<Traits>;
+    using component_hook = ecs::basic_component_hook<Traits>;
     using command_buffer = basic_command_buffer<Traits>;
     using blueprint = basic_blueprint<Traits>;
     using pool_ref = basic_pool_ref<Traits>;
@@ -5434,15 +5170,13 @@ private:
     using const_entity_ref = basic_entity_ref<const basic_world>;
     using limits = detail::entity_limits<Traits>;
     template <class T>
-    using pool_of_t = quiver::pool_of_t<T, Traits>;
+    using pool_of_t = ecs::pool_of_t<T, Traits>;
     static constexpr entity no_entity{};  // shadows the default-traits constant
 
 public:
-    // The optional memory resource feeds everything that scales — component
-    // payloads, sparse pages, dense arrays, the entity table — with zero
-    // template ceremony (signatures never change). It must outlive the world.
-    // Bounded structures (the pool objects themselves, hook lists) stay on
-    // the global allocator.
+    // The optional memory resource feeds all scaling storage (payloads,
+    // sparse pages, dense arrays, entity table) and must outlive the world.
+    // Bounded structures (pool objects, hook lists) use the global allocator.
     explicit basic_world(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : table_(memory),
@@ -5453,11 +5187,9 @@ public:
     {
     }
 
-    // Move-construction carries the pools along, so selections built before
-    // the move remain valid. Move-ASSIGNMENT destroys the assigned-over
-    // world's pools first: selections built from the destination world dangle
-    // exactly as they would on its destruction. Moved-from worlds are empty
-    // and reusable.
+    // Move-construction carries the pools along, so prior selections stay
+    // valid. Move-ASSIGNMENT destroys the target's pools first (its
+    // selections dangle). Moved-from worlds are empty and reusable.
     basic_world(basic_world&& other) noexcept
         : table_(std::move(other.table_)),
           pools_(std::move(other.pools_)),
@@ -5472,9 +5204,8 @@ public:
         repoint_pools();
     }
 
-    // Not noexcept: assigning between worlds on different memory resources
-    // falls back to element-wise moves, which may allocate. With matching
-    // resources it is O(1) pointer steals.
+    // Not noexcept: differing memory resources force element-wise moves that
+    // may allocate; matching resources are O(1) pointer steals.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
     basic_world& operator=(basic_world&& other)
     {
@@ -5489,8 +5220,7 @@ public:
                 }
             }
             table_ = std::move(other.table_);
-            active_.clear();  // if a cross-resource assignment below throws,
-                              // nothing here dangles into destroyed pools
+            active_.clear();  // a throwing cross-resource move leaves nothing dangling
             pools_ = std::move(other.pools_);
             active_ = std::move(other.active_);
             bonds_ = std::move(other.bonds_);
@@ -5507,10 +5237,8 @@ public:
     basic_world(const basic_world&) = delete;
     basic_world& operator=(const basic_world&) = delete;
 
-    // Pools die with the world; components are destroyed here. Tearing a
-    // world down while one of its iterations is running is reported in
-    // checked builds (and is unavoidable UB afterwards — a destructor cannot
-    // refuse).
+    // Destroys all components. Teardown mid-iteration is reported in checked
+    // builds, then UB regardless (a destructor cannot refuse).
     ~basic_world()
     {
         if constexpr (checks_enabled)
@@ -5524,28 +5252,26 @@ public:
 
     // ------------------------------------------------------------------ life
 
-    // O(1) amortized. Never touches component pools, which is why bare spawn()
-    // is the one structural operation that is always legal during iteration.
+    // O(1) amortized. Touches no pools: the one structural op always legal
+    // during iteration.
     entity spawn() { return table_.create(); }
 
-    // Spawn with initial components. This DOES write component pools, so it is
-    // not legal while one of those pools is being iterated (checked builds
-    // report it; use spawn() + command_buffer adds instead).
+    // Spawn with initial components. Writes pools, so illegal while any of
+    // them iterates (checked; use spawn() + command_buffer adds instead).
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, blueprint> && ...))
     entity spawn(Cs&&... components)
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "quiver: duplicate component type in spawn(...)");
+                      "ecs: duplicate component type in spawn(...)");
         const entity e = table_.create();
         (add_value(e, std::forward<Cs>(components)), ...);
         return e;
     }
 
-    // Stamps a blueprint onto a fresh entity (components copy-constructed
-    // from the recipe). Same iteration rules as spawn with components.
-    // O(recorded components).
+    // Stamps a blueprint onto a fresh entity (components copy-constructed).
+    // Same iteration rules as spawn with components. O(recorded components).
     entity spawn(const blueprint& recipe)
     {
         const entity e = table_.create();
@@ -5556,10 +5282,8 @@ public:
         return e;
     }
 
-    // Stamps a recipe count times; a zero count is a no-op. Recipe ops are
-    // type-erased, so pools grow on demand — pre-size big batches with
-    // reserve<T>(n) per recorded component. Same iteration rules as spawn
-    // with components. O(count * recorded components).
+    // Stamps a recipe count times (zero is a no-op); pre-size big batches
+    // with reserve<T>(n). Same iteration rules. O(count * recorded components).
     void spawn(const blueprint& recipe, std::size_t count)
     {
         for (std::size_t i = 0; i < count; ++i)
@@ -5568,8 +5292,7 @@ public:
         }
     }
 
-    // The same, handing each entity back after its full stamp — the hook for
-    // post-stamp tweaks and handle collection.
+    // The same, handing each entity back after its full stamp.
     template <class F>
         requires std::invocable<F&, basic_entity<Traits>>
     void spawn(const blueprint& recipe, std::size_t count, F&& fn)
@@ -5580,11 +5303,10 @@ public:
         }
     }
 
-    // Spawns a copy of src: every copy-constructible component is duplicated
-    // (parent/child links are NOT — clones start as unlinked roots), and
-    // components that cannot be copied are counted in `skipped`. Structural
-    // on every pool src occupies, so it follows the same iteration rules as
-    // spawn with components. O(pools this world uses).
+    // Spawns a copy of src: copy-constructible components are duplicated,
+    // non-copyable ones counted in `skipped`; parent/child links are NOT
+    // copied (clones start unlinked). Same iteration rules as spawn with
+    // components. O(pools this world uses).
     duplicate_result duplicate(entity src)
     {
         if (!table_.alive(src))
@@ -5619,10 +5341,9 @@ public:
         }
         duplicate_result result{table_.create()};
         const pool_base* links = peek_pool<kin>();
-        // Index loop: on_add hooks fired by the copies may register new pools
-        // (growing active_). Hooks observe a partially built clone, in pool
-        // registration order; a component a hook already gave the clone is
-        // not copied over it.
+        // Index loop: on_add hooks may register new pools (growing active_).
+        // Hooks observe a partially built clone; a component a hook already
+        // gave the clone is not copied over it.
         // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
         for (std::size_t i = 0; i < active_.size(); ++i)
         {
@@ -5644,12 +5365,10 @@ public:
         return result;
     }
 
-    // Immediate destroy: removes every component, severs parent/child links,
-    // and recycles the slot (generation bump kills outstanding handles).
-    // O(pools this world uses), noexcept (the free stack pre-reserves slack;
-    // violation handlers must not throw). Checked builds refuse (skip) a kill
-    // while the entity belongs to any pool that is being iterated, before any
-    // mutation.
+    // Immediate destroy: removes every component, severs links, recycles the
+    // slot (generation bump kills outstanding handles). O(pools this world
+    // uses), noexcept. Checked builds refuse (skip) a kill while the entity
+    // belongs to any iterated pool, before any mutation.
     void kill(entity e) noexcept
     {
         if (!table_.alive(e) || e == dying_)  // dying_: re-entrant kill from a hook
@@ -5683,9 +5402,8 @@ public:
                 }
             }
         }
-        // Index loops here and below: an on_remove hook may register a brand
-        // new component type, growing active_ under us (pool objects never
-        // move, so indexing stays valid — and the new pool gets visited).
+        // Index loops: an on_remove hook may register a new pool, growing
+        // active_ under us (pool objects never move; new pools get visited).
         const entity previous_dying = std::exchange(dying_, e);
         sever_links(e);
         // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
@@ -5709,25 +5427,17 @@ public:
         return entity(slot, table_.generation_at(slot));
     }
 
-    // Call-site sugar: a {world, entity} view forwarding the component verbs
-    // (defined after the class). Store quiver::entity in components, never
-    // an entity_ref — it is for passing through call chains, not for storage.
+    // Call-site sugar: a {world, entity} view forwarding the component verbs.
+    // For passing down call chains, not storage (store ecs::entity instead).
     [[nodiscard]] entity_ref ref(entity e) noexcept;
     [[nodiscard]] const_entity_ref ref(entity e) const noexcept;
 
-    // The world's singleton carrier: one ordinary entity, marked with
-    // globals_mark, spawned lazily here. World-scoped state is just
-    // components on it — every component verb, hook, tracker, and archive
-    // works unchanged:
-    //
-    //   world.globals().obtain<MatchClock>().elapsed += dt;
-    //
-    // Never store the handle (reset() wipes it like everything else; the
-    // next globals() call respawns or re-finds it — after unpack it finds
-    // the restored marked entity). kill()/duplicate() refuse it. It is a
-    // VISIBLE live entity: live_count()/live_entities()/pack() include it,
-    // so inspector numbers stay honest; except<globals_mark> filters it out
-    // of broad queries if needed. (Both defined after entity_ref.)
+    // The world's singleton carrier: one lazily spawned entity marked with
+    // globals_mark; world-scoped state is just components on it. Never store
+    // the handle (reset() wipes it; the next call respawns or re-finds it,
+    // including after unpack). kill()/duplicate() refuse it. It IS a visible
+    // live entity (live_count()/live_entities()/pack() include it); filter
+    // broad queries with except<globals_mark> if needed.
     [[nodiscard]] entity_ref globals();
     [[nodiscard]] const_entity_ref globals() const noexcept;  // never spawns
 
@@ -5735,23 +5445,18 @@ public:
 
     // ------------------------------------------------------------ components
 
-    // Adds T; the entity must not already have it (checked builds report a
-    // violation, then the duplicate is dropped and the existing component is
-    // returned). Returns T& (void for tag components). O(1) amortized.
-    // Invalidates pointers into T's pool if it is packed storage.
-    //
-    // During an iteration over T's pool, a tag add is refused after the
-    // violation report; a value add must produce a reference, so it reports
-    // and then PROCEEDS — at which point component references the running
-    // callback already holds (including its own parameters) may dangle.
-    // Record into a command_buffer instead.
+    // Adds T; the entity must not already have it (checked: the duplicate is
+    // dropped, the existing component returned). Returns T& (void for tags).
+    // O(1) amortized; invalidates pointers into packed storage. During an
+    // iteration over T's pool a tag add is refused; a value add must produce
+    // a reference, so it reports then PROCEEDS -- held component references
+    // may dangle. Record into a command_buffer instead.
     template <component T, class... Args>
     decltype(auto) add(entity e, Args&&... args)
     {
         auto& pool = ensure_pool<T>();
-        // Unconditional (all builds): adding through a dead, stale, or null
-        // handle would corrupt pool membership, and a reference must be
-        // produced — so this is fatal, matching replace().
+        // Fatal in all builds (matching replace()): a dead/stale/null handle
+        // would corrupt pool membership, and a reference must be produced.
         if (!table_.alive(e))
         {
             if constexpr (checks_enabled)
@@ -5763,7 +5468,7 @@ public:
         if constexpr (detail::is_tag_v<T>)
         {
             static_assert(sizeof...(Args) == 0,
-                          "quiver: T uses tag storage and carries no data; call add<T>(e) with "
+                          "ecs: T uses tag storage and carries no data; call add<T>(e) with "
                           "no arguments (or give T members / a non-tag storage policy)");
             if (clearing_ || e == dying_)  // a hook adding to a doomed entity
             {
@@ -5797,14 +5502,13 @@ public:
         else
         {
             static_assert(std::constructible_from<T, Args&&...>,
-                          "quiver: T cannot be constructed from these add() arguments (note: "
+                          "ecs: T cannot be constructed from these add() arguments (note: "
                           "passing a T value requires T to be move-constructible; non-movable "
                           "components must be constructed in place from constructor arguments)");
             if (clearing_ || e == dying_)
             {
-                // A hook adding a component to the entity being killed (or
-                // during reset) would leave a pool holding a dead entity:
-                // fatal in every build, like add through a dead handle.
+                // Would leave a pool holding a dead entity: fatal in every
+                // build, like add through a dead handle.
                 if constexpr (checks_enabled)
                 {
                     detail::violate_pool("add to a dying entity or during reset; pool",
@@ -5816,10 +5520,9 @@ public:
             {
                 if (pool.bond_locked())
                 {
-                    // Reported, then proceeds: a T& must be produced. The
-                    // running loop itself stays safe (it re-reads the dense
-                    // array each step), but previously fetched references die —
-                    // and on a bonded pool the partner's iteration order shifts.
+                    // Reported, then proceeds: a T& must be produced. The loop
+                    // itself stays safe, but previously fetched references die
+                    // and a bonded partner's iteration order shifts.
                     detail::violate_pool("add during iteration over pool (or its bonded partner)",
                                          pool.name());
                 }
@@ -5837,15 +5540,14 @@ public:
         }
     }
 
-    // Replaces the existing T by constructing a new value. The entity must
-    // have T (checked). Pointer-stable in every storage policy (the component
-    // is rebuilt in place). O(1).
+    // Replaces the existing T with a newly constructed value. The entity must
+    // have T (checked). Pointer-stable in every storage policy. O(1).
     template <component T, class... Args>
     T& replace(entity e, Args&&... args)
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: T uses tag storage and carries no data; there is nothing to "
-                      "replace — use has<T>/add<T>/remove<T>");
+                      "ecs: T uses tag storage and carries no data; there is nothing to "
+                      "replace -- use has<T>/add<T>/remove<T>");
         T* existing = lookup<T>(e);
         if (existing == nullptr)
         {
@@ -5869,20 +5571,17 @@ public:
         return *existing;
     }
 
-    // Mutates the existing T in place through fn(T&), then fires on_replace —
-    // the funnel for OBSERVED writes (plain get<T>() writes stay invisible to
-    // hooks and trackers by design; route the ones that matter through here).
-    // Mirrors replace's contract: the entity must have T (checked), pointer-
-    // stable in every storage policy, not structural, and therefore legal
-    // during iteration of T's pool — including on the entity currently
-    // visited. O(1) plus the callable.
+    // Mutates T in place through fn(T&), then fires on_replace -- the funnel
+    // for OBSERVED writes (plain get<T>() writes are invisible to hooks).
+    // Mirrors replace: entity must have T (checked), pointer-stable, not
+    // structural, so legal during iteration of T's pool. O(1) plus fn.
     template <component T, class F>
         requires std::invocable<F&, T&>
     T& amend(entity e, F&& fn)
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: T uses tag storage and carries no data; there is nothing to "
-                      "amend — use has<T>/add<T>/remove<T>");
+                      "ecs: T uses tag storage and carries no data; there is nothing to "
+                      "amend -- use has<T>/add<T>/remove<T>");
         T* existing = lookup<T>(e);
         if (existing == nullptr)
         {
@@ -5898,16 +5597,15 @@ public:
         return *existing;
     }
 
-    // Add-or-replace. Structural (and therefore iteration-locked, with add's
-    // report-then-proceed caveat) only when the component is actually added.
-    // O(1) amortized.
+    // Add-or-replace. Structural (with add's iteration rules) only when the
+    // component is actually added. O(1) amortized.
     template <component T, class... Args>
     decltype(auto) put(entity e, Args&&... args)
     {
         if constexpr (detail::is_tag_v<T>)
         {
             static_assert(sizeof...(Args) == 0,
-                          "quiver: T uses tag storage and carries no data; call put<T>(e) with "
+                          "ecs: T uses tag storage and carries no data; call put<T>(e) with "
                           "no arguments");
             if (!has<T>(e))
             {
@@ -5934,14 +5632,14 @@ public:
         }
     }
 
-    // Removes T if present; returns whether anything was removed. Removing
-    // from a stale handle is a checked violation (and removes nothing).
-    // Swap-remove: invalidates pointers into packed pools. O(1).
+    // Removes T if present; returns whether anything was removed. A stale
+    // handle is a checked violation (removes nothing). Swap-remove:
+    // invalidates pointers into packed pools. O(1).
     template <component T>
     bool remove(entity e)
     {
         static_assert(!std::same_as<T, kin>,
-                      "quiver: parent/child links are managed via adopt/orphan/kill");
+                      "ecs: parent/child links are managed via adopt/orphan/kill");
         if (!table_.alive(e))
         {
             if constexpr (checks_enabled)
@@ -5979,15 +5677,13 @@ public:
         return probe<T>(e.index());
     }
 
-    // True when e is alive and has EVERY listed component — the multi-type
-    // spelling of has (which stays the one-type form). Tags are legal:
-    // membership is exactly what they are. Safe on any handle; one liveness
-    // check, then one pool probe per type. O(types).
+    // True when e is alive and has EVERY listed component. Tags are legal.
+    // Safe on any handle. O(types).
     template <component T, component U, component... Rest>
     [[nodiscard]] bool has_all(entity e) const noexcept
     {
         static_assert(detail::all_distinct<T, U, Rest...>,
-                      "quiver: duplicate component type in has_all<...>");
+                      "ecs: duplicate component type in has_all<...>");
         if (!table_.alive(e))
         {
             return false;
@@ -5996,12 +5692,12 @@ public:
     }
 
     // True when e is alive and has AT LEAST ONE listed component. Same
-    // contract as has_all; short-circuits on the first hit. O(types).
+    // contract as has_all; short-circuits. O(types).
     template <component T, component U, component... Rest>
     [[nodiscard]] bool has_any(entity e) const noexcept
     {
         static_assert(detail::all_distinct<T, U, Rest...>,
-                      "quiver: duplicate component type in has_any<...>");
+                      "ecs: duplicate component type in has_any<...>");
         if (!table_.alive(e))
         {
             return false;
@@ -6015,7 +5711,7 @@ public:
     [[nodiscard]] auto& get(this Self&& self, entity e)
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: T uses tag storage and carries no data; use has<T>(e)");
+                      "ecs: T uses tag storage and carries no data; use has<T>(e)");
         auto* p = self.template lookup<T>(e);  // T* or const T* per Self
         if constexpr (checks_enabled)
         {
@@ -6031,9 +5727,8 @@ public:
         return *p;
     }
 
-    // Multi-component point lookup with structured bindings:
-    //   auto [t, v] = world.get<Transform, Velocity>(e);
-    // Each component keeps single-get's checked contract. O(types).
+    // Multi-component point lookup (structured bindings); each component
+    // keeps single-get's checked contract. O(types).
     template <component T, component U, component... Rest, class Self>
     [[nodiscard]] auto get(this Self&& self, entity e)
     {
@@ -6048,7 +5743,7 @@ public:
     [[nodiscard]] auto* find(this Self&& self, entity e) noexcept
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: T uses tag storage and carries no data; use has<T>(e)");
+                      "ecs: T uses tag storage and carries no data; use has<T>(e)");
         return self.template lookup<T>(e);
     }
 
@@ -6069,9 +5764,7 @@ public:
                    self.template find_in_pool<Rest>(e)...};
     }
 
-    // Get-or-add, completing the verb matrix (add = insert, put = upsert,
-    // replace = update, obtain = get-or-insert): returns the existing T, or
-    // adds one constructed from args. The lazily-attached-state idiom.
+    // Get-or-add: returns the existing T, or adds one constructed from args.
     // O(1) amortized; add's iteration rules apply only when it actually adds.
     template <component T, class... Args>
     decltype(auto) obtain(entity e, Args&&... args)
@@ -6079,7 +5772,7 @@ public:
         if constexpr (detail::is_tag_v<T>)
         {
             static_assert(sizeof...(Args) == 0,
-                          "quiver: T uses tag storage and carries no data; call obtain<T>(e) "
+                          "ecs: T uses tag storage and carries no data; call obtain<T>(e) "
                           "with no arguments");
             if (!has<T>(e))
             {
@@ -6096,14 +5789,14 @@ public:
         }
     }
 
-    // Destroys every T in the world. O(count of T). The pool object survives (selections stay
-    // valid) but its contents and capacity may be released. Stable-storage
-    // pointer stability ends here.
+    // Destroys every T in the world, O(count of T). The pool object survives
+    // (selections stay valid) but contents and capacity may be released;
+    // stable-storage pointer stability ends here.
     template <component T>
     void purge()
     {
         static_assert(!std::same_as<T, kin>,
-                      "quiver: parent/child links are managed via adopt/orphan/kill");
+                      "ecs: parent/child links are managed via adopt/orphan/kill");
         auto* pool = peek_pool<T>();
         if (pool == nullptr)
         {
@@ -6131,16 +5824,12 @@ public:
         ensure_pool<T>().reserve(n);
     }
 
-    // Reorders T's pool — the dense order selections, snapshots, and range()
-    // iterate in. cmp compares component values (const T&, const T&) or
-    // entities (entity, entity); the value form wins when both bind. The
-    // optional algorithm is called as algo(first, last, cmp) over a random-
-    // access range of dense positions and must permute it exactly as a
-    // comparison sort would (std::stable_sort qualifies; default std::sort).
-    // Cold: O(n log n) plus one scratch allocation; refused while T's pool is
-    // being iterated. Packed pools swap components, so outstanding T* die;
-    // stable pools permute bookkeeping only, so component pointers survive
-    // sorting.
+    // Reorders T's pool (the dense order selections, snapshots, and range()
+    // iterate in). cmp compares values (const T&, const T&) or entities; the
+    // value form wins when both bind. Optional algo(first, last, cmp) must
+    // permute like a comparison sort (default std::sort). Cold, O(n log n)
+    // plus one scratch allocation; refused while T's pool iterates. Packed
+    // T* die; stable pools keep component pointers.
     template <component T, class Compare, class Algorithm = detail::std_sort>
     void sort(Compare cmp, Algorithm&& algo = {})
     {
@@ -6149,15 +5838,14 @@ public:
         {
             return;
         }
-        // Refused in EVERY build: reordering one owner of a bond would
-        // silently break the mirrored partition. Order the partition itself
-        // with bonded(...).sort(...), or unbond first.
+        // Refused in EVERY build: reordering a bond owner breaks the mirrored
+        // partition. Use bonded(...).sort(...), or unbond first.
         if (pool->bond() != nullptr)
         {
             if constexpr (checks_enabled)
             {
                 detail::violate_pool(
-                    "sort on an owned (bonded) pool — use bonded(...).sort(...) for "
+                    "sort on an owned (bonded) pool -- use bonded(...).sort(...) for "
                     "in-partition order, or unbond first; pool",
                     pool->name());
             }
@@ -6187,24 +5875,21 @@ public:
         else
         {
             static_assert(std::invocable<Compare&, entity, entity>,
-                          "quiver: sort<T> comparator must be callable as (const T&, const T&) "
+                          "ecs: sort<T> comparator must be callable as (const T&, const T&) "
                           "for value sorting (non-tag components only) or as (entity, entity)");
         }
     }
 
     // Reorders Follow's pool so entities shared with Lead appear in Lead's
-    // dense order (non-shared entities end up after them, order unspecified).
-    // The opt-in locality optimization: after pairing, iterating
-    // select<Lead, Follow> driving from Lead touches Follow's payload
-    // near-linearly. One-shot — no standing coupling between the pools;
-    // re-run after churn if a profile says so. Cold, O(size of Lead).
-    // Refused while Follow's pool iterates. Packed Follow pointers die;
-    // stable Follow pointers survive.
+    // dense order (non-shared ones after, order unspecified) -- the opt-in
+    // locality optimization for select<Lead, Follow>. One-shot, no standing
+    // coupling; re-run after churn. Cold, O(size of Lead); refused while
+    // Follow's pool iterates. Packed Follow pointers die; stable survive.
     template <component Follow, component Lead>
     void sort_along()
     {
         static_assert(!std::same_as<Follow, Lead>,
-                      "quiver: sort_along needs two different component types");
+                      "ecs: sort_along needs two different component types");
         auto* follow = peek_pool<Follow>();
         const auto* lead = peek_pool<Lead>();
         if (follow == nullptr || lead == nullptr || follow->size() < 2)
@@ -6252,32 +5937,31 @@ public:
     // --------------------------------------------------------- bonded pools
     //
     // See the bonded_view block for the contract. bond() builds the partition
-    // over existing members (O(|first| · owners)); from then on every
-    // add/remove maintains it with one O(1) mirrored swap per owner. Calling
-    // bond<Ts...>() again for the same standing owned set (any order) is
-    // idempotent and just returns a view. Overlapping or nested owned sets
-    // are refused: one partition owner per pool, no exceptions.
+    // over existing members (O(|first| * owners)); afterwards every add/
+    // remove maintains it with one O(1) mirrored swap per owner. Re-bonding
+    // the same owned set (any order) is idempotent and returns a view;
+    // overlapping or nested owned sets are refused.
 
     template <class... Ts>  // const-qualify for read-only payload parts
         requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
     basic_bonded_view<Traits, except<>, Ts...> bond()
     {
         static_assert(detail::all_distinct<detail::bare<Ts>...>,
-                      "quiver: duplicate component type in bond<...>");
+                      "ecs: duplicate component type in bond<...>");
         static_assert((!detail::is_maybe_v<detail::bare<Ts>> && ...),
-                      "quiver: maybe<> marks optional selection parts and cannot be bonded");
+                      "ecs: maybe<> marks optional selection parts and cannot be bonded");
         static_assert((!detail::is_any_of_v<detail::bare<Ts>> && ...),
-                      "quiver: bonds own pools, not alternatives — any_of<> belongs in select");
-        // derived_from, not same_as: custom pools derived from the packed
-        // built-in swap exactly the same way and need the same wall.
+                      "ecs: bonds own pools, not alternatives -- any_of<> belongs in select");
+        // derived_from, not same_as: packed-derived custom pools swap the
+        // same way and need the same wall.
         static_assert(((!std::derived_from<pool_of_t<detail::bare<Ts>>,
                                            detail::packed_pool<detail::bare<Ts>, Traits>> ||
                         std::is_swappable_v<detail::bare<Ts>>) &&
                        ...),
-                      "quiver: bonded packed pools swap components to maintain the partition; "
+                      "ecs: bonded packed pools swap components to maintain the partition; "
                       "make every packed side swappable or store it in stable storage");
         static_assert(sizeof...(Ts) <= group_core::max_owners,
-                      "quiver: a bond spans at most group_core::max_owners (8) pools");
+                      "ecs: a bond spans at most group_core::max_owners (8) pools");
         const std::array<pool_base*, sizeof...(Ts)> pools{&ensure_pool<detail::bare<Ts>>()...};
         // Idempotent for the SAME standing owned set, in any order.
         if (group_core* standing = pools[0]->bond_;
@@ -6363,9 +6047,9 @@ public:
         return bonded<Ts...>();
     }
 
-    // Dissolves the bond; every owner keeps its current order. Stored views
-    // read as empty from here on (the bond object is tombstoned, not freed).
-    // The full owned set names the group, in any order.
+    // Dissolves the bond; owners keep their current order. Stored views read
+    // as empty (the bond is tombstoned, not freed). Name the full owned set,
+    // in any order.
     template <class... Ts>
         requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
     bool unbond()
@@ -6399,9 +6083,8 @@ public:
 
     // The standing bond's view. Plain-listed types must be the FULL owned
     // set, in any order; maybe<>-marked types are OBSERVED extras probed per
-    // row (T* parts, null when absent — partition membership does not imply
-    // observed membership); except<> filters rows. Without a standing bond
-    // over exactly the plain-listed set: checked violation, empty view.
+    // row (T* parts, null when absent); except<> filters rows. Without a
+    // standing bond over exactly that set: checked violation, empty view.
     template <class... Ts, class... Xs>
         requires(sizeof...(Ts) >= 2)
     [[nodiscard]] basic_bonded_view<Traits, except<Xs...>, Ts...> bonded(except<Xs...>)
@@ -6490,8 +6173,7 @@ public:
     }
 
     // Member function (or instance-first callable) bound to an instance that
-    // must outlive the hook. A const instance requires a const-invocable
-    // candidate — enforced at compile time.
+    // must outlive the hook; const instances need const-invocable candidates.
     template <component T, auto Candidate, class Inst>
     hook_token on_add(Inst* instance)
     {
@@ -6503,7 +6185,7 @@ public:
     }
 
     // Fires before the component is destroyed (remove, kill, purge, reset,
-    // command-buffer replay — but not world destruction).
+    // command-buffer replay -- but not world destruction).
     template <component T>
     hook_token on_remove(component_hook fn, void* user = nullptr)
     {
@@ -6527,14 +6209,13 @@ public:
             const_cast<void*>(static_cast<const void*>(instance)));
     }
 
-    // Fires after replace<T> or the replacing half of put<T>. Writing through
-    // get()/find()/iteration references is invisible to hooks by design — if
-    // you want observed writes, funnel them through replace/put.
+    // Fires after replace<T> or the replacing half of put<T>. Writes through
+    // get()/find()/iteration references are invisible to hooks by design.
     template <component T>
     hook_token on_replace(component_hook fn, void* user = nullptr)
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: tags carry no data and are never replaced; use on_add/on_remove");
+                      "ecs: tags carry no data and are never replaced; use on_add/on_remove");
         return connect_hook<T>(pool_base::hook_kind::replace, fn, user);
     }
 
@@ -6542,7 +6223,7 @@ public:
     hook_token on_replace()
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: tags carry no data and are never replaced; use on_add/on_remove");
+                      "ecs: tags carry no data and are never replaced; use on_add/on_remove");
         return connect_hook<T>(
             pool_base::hook_kind::replace, detail::free_hook_thunk<Traits, Candidate>(), nullptr);
     }
@@ -6551,7 +6232,7 @@ public:
     hook_token on_replace(Inst* instance)
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: tags carry no data and are never replaced; use on_add/on_remove");
+                      "ecs: tags carry no data and are never replaced; use on_add/on_remove");
         return connect_hook<T>(
             pool_base::hook_kind::replace,
             detail::bound_hook_thunk<Traits, Candidate, Inst>(),
@@ -6581,11 +6262,9 @@ public:
 
     // --------------------------------------------------------------- queries
 
-    // Builds a selection. Mark types const for read-only access. On a
-    // non-const world missing pools are created; on a const world the
-    // selection comes back all-const, and a missing pool yields an empty
-    // selection instead (no entity has that component). One deduced-this body
-    // serves both.
+    // Builds a selection; mark types const for read-only access. Non-const
+    // worlds create missing pools; const worlds yield all-const selections,
+    // where a missing pool reads as empty. One deduced-this body serves both.
     template <class... Ts, class Self>
     [[nodiscard]] auto select(this Self&& self)
     {
@@ -6597,8 +6276,7 @@ public:
     {
         if constexpr (std::is_const_v<std::remove_reference_t<Self>>)
         {
-            // The typename is required here: a dependent template argument is
-            // not one of C++20's typename-optional contexts.
+            // Dependent template argument: not a typename-optional context.
             // NOLINTNEXTLINE(readability-redundant-typename)
             using result =
                 basic_selection<Traits, except<Xs...>, typename detail::as_const_part<Ts>::type...>;
@@ -6609,17 +6287,15 @@ public:
         else
         {
             using result = basic_selection<Traits, except<Xs...>, Ts...>;
-            // maybe<T> contributes its inner type's pool, any_of<As...> one
-            // pool per alternative; registering keeps the selection's pointer
-            // array complete (a never-added member stays empty).
+            // maybe<T> contributes its inner pool, any_of<As...> one per
+            // alternative; registering keeps the pointer array complete.
             return result{self.template flat_include_pools<Ts...>(),
                           {&self.template ensure_pool<Xs>()...}};
         }
     }
 
-    // Manifest forms: build the same queries from a types<> list, so
-    // component sets named once (using Movers = types<Transform, Velocity>)
-    // drive selections, archives, and tools alike.
+    // Manifest forms: the same queries from a types<> list, so a component
+    // set named once drives selections, archives, and tools alike.
     template <class... Ts, class... Xs, class Self>
     [[nodiscard]] auto select(this Self&& self, types<Ts...>, except<Xs...> x)
     {
@@ -6659,11 +6335,10 @@ public:
 
     // -------------------------------------------------------- command buffer
 
-    // O(recorded ops). Replays a buffer: provisional spawns become real entities first (in
-    // recording order), then every op runs in recording order, each gated on
-    // its target being alive at that moment (dead targets are skipped and
-    // counted). The buffer is cleared and ready for reuse afterwards.
-    // Checked builds refuse to apply while any iteration is running.
+    // Replays a buffer: every op runs in recording order, gated on its target
+    // being alive (dead targets are skipped and counted); the buffer is
+    // cleared for reuse. O(recorded ops). Checked builds refuse to apply
+    // while any iteration is running.
     apply_result apply(command_buffer& buffer)
     {
         if (!apply_allowed())
@@ -6675,15 +6350,14 @@ public:
         return result;
     }
 
-    // Like apply(buffer), and additionally reports what each deferred spawn
-    // became: on_spawn(provisional, real) is invoked once per cmd.spawn(), in
-    // recording order, before the buffer is cleared. For rollback/replay and
-    // spawn-acknowledgement systems that need the mapping.
+    // Like apply(buffer), additionally reporting what each deferred spawn
+    // became: on_spawn(provisional, real) once per cmd.spawn(), in recording
+    // order, before the buffer is cleared.
     template <class F>
     apply_result apply(command_buffer& buffer, F&& on_spawn)
     {
         static_assert(std::invocable<F&, entity, entity>,
-                      "quiver: the apply() spawn callback must be callable as "
+                      "ecs: the apply() spawn callback must be callable as "
                       "(entity provisional, entity real)");
         if (!apply_allowed())
         {
@@ -6707,10 +6381,9 @@ public:
 
     // ---------------------------------------------------------- relationships
     //
-    // Optional, minimal parent/child links: no transform propagation, no scene
-    // graph. Destroying an entity unlinks it (its children become parentless
-    // roots; nothing else is destroyed — use a command_buffer if you want
-    // recursive destruction).
+    // Optional, minimal parent/child links: no transform propagation, no
+    // scene graph. Destroying an entity unlinks it; children become
+    // parentless roots (use a command_buffer for recursive destruction).
 
     // Makes child a child of parent (re-parenting if it already had one).
     // O(1) (checked builds add an O(depth) ancestor walk to refuse cycles).
@@ -6818,10 +6491,9 @@ public:
         return k == nullptr ? no_entity : k->parent;
     }
 
-    // Visits direct children (newest first), O(children). fn may return bool
-    // to stop early.
-    // Structural link edits (adopt/orphan/kill of a linked entity) are blocked
-    // while this runs.
+    // Visits direct children (newest first), O(children); fn may return bool
+    // to stop early. Link edits (adopt/orphan/kill of a linked entity) are
+    // blocked while this runs.
     template <class F>
     void children_of(entity parent, F&& fn) const
     {
@@ -6864,15 +6536,13 @@ public:
 
     // -------------------------------------------------------------- snapshot
     //
-    // quiver does not serialize; it gives you deterministic primitives to
-    // build save/load, rollback, or replay on top:
-    //   - live_entities() walks live handles in slot order (stable),
-    //   - selections iterate in dense order (stable between structural edits),
-    //   - restore_entity() re-creates an exact handle in a fresh/loading world,
-    //     after which add<T> repopulates components.
+    // ecs does not serialize; it gives deterministic primitives for save/
+    // load, rollback, or replay: live_entities() walks slot order,
+    // selections iterate dense order (stable between structural edits), and
+    // restore_entity() re-creates exact handles in a fresh world.
 
-    // Visits every live entity in increasing slot order, O(slots). fn may return bool to
-    // stop early.
+    // Visits every live entity in increasing slot order, O(slots); fn may
+    // return bool to stop early.
     template <class F>
     void live_entities(F&& fn) const
     {
@@ -6897,24 +6567,19 @@ public:
         }
     }
 
-    // Re-creates an entity with an exact index and generation. Errors (rather
-    // than asserts: this is the load path, and load data is untrusted) when
-    // the handle is malformed or the slot is occupied by a live entity.
-    // O(1) amortized, plus table growth up to the requested index — validate
-    // indices against your expected world size before feeding hostile data in.
-    // Restoring a generation lower than the slot has seen is the rollback
-    // semantic: handles issued after the snapshot may then alias new entities,
-    // so discard them.
+    // Re-creates an entity with an exact index and generation. Errors (not
+    // asserts: load data is untrusted) on malformed handles or occupied
+    // slots. O(1) amortized plus table growth up to the index -- bound
+    // indices before feeding hostile data in. Restoring a lower generation
+    // is the rollback semantic: discard handles issued after the snapshot.
     std::expected<entity, fault> restore_entity(entity e) { return table_.restore(e); }
 
     // ------------------------------------------------------------- world ops
 
-    // Destroys all components and entities, O(everything). Generations are preserved and
-    // bumped, so pre-reset handles read as dead rather than aliasing new
-    // entities. Pools and selections built on them remain usable (empty).
-    // Hooks and their tokens survive; on_remove fires per live component
-    // during the reset, and hook ADDS during it are refused (the entities
-    // are about to die).
+    // Destroys all components and entities, O(everything). Generations are
+    // bumped, so pre-reset handles read as dead rather than aliasing. Pools,
+    // selections, hooks, and tokens survive; on_remove fires per live
+    // component, and hook ADDS during the reset are refused.
     void reset()
     {
         if constexpr (checks_enabled)
@@ -6925,9 +6590,8 @@ public:
                 return;
             }
         }
-        // Partitions zero BEFORE the wipes: every intersection is doomed, and
-        // an on_remove hook fired mid-reset that reads a bonded view must see
-        // it empty, not a stale partition over an already-wiped partner.
+        // Partitions zero BEFORE the wipes: an on_remove hook reading a
+        // bonded view mid-reset must see it empty, not a stale partition.
         // Bonds survive reset, like hooks; repopulation re-pairs.
         for (const auto& bond : bonds_)
         {
@@ -6945,9 +6609,8 @@ public:
         table_.destroy_all();
     }
 
-    // Returns slack memory. Stable-storage pointers survive (chunks are never
-    // freed), but packed pools may reallocate their dense arrays: treat every
-    // outstanding pointer into a packed pool as invalidated. O(everything).
+    // Returns slack memory, O(everything). Stable-storage pointers survive;
+    // packed pools may reallocate, invalidating outstanding pointers.
     void shrink()
     {
         if constexpr (checks_enabled)
@@ -6965,14 +6628,14 @@ public:
         table_.shrink();
     }
 
-    // Total slots ever allocated (live + recycled). For "how many entities
-    // exist", use live_count().
+    // Total slots ever allocated (live + recycled); live_count() counts
+    // existing entities.
     [[nodiscard]] std::size_t slot_count() const noexcept { return table_.slots(); }
     [[nodiscard]] std::size_t live_count() const noexcept { return table_.live(); }
     [[nodiscard]] std::size_t capacity() const noexcept { return table_.capacity(); }
 
-    // Visits a pool_info per registered pool, O(pools) — enough for an editor overlay or
-    // a stats HUD, with no RTTI and no reflection.
+    // Visits a pool_info per registered pool, O(pools) -- enough for an
+    // editor overlay or stats HUD, no RTTI needed.
     template <class F>
     void each_pool(F&& fn) const
     {
@@ -6982,9 +6645,8 @@ public:
         }
     }
 
-    // The other inspector axis: which components does THIS entity have?
-    // Visits a pool_info per pool containing e, O(pools this world uses).
-    // Feeds entity-inspector overlays and debug dumps.
+    // The other inspector axis: visits a pool_info per pool containing e,
+    // O(pools this world uses).
     template <class F>
     void components_of(entity e, F&& fn) const
     {
@@ -7001,8 +6663,8 @@ public:
         }
     }
 
-    // Aggregated memory accounting, O(pools). Counts capacity (allocated),
-    // not size (used) — that is what a budget dashboard needs.
+    // Aggregated memory accounting, O(pools); counts capacity (allocated),
+    // not size (used).
     [[nodiscard]] memory_footprint footprint() const noexcept
     {
         memory_footprint f{};
@@ -7032,8 +6694,8 @@ public:
         return pool_ref{type_id < pools_.size() ? pools_[type_id].get() : nullptr};
     }
 
-    // By stable name hash (hash_of<T>(), as seen in pool_info::name_hash) —
-    // the form save files and tools should persist. O(pools this world uses).
+    // By stable name hash (hash_of<T>(), pool_info::name_hash) -- the form
+    // save files and tools should persist. O(pools this world uses).
     [[nodiscard]] pool_ref find_pool_by_hash(std::uint64_t name_hash) const noexcept
     {
         for (const pool_base* pool : active_)
@@ -7046,9 +6708,8 @@ public:
         return {};
     }
 
-    // Full consistency audit: entity table bookkeeping, every pool's
-    // sparse/dense mapping, stable pools' slot accounting, parent/child link
-    // integrity. O(everything); meant for tests, asserts, and tools.
+    // Full consistency audit: table bookkeeping, sparse/dense mappings, slot
+    // accounting, link integrity. O(everything); for tests and tools.
     [[nodiscard]] std::expected<void, fault> validate() const
     {
         if (auto r = table_.check(); !r)
@@ -7080,8 +6741,7 @@ private:
     friend class basic_scoped_hook;  // resolves its pool anchor through the token
 
     // The pool a hook token belongs to; null for empty/stale tokens. Pools
-    // are heap-stable for the world's life, so the pointer survives world
-    // moves (the connections move with the pools).
+    // are heap-stable for the world's life: the pointer survives world moves.
     [[nodiscard]] pool_base* pool_for_token(hook_token token) noexcept
     {
         if (!token || token.pool >= pools_.size() || !pools_[token.pool])
@@ -7107,9 +6767,9 @@ private:
     pool_of_t<T>& ensure_pool()
     {
         static_assert(component_pool<pool_of_t<T>, Traits>,
-                      "quiver: pool_of<T> specializations must derive quiver::basic_pool (via "
+                      "ecs: pool_of<T> specializations must derive ecs::basic_pool (via "
                       "packed_pool_of / stable_pool_of / tag_pool_of, or from scratch) and "
-                      "construct from a std::pmr::memory_resource* — see the pool_of seam "
+                      "construct from a std::pmr::memory_resource* -- see the pool_of seam "
                       "block");
         const std::uint32_t id = detail::type_id<T>();
         if (id >= pools_.size())
@@ -7140,8 +6800,7 @@ private:
         return static_cast<pool_of_t<T>&>(*pools_[id]);
     }
 
-    // Never registers; null when the world has not seen T. Safe on const
-    // worlds and in hot paths.
+    // Never registers; null when the world has not seen T.
     template <component T>
     [[nodiscard]] pool_of_t<T>* peek_pool() const noexcept
     {
@@ -7261,7 +6920,7 @@ private:
     [[nodiscard]] auto* find_in_pool(this Self&& self, entity e) noexcept
     {
         static_assert(!detail::is_tag_v<T>,
-                      "quiver: T uses tag storage and carries no data; use has<T>(e)");
+                      "ecs: T uses tag storage and carries no data; use has<T>(e)");
         using pointer =
             std::conditional_t<std::is_const_v<std::remove_reference_t<Self>>, const T*, T*>;
         auto* pool = self.template peek_pool<T>();
@@ -7341,22 +7000,18 @@ private:
         return true;
     }
 
-    // Replays the buffer without clearing it: every op runs in recording
-    // order, gated on a generation-checked alive(target); provisional spawns
-    // resolve to real entities on encounter (recording order guarantees a
-    // spawn precedes every op that uses its handle, and tickets are issued
-    // in append order, so lazy resolution stays exact). Callers clear()
-    // afterwards.
+    // Replays the buffer without clearing it: ops run in recording order,
+    // gated on a generation-checked alive(target); provisional spawns resolve
+    // on encounter (recording order makes lazy resolution exact). Callers
+    // clear() afterwards.
     apply_result apply_replay(command_buffer& buffer)
     {
         buffer.resolved_.clear();
         apply_result result{};
-        // Index loop, ops copied out by value: a hook fired by an applied op
-        // may legally record MORE ops into this same buffer (the documented
-        // escape hatch for structural work from hooks) — they replay in this
-        // same pass, and the caller's terminal clear() destroys exactly what
-        // ran. Payload pointers stay valid throughout (the arena never
-        // relocates).
+        // Index loop, ops copied by value: a hook may legally record MORE ops
+        // into this buffer (the escape hatch for structural work from hooks);
+        // they replay in this same pass. Payload pointers stay valid (the
+        // arena never relocates).
         for (std::size_t i = 0; i < buffer.ops_.size(); ++i)
         {
             const command_buffer::op o = buffer.ops_[i];
@@ -7369,9 +7024,9 @@ private:
             }
             if (detail::is_provisional(target))
             {
-                // The nonce stamped into the handle must match the applying
-                // buffer: handles from another buffer, or recorded before a
-                // clear(), are refused rather than silently mis-resolved.
+                // The handle's nonce must match this buffer: handles from
+                // another buffer or from before clear() are refused, not
+                // silently mis-resolved.
                 const auto ticket =
                     static_cast<index_type>(target.index() & ~limits::provisional_bit);
                 if (target.generation() != buffer.nonce_ || ticket >= buffer.resolved_.size())
@@ -7486,10 +7141,8 @@ private:
 
     entity_table table_;
     std::pmr::vector<std::unique_ptr<pool_base>> pools_;  // indexed by type_id (holes ok)
-    // Dense, creation-order view of the same pools. The pools_ vector is sized
-    // by the largest process-global type id this world has touched, so worlds
-    // in multi-world processes carry null holes there; every O(pools) walk
-    // (kill, apply, reset, shrink, each_pool, validate) uses this list instead.
+    // Dense, creation-order view of the same pools (pools_ may carry null
+    // holes in multi-world processes); every O(pools) walk uses this list.
     std::pmr::vector<pool_base*> active_;
     // Bond objects are heap-stable for the life of the world; unbond
     // tombstones instead of freeing so stored bonded_views degrade to empty.
@@ -7510,13 +7163,11 @@ using const_entity_ref = basic_entity_ref<const world>;
 // ----------------------------------------------------------------------------
 // Scoped hooks
 //
-// RAII over a hook_token: disconnects on destruction, so a system object can
-// own its hook connections without manual teardown. Move-only. Anchored to
-// the POOL (heap-stable for the world's life), not the world object — so the
-// connection releases correctly even after the world is moved elsewhere.
-// Releasing while the pool iterates (including from inside the hook's own
-// dispatch) is refused with a violation and the token is KEPT: release again
-// after the iteration ends, or let a later destructor do it.
+// RAII over a hook_token: disconnects on destruction. Move-only. Anchored to
+// the POOL (heap-stable for the world's life), not the world object, so the
+// connection releases correctly after world moves. Releasing while the pool
+// iterates (including from inside the hook's own dispatch) is refused and the
+// token is KEPT for a later retry.
 // ----------------------------------------------------------------------------
 
 template <class Traits>
@@ -7589,24 +7240,14 @@ using scoped_hook = basic_scoped_hook<default_entity_traits>;
 // ----------------------------------------------------------------------------
 // Trackers
 //
-// A tracker collects the entities whose T changed since the last drain —
-// added, replaced (via replace/put), removed — deduplicated, in event order.
-// The drain pattern, run once per frame by whatever system cares:
-//
-//   quiver::tracker<Health> hurt(world);          // connect once
-//   ...
-//   for (quiver::entity e : hurt.replaced()) { ui.popup(e); }
-//   hurt.clear();
-//
-// removed() may hold dead handles (kill destroys the entity after the hook
-// fires); that is information, not an error — alive()-filter if needed. An
-// entity added then removed before a drain appears in both lists. Between
-// drains a recycled slot keeps only the LIVE successor in added()/replaced()
-// (the dead predecessor's events are moot), while removed() keeps every
-// distinct entity's record. On tag components the replaced channel is inert
-// (tags carry no data and are never replaced). Trackers are pinned (the
-// hooks hold a pointer to the tracker) and must be destroyed before their
-// world.
+// Collects the entities whose T changed since the last drain -- added,
+// replaced (via replace/put), removed -- deduplicated, in event order. Read
+// the lists, then clear(), once per frame. removed() may hold dead handles
+// (kill fires the hook first); added-then-removed appears in both lists.
+// Between drains a recycled slot keeps only the LIVE successor in added()/
+// replaced(), while removed() keeps every distinct entity's record. The
+// replaced channel is inert for tags. Trackers are pinned (hooks hold a
+// pointer to the tracker); destroy them before their world.
 // ----------------------------------------------------------------------------
 
 enum class track : std::uint8_t
@@ -7633,7 +7274,7 @@ enum class track : std::uint8_t
 template <component T, class Traits = default_entity_traits>
 class tracker
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using world = basic_world<Traits>;
     using scoped_hook = basic_scoped_hook<Traits>;
 
@@ -7710,10 +7351,9 @@ private:
         const auto pos = seen.get(e.index());
         if (pos != detail::entity_limits<Traits>::npos)
         {
-            // Slot recycled before a drain. For added/replaced the live
-            // successor wins (the predecessor's event is moot once it died);
-            // for removed() history matters — a DISTINCT entity's removal
-            // must not erase its predecessor's, so it appends instead.
+            // Slot recycled before a drain: for added/replaced the live
+            // successor wins; for removed() a DISTINCT entity's removal must
+            // not erase its predecessor's, so it appends instead.
             if (!keep_history || list[pos] == e)
             {
                 list[pos] = e;
@@ -7749,29 +7389,18 @@ private:
 // ----------------------------------------------------------------------------
 // Watchers
 //
-// A watcher monitors a CONDITION SET — entities holding every component in
-// its types<> list and none in its except<> list — and collects,
-// deduplicated, the entities that BEGAN matching since the last drain (and,
-// with changed<C> triggers, those whose C was replaced through
-// replace/put/amend WHILE matching). Entities that stop matching before the
-// drain are evicted, so matched() is live truth at drain time. That is the
-// deliberate divergence from the tracker: tracker<T> is a per-pool event
-// log whose removed() keeps history; a watcher is a membership monitor.
-//
-//   quiver::watcher<quiver::types<Burning, Health>> entered(world);
-//   quiver::watcher<quiver::types<Burning>, quiver::except<Shielded>> raw(world);
-//   quiver::watcher<quiver::types<Burning>, quiver::changed<Health>> hurt(world);
-//   for (quiver::entity e : hurt.matched()) { ... }
-//   hurt.clear();
-//
-// Watchers see EDGES: members that predate construction do not enter until
-// a fresh edge re-collects them. Only the named pools gain hook entries
-// (untouched pools keep their one-pointer test); watchers are pinned (the
-// hooks hold `this`) and must be destroyed before their world.
+// Monitors a CONDITION SET -- entities holding every component in types<>
+// and none in except<> -- and collects, deduplicated, those that BEGAN
+// matching since the last drain (changed<C>: also those whose C was replaced
+// via replace/put/amend WHILE matching). Entities that stop matching are
+// evicted, so matched() is live truth at drain time -- a membership monitor,
+// unlike the tracker's event log. Watchers see EDGES: members predating
+// construction stay out until a fresh edge re-collects them. Pinned (hooks
+// hold `this`); destroy before the world.
 // ----------------------------------------------------------------------------
 
-// Trigger marker: collect entities whose T was replaced (via
-// replace/put/amend) while the watcher's condition set held.
+// Trigger marker: collect entities whose T was replaced while the watcher's
+// condition set held.
 template <class T>
 struct changed
 {
@@ -7840,8 +7469,8 @@ template <class... Is>
 struct watcher_conditions_ok<types<Is...>>
 {
     static_assert((component<Is> && ...),
-                  "quiver: watcher condition types must be plain, non-const component types");
-    static_assert(all_distinct<Is...>, "quiver: duplicate component type in a watcher list");
+                  "ecs: watcher condition types must be plain, non-const component types");
+    static_assert(all_distinct<Is...>, "ecs: duplicate component type in a watcher list");
     static constexpr bool value = true;
 };
 
@@ -7852,11 +7481,11 @@ template <class... Cs>
 struct watcher_triggers_ok<types<Cs...>>
 {
     static_assert((component<Cs> && ...),
-                  "quiver: changed<T> takes a plain, non-const component type");
+                  "ecs: changed<T> takes a plain, non-const component type");
     static_assert((!is_tag_v<Cs> && ...),
-                  "quiver: changed<T> on a tag is inert — tags carry no data and are never "
+                  "ecs: changed<T> on a tag is inert -- tags carry no data and are never "
                   "replaced");
-    static_assert(all_distinct<Cs...>, "quiver: duplicate changed<> trigger");
+    static_assert(all_distinct<Cs...>, "ecs: duplicate changed<> trigger");
     static constexpr bool value = true;
 };
 }  // namespace detail
@@ -7864,22 +7493,22 @@ struct watcher_triggers_ok<types<Cs...>>
 template <class Traits, class... Specs>
 class basic_watcher
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     using world = basic_world<Traits>;
     using scoped_hook = basic_scoped_hook<Traits>;
     using watcher = basic_watcher;  // the historical body spelling
 
     static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_includes}) ==
                       1,
-                  "quiver: a watcher takes exactly one types<...> condition list");
+                  "ecs: a watcher takes exactly one types<...> condition list");
     static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_excludes}) <=
                       1,
-                  "quiver: at most one except<...> list per watcher");
+                  "ecs: at most one except<...> list per watcher");
     static_assert(((detail::watcher_spec<Specs>::is_includes ||
                     detail::watcher_spec<Specs>::is_excludes ||
                     detail::watcher_spec<Specs>::is_trigger) &&
                    ...),
-                  "quiver: watcher specs are types<...>, except<...>, and changed<T>");
+                  "ecs: watcher specs are types<...>, except<...>, and changed<T>");
 
     using include_list = joined_t<std::conditional_t<detail::watcher_spec<Specs>::is_includes,
                                                      typename detail::watcher_spec<Specs>::list,
@@ -7892,12 +7521,12 @@ class basic_watcher
                                                      types<>>...>;
 
     static_assert(detail::list_size<include_list>::value >= 1,
-                  "quiver: a watcher needs at least one condition component");
+                  "ecs: a watcher needs at least one condition component");
     static_assert(detail::watcher_conditions_ok<include_list>::value);
     static_assert(detail::watcher_conditions_ok<exclude_list>::value);
     static_assert(detail::watcher_triggers_ok<trigger_list>::value);
     static_assert(detail::lists_disjoint<include_list, exclude_list>::value,
-                  "quiver: a component type appears in both the watcher's types<...> and "
+                  "ecs: a component type appears in both the watcher's types<...> and "
                   "except<...> lists");
 
     static constexpr std::size_t hook_count = (detail::list_size<include_list>::value * 2) +
@@ -8044,43 +7673,15 @@ using watcher = basic_watcher<default_entity_traits, Specs...>;
 // ----------------------------------------------------------------------------
 // Archives: pack / unpack / graft
 //
-// quiver owns ordering and identity; YOUR archive owns the encoding. A writer
-// is any object callable with each value quiver emits; a reader mirrors it
-// with references. Typed, not byte-oriented — components need not be
-// trivially copyable, and versioning/endianness live in your archive where
-// they belong.
-//
-//   pack<Transform, Health, Burning>(world, writer);     // save
-//   unpack<Transform, Health, Burning>(fresh, reader);   // load (exact ids)
-//   auto map = graft<Transform, Squad>(world, reader);   // merge (remapped ids)
-//
-// Stream layout: [u64 live count][live handles in slot order], then per type
-// in declaration order: [u64 hash_of<T>][u64 count][entity (, value)] rows in
-// dense (iteration) order — which round-trips sort<T> ordering. Tags emit
-// membership only. List the same types in the same order on both sides.
-//
-// unpack requires an EMPTY world and re-creates exact index+generation pairs
-// (rollback semantics). graft spawns FRESH entities and returns the old→new
-// graft_map; component types whose values store entity handles opt into
-// relinking explicitly — quiver never guesses at members:
-//
-//   struct Squad {
-//       quiver::entity leader;
-//       void quiver_relink(const quiver::graft_map& m) { leader = m.resolve(leader); }
-//   };
-//
-// (or specialize quiver::relink_traits<T> for types you do not own.)
-// resolve() answers no_entity for handles outside the archive — dangling
-// references are data, but a row's OWNER outside the archive is a hard fault.
-// Faults leave already-applied rows in place (not transactional): treat a
-// failed world as suspect. Parent/child links never serialize — re-adopt
-// after load. Readers signal corruption by throwing (quiver is
-// exception-transparent) or by failing the next hash check. Two sharp edges
-// on untrusted data: a stream with MORE trailing type sections than the
-// unpack list simply stops early (no fault — list the same types on both
-// sides), and unpack/graft trust the stream's entity COUNT before any row
-// validates — bound it against your expected world size first, like
-// restore_entity.
+// Typed, not byte-oriented: ecs owns ordering and identity, your archive
+// (writer/reader callables) owns the encoding. Rows emit in dense order,
+// which round-trips sort<T> order; list the same types in the same order on
+// both sides. unpack requires an EMPTY world and restores exact handles
+// (rollback semantics); faults are not rolled back. graft spawns FRESH
+// entities and returns the old->new graft_map -- stored handles relink only
+// by explicit opt-in (ecs_relink / relink_traits, never member-guessing),
+// and resolve() answers no_entity for handles outside the archive. Bound
+// untrusted entity counts before unpack, like restore_entity.
 // ----------------------------------------------------------------------------
 
 template <class W, class Traits = default_entity_traits>
@@ -8125,12 +7726,12 @@ template <class Traits>
 }
 }  // namespace detail
 
-// The old-handle → fresh-handle mapping a graft produces. Sorted by old slot
+// The old-handle -> fresh-handle mapping a graft produces. Sorted by old slot
 // (pack emits slot order); resolve is a binary search.
 template <class Traits>
 class basic_graft_map
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
 
 public:
     explicit basic_graft_map(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
@@ -8138,7 +7739,7 @@ public:
     {
     }
 
-    // The fresh handle minted for `old`, or no_entity when the archive never
+    // The fresh handle minted for `old`; no_entity when the archive never
     // contained it.
     [[nodiscard]] entity resolve(entity old) const noexcept
     {
@@ -8183,18 +7784,13 @@ struct archive_access  // pack/unpack/graft internals; not user API
 };
 
 template <class T, class Traits>
-concept has_member_relink =
-    requires(T& v, const basic_graft_map<Traits>& m) { v.quiver_relink(m); };
+concept has_member_relink = requires(T& v, const basic_graft_map<Traits>& m) { v.ecs_relink(m); };
 }  // namespace detail
 
-// Opt-in entity-handle rewriting for graft. A component participates by
-// defining `void quiver_relink(const graft_map&)` — against the layout's own
-// basic_graft_map<Traits>, or as a member template serving every layout — or,
-// for types you do not own, by specializing relink_traits<T, Traits> with
-// `links = true` and a static relink(T&, const basic_graft_map<Traits>&).
-// A hook written for one layout reports links == false everywhere else,
-// which is coherent: a component storing that layout's handles cannot ride
-// another layout's archive anyway.
+// Opt-in entity-handle rewriting for graft: give the component
+// `void ecs_relink(const graft_map&)`, or specialize relink_traits<T, Traits>
+// (links = true, static relink) for types you do not own. A hook written for
+// one layout reports links == false under every other layout.
 template <class T, class Traits = default_entity_traits>
 struct relink_traits
 {
@@ -8203,7 +7799,7 @@ struct relink_traits
     static void relink(T& value, const basic_graft_map<Traits>& map)
         requires detail::has_member_relink<T, Traits>
     {
-        value.quiver_relink(map);
+        value.ecs_relink(map);
     }
 };
 
@@ -8212,7 +7808,7 @@ namespace detail
 template <component T, class Traits, class W>
 void pack_one(const basic_world<Traits>& w, W& out)
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     out(hash_of<T>());
     const auto sel = w.template select<T>();  // const world: all-const, never registers
     out(static_cast<std::uint64_t>(sel.count()));
@@ -8234,7 +7830,7 @@ void pack_one(const basic_world<Traits>& w, W& out)
 template <component T, class Traits, class R>
 [[nodiscard]] std::expected<void, fault> unpack_one(basic_world<Traits>& w, R& in)
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     std::uint64_t hash{};
     in(hash);
     if (hash != hash_of<T>())
@@ -8260,7 +7856,7 @@ template <component T, class Traits, class R>
         else
         {
             static_assert(std::default_initializable<T> && std::is_move_constructible_v<T>,
-                          "quiver: unpack/graft default-construct a row, read into it, and "
+                          "ecs: unpack/graft default-construct a row, read into it, and "
                           "move it into the world; give T those operations or load manually");
             T value{};
             in(value);
@@ -8275,7 +7871,7 @@ template <component T, class Traits, class R>
                                                    R& in,
                                                    const basic_graft_map<Traits>& map)
 {
-    using entity = quiver::basic_entity<Traits>;
+    using entity = ecs::basic_entity<Traits>;
     constexpr entity no_entity{};  // shadows the default-traits constant
     std::uint64_t hash{};
     in(hash);
@@ -8303,7 +7899,7 @@ template <component T, class Traits, class R>
         else
         {
             static_assert(std::default_initializable<T> && std::is_move_constructible_v<T>,
-                          "quiver: unpack/graft default-construct a row, read into it, and "
+                          "ecs: unpack/graft default-construct a row, read into it, and "
                           "move it into the world; give T those operations or load manually");
             T value{};
             in(value);
@@ -8318,20 +7914,20 @@ template <component T, class Traits, class R>
 }
 }  // namespace detail
 
-// Serializes the live entity set plus the listed component types. The
-// stream opens with a layout stamp naming the handle traits it was packed
-// with; loads under different traits refuse with archive_mismatch.
+// Serializes the live entity set plus the listed component types. The stream
+// opens with a layout stamp; loads under different handle traits refuse with
+// archive_mismatch.
 template <component... Ts, class Traits, class W>
 void pack(const basic_world<Traits>& w, W& out)
 {
-    using entity = quiver::basic_entity<Traits>;
-    static_assert(sizeof...(Ts) > 0, "quiver: pack needs at least one component type");
+    using entity = ecs::basic_entity<Traits>;
+    static_assert(sizeof...(Ts) > 0, "ecs: pack needs at least one component type");
     static_assert((archive_writer_for<W, Ts, Traits> && ...),
-                  "quiver: the writer must be callable with std::uint64_t, quiver::entity, and "
+                  "ecs: the writer must be callable with std::uint64_t, ecs::entity, and "
                   "each non-tag component as (const T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
-                  "quiver: pack/unpack/graft take plain component types");
-    static_assert(detail::all_distinct<Ts...>, "quiver: duplicate component type in pack");
+                  "ecs: pack/unpack/graft take plain component types");
+    static_assert(detail::all_distinct<Ts...>, "ecs: duplicate component type in pack");
     out(detail::layout_stamp<Traits>());
     out(static_cast<std::uint64_t>(w.live_count()));
     w.live_entities([&](entity e) { out(e); });
@@ -8346,17 +7942,17 @@ void pack(const basic_world<Traits>& w, W& out, types<Ts...>)
 }
 
 // Restores a pack stream into an EMPTY world: exact index+generation pairs
-// (rollback semantics — handles saved elsewhere stay meaningful).
+// (rollback semantics -- handles saved elsewhere stay meaningful).
 template <component... Ts, class Traits, class R>
 [[nodiscard]] std::expected<void, fault> unpack(basic_world<Traits>& w, R& in)
 {
-    using entity = quiver::basic_entity<Traits>;
-    static_assert(sizeof...(Ts) > 0, "quiver: unpack needs at least one component type");
+    using entity = ecs::basic_entity<Traits>;
+    static_assert(sizeof...(Ts) > 0, "ecs: unpack needs at least one component type");
     static_assert((archive_reader_for<R, Ts, Traits> && ...),
-                  "quiver: the reader must be callable with std::uint64_t&, quiver::entity&, "
+                  "ecs: the reader must be callable with std::uint64_t&, ecs::entity&, "
                   "and each non-tag component as (T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
-                  "quiver: pack/unpack/graft take plain component types");
+                  "ecs: pack/unpack/graft take plain component types");
     if (w.live_count() != 0)
     {
         if constexpr (checks_enabled)
@@ -8397,7 +7993,7 @@ template <class Traits, class R, component... Ts>
 }
 
 // Merges a pack stream into a (possibly populated) world: every archived
-// entity becomes a FRESH spawn; returns the old→new map. Component values
+// entity becomes a FRESH spawn; returns the old->new map. Component values
 // relink their stored handles per relink_traits (explicit opt-in).
 template <component... Ts, class Traits, class R>
 [[nodiscard]] std::expected<basic_graft_map<Traits>, fault> graft(
@@ -8405,13 +8001,13 @@ template <component... Ts, class Traits, class R>
     R& in,
     std::pmr::memory_resource* memory = std::pmr::get_default_resource())
 {
-    using entity = quiver::basic_entity<Traits>;
-    static_assert(sizeof...(Ts) > 0, "quiver: graft needs at least one component type");
+    using entity = ecs::basic_entity<Traits>;
+    static_assert(sizeof...(Ts) > 0, "ecs: graft needs at least one component type");
     static_assert((archive_reader_for<R, Ts, Traits> && ...),
-                  "quiver: the reader must be callable with std::uint64_t&, quiver::entity&, "
+                  "ecs: the reader must be callable with std::uint64_t&, ecs::entity&, "
                   "and each non-tag component as (T&)");
     static_assert((std::same_as<Ts, detail::bare<Ts>> && ...),
-                  "quiver: pack/unpack/graft take plain component types");
+                  "ecs: pack/unpack/graft take plain component types");
     basic_graft_map<Traits> map(memory);
     auto& pairs = detail::archive_access::pairs(map);
     std::uint64_t stamp{};
@@ -8453,23 +8049,11 @@ template <class Traits, class R, component... Ts>
 // ----------------------------------------------------------------------------
 // Pipeline
 //
-// The dumbest viable system runner: an ordered list of stages your game loop
-// calls once per frame. quiver never owns the loop — a pipeline is a plain
-// object you run. Its one real feature: it owns a command buffer
-// (`deferred()`) and applies it AFTER EVERY STAGE, so each stage observes
-// the previous stage's structural changes and nothing ever mutates under an
-// iteration.
-//
-//   quiver::pipeline frame;
-//   frame.stage("movement", [](quiver::world& w, float dt) { ... });
-//   frame.stage("combat", [&frame](quiver::world& w, float) {
-//       w.each<Health>([&](quiver::entity e, Health& h)
-//                      { if (h.value <= 0) { frame.deferred().kill(e); } });
-//   });
-//   ...every frame: frame.run(world, dt);
-//
-// Stages are std::move_only_function (capture freely, including move-only
-// state). Move-only; stages must outlive nothing — the pipeline owns them.
+// An ordered list of plain stages your game loop calls once per frame -- ecs
+// never owns the loop. It owns a command buffer (deferred()) and applies it
+// AFTER EVERY STAGE, so each stage observes the previous stage's structural
+// changes and nothing mutates under an iteration. Stages are
+// std::move_only_function; the pipeline is move-only and owns them.
 // ----------------------------------------------------------------------------
 
 template <class Traits>
@@ -8549,22 +8133,18 @@ using pipeline = basic_pipeline<default_entity_traits>;
 // ----------------------------------------------------------------------------
 // Entity references
 //
-// Pure forwarding sugar over the world verbs — every call inherits the world
-// API's checks unchanged, nothing is cached. 16 bytes; pass it down call
-// chains instead of (world&, entity) pairs. Never store it in components:
-// it pins the world's address, which quiver::entity deliberately does not.
-//
-// A default-constructed ref is EMPTY (no world): queries (alive, has, find,
-// remove, kill, orphan, parent) answer false/null/no-op on it; the
-// reference-producing verbs (add, put, replace, obtain, get, owner) require
-// a bound ref and are checked-build violations otherwise.
+// Pure forwarding sugar over the world verbs; nothing is cached. 16 bytes;
+// pass it down call chains instead of (world&, entity) pairs. Never store it
+// in components -- it pins the world's address. A default-constructed ref is
+// EMPTY: queries answer false/null/no-op on it, while reference-producing
+// verbs (add, put, replace, obtain, get, owner) are checked violations.
 // ----------------------------------------------------------------------------
 
 template <class W>  // W = world (full verb set) or const world (read-only)
 class basic_entity_ref
 {
     static constexpr bool writable = !std::is_const_v<W>;
-    using entity = typename std::remove_const_t<W>::entity;  // the world''s handle type
+    using entity = typename std::remove_const_t<W>::entity;  // the world's handle type
 
 public:
     basic_entity_ref() = default;
@@ -8642,8 +8222,8 @@ public:
         return bound("entity_ref::get").template get<T>(entity_);
     }
 
-    // Multi-component point lookup, mirroring world.get<T, U, ...>: a tuple
-    // of references, const through a const_entity_ref.
+    // Multi-component point lookup: a tuple of references, const through a
+    // const_entity_ref.
     template <component T, component U, component... Rest>
     [[nodiscard]] auto get() const
     {
@@ -8728,7 +8308,7 @@ typename basic_world<Traits>::entity_ref basic_world<Traits>::globals()
     }
     if (!has<globals_mark>(globals_))
     {
-        // First call — or self-healing after a lazy mark add was refused
+        // First call -- or self-healing after a lazy mark add was refused
         // (first globals() under an iteration of the mark pool).
         add<globals_mark>(globals_);
     }
@@ -8747,18 +8327,15 @@ typename basic_world<Traits>::const_entity_ref basic_world<Traits>::globals() co
 }
 
 // ----------------------------------------------------------------------------
-// any — a type-erased value with small-buffer optimization
+// any -- a type-erased value with small-buffer optimization
 //
-// RTTI-free: identity is hash_of<T>, the same 64-bit name hash pools and
-// archives key on. The vtable is a static per-type table of plain function
-// pointers — no virtual classes, debugger-plain. Payloads up to three words
-// with ordinary alignment live inline; everything else (and every
-// over-aligned type) takes one aligned heap allocation. ref() makes a
-// NON-OWNING view: writes alias the original, destruction leaves it alone,
-// and copies of a ref are more refs. Copying an any whose payload is not
-// copy-constructible is a checked violation that yields an empty any.
-// as<T>() is the get-style accessor (aborts on mismatch in checked builds);
-// try_as<T>() is the find-style one (null on mismatch).
+// RTTI-free: identity is hash_of<T> (the hash pools and archives key on);
+// the vtable is a static per-type table of plain function pointers. Payloads
+// up to three words with ordinary alignment live inline; larger or
+// over-aligned ones take one heap allocation. make<T>() owns; ref() makes a
+// NON-OWNING view that aliases the original (copies of a ref are more refs).
+// Copying a non-copyable payload is a checked violation yielding an empty
+// any. as<T>() aborts on mismatch (checked); try_as<T>() answers null.
 // ----------------------------------------------------------------------------
 
 class any
@@ -8903,7 +8480,7 @@ public:
     [[nodiscard]] static any make(Args&&... args)
     {
         static_assert(std::same_as<T, detail::bare<T>>,
-                      "quiver: any::make<T> takes a plain, unqualified value type");
+                      "ecs: any::make<T> takes a plain, unqualified value type");
         any out;
         out.emplace_value<T>(std::forward<Args>(args)...);
         return out;
@@ -8914,7 +8491,7 @@ public:
     [[nodiscard]] static any ref(T& object) noexcept
     {
         static_assert(std::same_as<T, detail::bare<T>>,
-                      "quiver: any::ref<T> views a plain, unqualified value type");
+                      "ecs: any::ref<T> views a plain, unqualified value type");
         any out;
         out.store_.remote = &object;
         out.vt_ = table<T, place::ref>();
@@ -9061,23 +8638,14 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// Reflection — a process-wide, RTTI-free runtime type registry
+// Reflection -- a process-wide, RTTI-free runtime type registry
 //
-// Registration is a fluent builder driven entirely by compile-time member
-// pointers; lookups are lock-free binary searches keyed by hash_of<T> (the
-// SAME identity archives and pools use, so reflection, serialization, and
-// runtime pools agree on what a type is called). Register at startup —
-// registration is externally synchronized, like world construction. Every
-// runtime operation is fault-tolerant, editor-grade: mismatches answer with
-// empty handles, empty anys, or false — never an abort.
-//
-//   quiver::reflect<Transform>()
-//       .field<&Transform::x>("x")
-//       .field<&Transform::y>("y")
-//       .method<&Transform::translate>("translate")
-//       .construct<float, float>();
-//
-//   if (auto r = quiver::reflection_of("Transform")) { ... }
+// A fluent builder over compile-time member pointers; lookups are binary
+// searches keyed by hash_of<T> -- the SAME identity archives and pools use,
+// so all three agree on what a type is called. Register at startup
+// (externally synchronized, like world construction). Runtime operations are
+// fault-tolerant: mismatches answer empty handles, empty anys, or false --
+// never an abort.
 // ----------------------------------------------------------------------------
 
 namespace detail
@@ -9105,7 +8673,7 @@ struct ctor_node
     any (*construct)(std::span<any> args);
 };
 
-// The meta×ECS bridge: structural verbs by hash, captured when reflect<T>()
+// The meta x ECS bridge: structural verbs by hash, captured when reflect<T>()
 // sees a component type. Alive-gated and presence-gated so editor calls
 // refuse with false instead of tripping checked violations.
 struct ecs_bridge
@@ -9320,7 +8888,7 @@ public:
         return {};
     }
 
-    // Walks fields in registration order: fn(const quiver::field&).
+    // Walks fields in registration order: fn(const ecs::field&).
     template <class F>
     void each_field(F&& fn) const
     {
@@ -9355,12 +8923,11 @@ public:
         return {};
     }
 
-    // --- the meta×ECS bridge (captured for component types) ---
-    // add_to moves the payload in (an EMPTY any default-constructs, and is
-    // how tags add); every verb is alive- and presence-gated so editor calls
-    // answer false instead of tripping checked violations. Mid-iteration
-    // calls hit the same rules as the typed verbs — editors mutate between
-    // frames.
+    // --- the meta x ECS bridge (captured for component types) ---
+    // add_to moves the payload in (an EMPTY any default-constructs; how tags
+    // add). Every verb is alive- and presence-gated: editor calls answer
+    // false, never checked violations. Mid-iteration calls follow the typed
+    // verbs' rules.
     bool add_to(world& w, entity e, any value) const
     {
         return node_ != nullptr && node_->ecs.add_to != nullptr && node_->ecs.add_to(w, e, value);
@@ -9397,8 +8964,8 @@ private:
 
 [[nodiscard]] inline reflection reflection_of(std::string_view name) noexcept
 {
-    // Names hash with the same fnv1a that hash_of<T> uses, so the name
-    // lookup IS the hash lookup.
+    // Names hash with the same fnv1a hash_of<T> uses: the name lookup IS the
+    // hash lookup.
     return reflection_of(detail::fnv1a(name));
 }
 
@@ -9425,7 +8992,7 @@ public:
     {
         using traits = detail::member_object_traits<decltype(Member)>;
         static_assert(std::same_as<typename traits::owner, T>,
-                      "quiver: field<&U::m> must name a member of the reflected type");
+                      "ecs: field<&U::m> must name a member of the reflected type");
         using value = typename traits::value;
         node_->fields.push_back(detail::field_node{
             name,
@@ -9452,7 +9019,7 @@ public:
     {
         using traits = detail::member_function_traits<decltype(Method)>;
         static_assert(std::same_as<typename traits::owner, T>,
-                      "quiver: method<&U::fn> must name a member of the reflected type");
+                      "ecs: method<&U::fn> must name a member of the reflected type");
         node_->methods.push_back(detail::method_node{
             name,
             hash_of<T>(),
@@ -9466,7 +9033,7 @@ public:
     reflect_builder& construct()
     {
         static_assert(std::constructible_from<T, Args...>,
-                      "quiver: construct<Args...> must name a real constructor of T");
+                      "ecs: construct<Args...> must name a real constructor of T");
         node_->ctors.push_back(detail::ctor_node{
             sizeof...(Args),
             +[](std::span<any> args) -> any
@@ -9531,13 +9098,13 @@ private:
     detail::type_node* node_;
 };
 
-// Registers T (idempotent identity: name from name_of<T>/quiver_label) and
+// Registers T (idempotent identity: name from name_of<T>/ecs_label) and
 // returns the builder for fields, methods, and constructors.
 template <class T>
 reflect_builder<T> reflect()
 {
     static_assert(std::same_as<T, detail::bare<T>>,
-                  "quiver: reflect<T> takes a plain, unqualified type");
+                  "ecs: reflect<T> takes a plain, unqualified type");
     constexpr std::uint64_t hash = hash_of<T>();
     if (detail::type_node* standing = detail::find_type_node(hash); standing != nullptr)
     {
@@ -9610,7 +9177,7 @@ reflect_builder<T> reflect()
 }
 
 // Manifest-driven identity registration: one call per types<> list.
-// Idempotent — already registered types are skipped, not violations.
+// Idempotent -- already registered types are skipped, not violations.
 template <class... Ts>
 void reflect_all(types<Ts...>)
 {
@@ -9621,12 +9188,11 @@ void reflect_all(types<Ts...>)
 }
 
 // ----------------------------------------------------------------------------
-// Checked-build test backdoor: deliberately corrupts internal state so a test
-// suite can prove validate() detects real damage, and exposes iteration-lock
-// counters. Not part of the API contract.
+// Checked-build test backdoor: deliberately corrupts internal state so tests
+// can prove validate() detects real damage. Not part of the API contract.
 // ----------------------------------------------------------------------------
 
-#if QUIVER_CHECKS
+#if ECS_CHECKS
 struct test_access
 {
     template <component T>
@@ -9658,10 +9224,9 @@ struct test_access
 };
 #endif
 
-// Named hasher mirroring std::hash<basic_entity<...>>. Exists for module
-// builds, where some toolchains do not surface global-module-fragment
-// std::hash specializations to importers:
-// std::unordered_set<entity, entity_hash> works everywhere.
+// Named hasher mirroring std::hash<basic_entity<...>>, for module builds
+// where some toolchains hide global-module-fragment std::hash
+// specializations from importers.
 template <entity_traits Traits>
 struct basic_entity_hash
 {
@@ -9673,12 +9238,12 @@ struct basic_entity_hash
 
 using entity_hash = basic_entity_hash<default_entity_traits>;
 
-}  // namespace quiver
+}  // namespace ecs
 
-template <quiver::entity_traits Traits>
-struct std::hash<quiver::basic_entity<Traits>>
+template <ecs::entity_traits Traits>
+struct std::hash<ecs::basic_entity<Traits>>
 {
-    [[nodiscard]] std::size_t operator()(quiver::basic_entity<Traits> e) const noexcept
+    [[nodiscard]] std::size_t operator()(ecs::basic_entity<Traits> e) const noexcept
     {
         return std::hash<std::uint64_t>{}(e.bits());
     }
