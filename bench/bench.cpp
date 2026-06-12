@@ -1,26 +1,18 @@
 // ============================================================================
-// bench.cpp — order-of-magnitude timings for quiver's hot operations.
+// bench.cpp -- order-of-magnitude timings for ecs's hot operations.
+// For spotting regressions, not marketing; measure in your game first.
 //
-// Methodology: each case runs `repeats` times over `entity_count` entities and
-// the BEST run is reported (best-of-N suppresses scheduler noise; it answers
-// "how fast can this be", not "how fast is it on average"). A checksum is
-// accumulated into a volatile sink so the optimizer cannot delete the work.
-//
-// These numbers are for spotting regressions and gross mistakes, not for
-// marketing. An ECS's real cost depends on your component sizes, access
-// patterns, and cache pressure: measure in your game, with your data, before
-// believing any table — this one included. Build with optimizations and
-// NDEBUG (QUIVER_CHECKS off); a checked build measures the safety rails too.
+// Each case runs `repeats` times over `entity_count` entities; the BEST run
+// is reported -- best-of-N suppresses scheduler noise and answers "how fast
+// can this be", not the average. Build optimized with NDEBUG (ECS_CHECKS off).
 // ============================================================================
 
-#include <quiver.hpp>
+#include <ecs.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
-
-namespace ecs = quiver;
 
 namespace
 {
@@ -84,12 +76,12 @@ void report(const char* name, double ns_per_op)
 
 }  // namespace
 
-// NOLINTNEXTLINE(bugprone-exception-escape) — only bad_alloc can escape; that is fatal anyway
+// NOLINTNEXTLINE(bugprone-exception-escape) -- only bad_alloc can escape
 int main()
 {
-    std::printf("quiver bench — %zu entities, best of %d runs\n", entity_count, repeats);
-#if QUIVER_CHECKS
-    std::printf("  NOTE: QUIVER_CHECKS is ON; this measures the checked build.\n");
+    std::printf("ecs bench -- %zu entities, best of %d runs\n", entity_count, repeats);
+#if ECS_CHECKS
+    std::printf("  NOTE: ECS_CHECKS is ON; this measures the checked build.\n");
 #endif
 
     // --- entity lifecycle ----------------------------------------------------
@@ -269,9 +261,8 @@ int main()
                                   sink += static_cast<std::uint64_t>(acc);
                               }));
 
-        // Stored selection vs rebuilding through world.each every call: the
-        // difference is the per-call setup (pool lookup + registration check),
-        // visible only when iterations are tiny and frequent.
+        // Stored selection vs ad-hoc world.each: isolates the per-call setup
+        // (pool lookup + registration check); matters only for tiny, frequent runs.
         ecs::world small;
         for (int i = 0; i < 64; ++i)
         {
@@ -402,7 +393,7 @@ int main()
                 w.add<Velocity>(entities[i], Velocity{1, 1});
             }
         }
-        const std::size_t union_size = 66'666;  // |A ∪ B| for the op count
+        const std::size_t union_size = 66'666;  // |A u B| for the op count
         const auto either = w.select<ecs::any_of<Transform, Velocity>>();
         report("any_of<2> union drive",
                best_ns_per_op(union_size,
@@ -589,8 +580,7 @@ int main()
                                   sink += 1;
                               }));
 
-        // Observed extras pay one sparse probe per row, on top of the
-        // zero-probe owned walk.
+        // Observed extras pay one sparse probe per row over the zero-probe owned walk.
         for (std::size_t i = 0; i < entity_count; i += 8)
         {
             w.add<Heat>(entities[i], Heat{300});
