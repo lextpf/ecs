@@ -1,9 +1,9 @@
 @echo off
 REM ===========================================================================================
-REM build.bat - Complete build pipeline for quiver
+REM build.bat - Complete build pipeline for ecs
 REM ===========================================================================================
 REM This script:
-REM   1. clang-format - in-place formatting of include/ tests/ examples/ bench/
+REM   1. clang-format - in-place formatting of src/ tests/ examples/ bench/
 REM   2. cmake        - CMake configure with vcpkg manifest install and VS 17 2022 generator
 REM   3. clang-tidy   - static analysis via Ninja compile_commands.json sidecar (build-cdb/)
 REM   4. build        - Release build via cmake --build
@@ -13,7 +13,7 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 
 echo ============================================================================
-echo                             QUIVER BUILD PIPELINE
+echo                              ECS BUILD PIPELINE
 echo ============================================================================
 echo.
 
@@ -27,7 +27,7 @@ where clang-format >nul 2>&1
 if errorlevel 1 (
     echo SKIP: clang-format not found in PATH
 ) else (
-    for %%f in (include\*.hpp tests\*.cpp tests\*.hpp examples\*.cpp bench\*.cpp) do (
+    for %%f in (src\*.hpp tests\*.cpp tests\*.hpp examples\*.cpp bench\*.cpp) do (
         if exist "%%f" clang-format -i "%%f"
     )
     echo Formatting complete.
@@ -67,10 +67,8 @@ if errorlevel 1 (
 
     REM The sidecar preset compiles with clang++ directly, so the database is
     REM consumed as-is - no driver-mode tricks or normalization required.
-    REM module_smoke.cpp is skipped: `import quiver;` targets the MSVC module
-    REM build, which the clang sidecar cannot resolve.
     for %%f in (tests\*.cpp examples\*.cpp bench\*.cpp) do (
-        if exist "%%f" if not "%%f"=="tests\module_smoke.cpp" (
+        if exist "%%f" (
             echo   tidy: %%f
             clang-tidy --quiet -p build-cdb "%%f"
             if !ERRORLEVEL! neq 0 (
@@ -112,9 +110,9 @@ echo                           BUILD PIPELINE COMPLETE
 echo ============================================================================
 echo.
 echo Build Output:
-echo   Tests:     build\Release\quiver_tests.exe
-echo   Example:   build\Release\quiver_example.exe
-echo   Benchmark: build\Release\quiver_bench.exe
+echo   Tests:     build\Release\ecs_tests.exe
+echo   Example:   build\Release\ecs_example.exe
+echo   Benchmark: build\Release\ecs_bench.exe
 echo.
 echo ============================================================================
 
