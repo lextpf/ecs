@@ -1,13 +1,7 @@
-// ============================================================================
-// tests_queries.cpp -- any_of query combinators: OR-alternatives in select,
-// union driving with dedup, and composition with except/maybe/manifests.
-// ============================================================================
-
 #include "test_harness.hpp"
 
 #include <unordered_set>
 
-// Alternative components for the OR tests.
 struct Cat
 {
     int meow = 0;
@@ -22,29 +16,49 @@ struct Muzzled
 {
 };
 
-void test_any_of_basics()
+TEST(Queries, ViewGet)
 {
-    section("any_of: pointer parts, >=1 non-null per row");
-    ecs::world w;
+    ecs::registry w;
+    const ecs::entity a = w.create(Pos{1}, Vel{2});
+    const ecs::entity b = w.create(Pos{3}, Vel{4});
 
-    const ecs::entity cat = w.spawn(Pos{1});
+    auto v = w.view<Pos, const Vel>();
+    EXPECT_EQ(v.get<Pos>(a).x, 1);
+    EXPECT_EQ(v.get<Pos>(b).x, 3);
+    EXPECT_EQ(v.get<Vel>(a).v, 2);
+    static_assert(std::is_same_v<decltype(v.get<Pos>(a)), Pos&>);
+    static_assert(std::is_same_v<decltype(v.get<Vel>(a)), const Vel&>);
+
+    v.get<Pos>(a).x = 9;
+    EXPECT_EQ(w.get<Pos>(a).x, 9);
+
+    auto [p, vel] = v.get<Pos, Vel>(b);
+    EXPECT_EQ(p.x, 3);
+    EXPECT_EQ(vel.v, 4);
+}
+
+TEST(Queries, AnyOfBasics)
+{
+    ecs::registry w;
+
+    const ecs::entity cat = w.create(Pos{1});
     w.add<Cat>(cat, Cat{10});
-    const ecs::entity dog = w.spawn(Pos{2});
+    const ecs::entity dog = w.create(Pos{2});
     w.add<Dog>(dog, Dog{20});
-    const ecs::entity both = w.spawn(Pos{3});
+    const ecs::entity both = w.create(Pos{3});
     w.add<Cat>(both, Cat{30});
     w.add<Dog>(both, Dog{40});
-    w.spawn(Pos{4});  // neither: filtered out
+    w.create(Pos{4});
 
-    // The nullity matrix: cat-only, dog-only, both -- never neither.
     int cats = 0;
     int dogs = 0;
     int boths = 0;
-    auto sel = w.select<Pos, ecs::any_of<Cat, Dog>>();
+    auto sel =
+        w.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{});
     sel.each(
         [&](ecs::entity, Pos&, Cat* c, Dog* d)
         {
-            CHECK(c != nullptr || d != nullptr);  // the strengthened invariant
+            EXPECT_TRUE(c != nullptr || d != nullptr);
             if (c != nullptr && d != nullptr)
             {
                 ++boths;
@@ -58,38 +72,35 @@ void test_any_of_basics()
                 ++dogs;
             }
         });
-    CHECK(cats == 1);
-    CHECK(dogs == 1);
-    CHECK(boths == 1);
+    EXPECT_EQ(cats, 1);
+    EXPECT_EQ(dogs, 1);
+    EXPECT_EQ(boths, 1);
 
-    // Tag alternatives are legal and contribute no callback argument.
-    const ecs::entity tagged = w.spawn(Pos{5});
+    const ecs::entity tagged = w.create(Pos{5});
     w.add<TagA>(tagged);
     std::size_t flagged = 0;
-    w.select<Pos, ecs::any_of<TagA, Cat>>().each([&](Pos&, Cat*) { ++flagged; });
-    CHECK(flagged == 3);  // cat, both, tagged
+    w.view<Pos, ecs::maybe<Cat>>(ecs::exists<TagA>{} || ecs::exists<Cat>{})
+        .each([&](Pos&, Cat*) { ++flagged; });
+    EXPECT_EQ(flagged, 3);
 
-    // A const world serves the same shapes, const-propagated.
-    const ecs::world& cw = w;
+    const ecs::registry& cw = w;
     int seen = 0;
-    cw.select<Pos, ecs::any_of<Cat, Dog>>().each(
-        [&](const Pos&, const Cat* c, const Dog* d)
-        { seen += (c != nullptr || d != nullptr) ? 1 : 0; });
-    CHECK(seen == 3);
+    cw.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each([&](const Pos&, const Cat* c, const Dog* d)
+              { seen += (c != nullptr || d != nullptr) ? 1 : 0; });
+    EXPECT_EQ(seen, 3);
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_any_of_driving()
+TEST(Queries, AnyOfDriving)
 {
-    section("any_of: union driving with exact dedup");
-    ecs::world w;
+    ecs::registry w;
 
-    // No plain include: the union drives; overlap is visited exactly once.
     std::vector<ecs::entity> all;
     for (int i = 0; i < 12; ++i)
     {
-        const ecs::entity e = w.spawn();
+        const ecs::entity e = w.create(Pos{i});
         if (i % 2 == 0)
         {
             w.add<Cat>(e, Cat{i});
@@ -100,65 +111,62 @@ void test_any_of_driving()
         }
         all.push_back(e);
     }
-    // Cats: 6, dogs: 4, overlap (i % 6 == 0): 2 -> union = 8 distinct.
     std::unordered_set<ecs::entity, ecs::entity_hash> visited;
     std::size_t visits = 0;
-    w.select<ecs::any_of<Cat, Dog>>().each(
-        [&](ecs::entity e, Cat*, Dog*)
-        {
-            visited.insert(e);
-            ++visits;
-        });
-    CHECK(visits == 8);          // exactly once each
-    CHECK(visited.size() == 8);  // the exact union
+    w.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each(
+            [&](ecs::entity e, Pos&, Cat*, Dog*)
+            {
+                visited.insert(e);
+                ++visits;
+            });
+    EXPECT_EQ(visits, 8);
+    EXPECT_EQ(visited.size(), 8);
 
-    // Brute-force oracle agreement.
     std::size_t oracle = 0;
     for (const ecs::entity e : all)
     {
         oracle += (w.has<Cat>(e) || w.has<Dog>(e)) ? 1 : 0;
     }
-    CHECK(oracle == 8);
+    EXPECT_EQ(oracle, 8);
 
-    // With a small plain include, the plain pool drives; the group becomes an
-    // OR-probe.
-    const ecs::entity special = all[0];  // has Cat (i=0) and Dog
+    const ecs::entity special = all[0];
     w.add<Hp>(special, Hp{1});
     std::size_t narrowed = 0;
-    w.select<Hp, ecs::any_of<Cat, Dog>>().each([&](Hp&, Cat*, Dog*) { ++narrowed; });
-    CHECK(narrowed == 1);
+    w.view<Hp, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each([&](Hp&, Cat*, Dog*) { ++narrowed; });
+    EXPECT_EQ(narrowed, 1);
 
-    // A union smaller than the plain pool drives; the match set never changes.
-    ecs::world w2;
+    ecs::registry w2;
     for (int i = 0; i < 100; ++i)
     {
-        w2.spawn(Pos{i});  // big plain pool
+        w2.create(Pos{i});
     }
-    const ecs::entity rare = w2.spawn(Pos{1000});
+    const ecs::entity rare = w2.create(Pos{1000});
     w2.add<Cat>(rare, Cat{1});
     std::size_t found = 0;
-    w2.select<Pos, ecs::any_of<Cat, Dog>>().each([&](Pos&, Cat*, Dog*) { ++found; });
-    CHECK(found == 1);
+    w2.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each([&](Pos&, Cat*, Dog*) { ++found; });
+    EXPECT_EQ(found, 1);
 
-    // driven_by still forces a PLAIN include.
     std::size_t forced = 0;
-    w2.select<Pos, ecs::any_of<Cat, Dog>>().driven_by<Pos>().each([&](Pos&, Cat*, Dog*)
-                                                                  { ++forced; });
-    CHECK(forced == 1);
+    w2.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .driven_by<Pos>()
+        .each([&](Pos&, Cat*, Dog*) { ++forced; });
+    EXPECT_EQ(forced, 1);
 
-    CHECK_VALID(w);
-    CHECK_VALID(w2);
+    EXPECT_TRUE(RegistryValid(w));
+    EXPECT_TRUE(RegistryValid(w2));
 }
 
-void test_any_of_composition()
+TEST(Queries, AnyOfComposition)
 {
-    section("any_of: composition with except, maybe, manifests, range, split");
-    ecs::world w;
+    ecs::registry w;
 
     ecs::entity muzzled_cat = ecs::no_entity;
     for (int i = 0; i < 10; ++i)
     {
-        const ecs::entity e = w.spawn(Pos{i});
+        const ecs::entity e = w.create(Pos{i});
         if (i % 2 == 0)
         {
             w.add<Cat>(e, Cat{i});
@@ -178,51 +186,47 @@ void test_any_of_composition()
         }
     }
 
-    // except + maybe + any_of in one select.
-    auto sel = w.select<Pos, ecs::any_of<Cat, Dog>, ecs::maybe<Vel>>(ecs::except<Muzzled>{});
+    auto sel = w.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>, ecs::maybe<Vel>>(
+        (ecs::exists<Cat>{} || ecs::exists<Dog>{}) && !ecs::exists<Muzzled>{});
     std::size_t rows = 0;
     std::size_t with_vel = 0;
     sel.each(
         [&](ecs::entity e, Pos&, Cat* c, Dog* d, Vel* v)
         {
-            CHECK(e != muzzled_cat);
-            CHECK(c != nullptr || d != nullptr);
+            EXPECT_NE(e, muzzled_cat);
+            EXPECT_TRUE(c != nullptr || d != nullptr);
             rows += 1;
             with_vel += (v != nullptr) ? 1 : 0;
         });
-    CHECK(rows == 9);
-    CHECK(with_vel == 4);  // i in {0, 3, 6, 9}
+    EXPECT_EQ(rows, 9);
+    EXPECT_EQ(with_vel, 4);
 
-    // first / count / contains agree with the walk.
-    CHECK(sel.count() == 9);
-    CHECK(!sel.contains(muzzled_cat));
-    CHECK(sel.contains(sel.first()));
+    EXPECT_EQ(sel.count(), 9);
+    EXPECT_FALSE(sel.contains(muzzled_cat));
+    EXPECT_TRUE(sel.contains(sel.first()));
 
-    // Two independent groups: both must be satisfied.
-    const ecs::entity cross = w.spawn(Pos{100});
+    const ecs::entity cross = w.create(Pos{100});
     w.add<Cat>(cross, Cat{100});
     w.add<Vel>(cross, Vel{100});
     std::size_t crossed = 0;
-    w.select<ecs::any_of<Cat, Dog>, ecs::any_of<Vel, Hp>>().each(
-        [&](ecs::entity, Cat*, Dog*, Vel*, Hp*) { ++crossed; });
-    // Entities with (Cat|Dog) AND (Vel|Hp): i in {0,3,6,9} plus cross.
-    CHECK(crossed == 5);
+    w.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>, ecs::maybe<Vel>, ecs::maybe<Hp>>(
+         (ecs::exists<Cat>{} || ecs::exists<Dog>{}) && (ecs::exists<Vel>{} || ecs::exists<Hp>{}))
+        .each([&](ecs::entity, Pos&, Cat*, Dog*, Vel*, Hp*) { ++crossed; });
+    EXPECT_EQ(crossed, 5);
 
-    // Manifests carry any_of like any other element.
-    using Pets = ecs::types<Pos, ecs::any_of<Cat, Dog>>;
+    using Pets = ecs::types<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>;
     std::size_t via_manifest = 0;
-    w.select(Pets{}).each([&](Pos&, Cat*, Dog*) { ++via_manifest; });
-    CHECK(via_manifest == 11);
+    w.view(Pets{}, ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each([&](Pos&, Cat*, Dog*) { ++via_manifest; });
+    EXPECT_EQ(via_manifest, 11);
 
-    // range() carries the pointer parts. Selections are live: `cross` now matches.
     std::size_t range_rows = 0;
-    for (auto [e, p, c, d, v] : sel.range())
+    for (auto [e, p, c, d, v] : sel.each())
     {
         range_rows += (c != nullptr || d != nullptr) ? 1 : 0;
     }
-    CHECK(range_rows == 10);
+    EXPECT_EQ(range_rows, 10);
 
-    // split() covers every row exactly once (plain include drives parts).
     {
         std::unordered_set<ecs::entity, ecs::entity_hash> seen;
         std::size_t visits = 0;
@@ -236,40 +240,78 @@ void test_any_of_composition()
                     ++visits;
                 });
         }
-        CHECK(visits == 10);
-        CHECK(seen.size() == 10);
+        EXPECT_EQ(visits, 10);
+        EXPECT_EQ(seen.size(), 10);
     }
 
-    CHECK_VALID(w);
-
-    // Compile-time walls (each is a static_assert):
-    //   select<any_of<Cat>>()                  // a group needs >= 2 alternatives
-    //   select<any_of<Cat, Cat>>()             // duplicate alternative
-    //   select<Cat, any_of<Cat, Dog>>()        // type appears twice across the select
-    //   select<any_of<Cat, Dog>>(except<Cat>{})  // alternative also excluded
-    //   select<ecs::maybe<ecs::any_of<Cat, Dog>>>()  // maybe<any_of<>> is meaningless
-    //   bond<ecs::any_of<Cat, Dog>, Pos>()     // bonds own pools, not alternatives
+    EXPECT_TRUE(RegistryValid(w));
 }
 
 #if ECS_CHECKS
-void test_any_of_violations()
+TEST(Queries, AnyOfViolations)
 {
-    section("any_of: lock discipline covers every alternative pool");
-    ecs::world w;
-    const ecs::entity e = w.spawn(Pos{1});
+    ecs::registry w;
+    const ecs::entity e = w.create(Pos{1});
     w.add<Cat>(e, Cat{1});
 
-    // Every alternative pool is locked during iteration; structural changes to
-    // any of them are refused.
     violation_scope guard;
-    w.select<Pos, ecs::any_of<Cat, Dog>>().each(
-        [&](ecs::entity who, Pos&, Cat*, Dog*)
-        {
-            w.remove<Cat>(who);  // Cat pool is locked as an alternative
-            return false;
-        });
-    CHECK(violations_seen == 1);
-    CHECK(w.has<Cat>(e));  // refused: still present
-    CHECK_VALID(w);
+    w.view<Pos, ecs::maybe<Cat>, ecs::maybe<Dog>>(ecs::exists<Cat>{} || ecs::exists<Dog>{})
+        .each(
+            [&](ecs::entity who, Pos&, Cat*, Dog*)
+            {
+                w.remove<Cat>(who);
+                return false;
+            });
+    EXPECT_EQ(violations_seen, 1);
+    EXPECT_TRUE(w.has<Cat>(e));
+    EXPECT_TRUE(RegistryValid(w));
 }
 #endif
+
+TEST(Queries, ViewBackAndReversed)
+{
+    ecs::registry w;
+    std::vector<ecs::entity> order;
+    for (int i = 0; i < 5; ++i)
+    {
+        order.push_back(w.create(Pos{i}));
+    }
+
+    const auto v = w.view<Pos>();
+
+    EXPECT_EQ(v.first(), order.front());
+    EXPECT_EQ(v.back(), order.back());
+
+    std::vector<int> seen;
+    for (auto&& [e, p] : v.reversed())
+    {
+        (void)e;
+        seen.push_back(p.x);
+    }
+    EXPECT_TRUE((seen == std::vector<int>{4, 3, 2, 1, 0}));
+
+    w.add<Cat>(order[1]);
+    w.add<Cat>(order[3]);
+    const auto cats = w.view<Pos>(ecs::exists<Cat>{});
+    EXPECT_EQ(cats.back(), order[3]);
+    std::vector<int> cat_x;
+    for (auto&& [e, p] : cats.reversed())
+    {
+        (void)e;
+        cat_x.push_back(p.x);
+    }
+    EXPECT_TRUE((cat_x == std::vector<int>{3, 1}));
+
+    const auto none = w.view<Hp>();
+    EXPECT_EQ(none.back(), ecs::no_entity);
+    int count = 0;
+    for (auto&& [e, h] : none.reversed())
+    {
+        (void)e;
+        (void)h;
+        ++count;
+    }
+    EXPECT_EQ(count, 0);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
