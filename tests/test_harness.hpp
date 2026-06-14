@@ -1,8 +1,6 @@
-// ============================================================================
-// test_harness.hpp -- shared test spine: CHECK macro, counters, violation
-// capture, and fixture types. No framework; main() lives in tests.cpp.
-// ============================================================================
 #pragma once
+
+#include <gtest/gtest.h>
 
 #include <ecs.hpp>
 
@@ -17,31 +15,18 @@
 #include <string>
 #include <vector>
 
-// ------------------------------------------------------------------- harness
-
-// inline (not static): shared across TUs so main() totals the whole suite.
-inline int checks_run = 0;
-inline int checks_failed = 0;
-
-#define CHECK(cond)                                                     \
-    do                                                                  \
-    {                                                                   \
-        ++checks_run;                                                   \
-        if (!(cond))                                                    \
-        {                                                               \
-            ++checks_failed;                                            \
-            std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-        }                                                               \
-    } while (false)
-
-#define CHECK_VALID(world) CHECK((world).validate().has_value())
-
-inline void section(const char* name)
+template <class Registry>
+inline ::testing::AssertionResult RegistryValid(const Registry& w)
 {
-    std::printf("--- %s\n", name);
+    const auto r = w.validate();
+    if (r.has_value())
+    {
+        return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure()
+           << "registry.validate() faulted: code=" << static_cast<int>(r.error().code);
 }
 
-// Captures violations instead of aborting, for tests that provoke them.
 inline int violations_seen = 0;
 inline std::string last_violation;
 
@@ -64,8 +49,6 @@ struct violation_scope
 
     ecs::violation_handler previous;
 };
-
-// ---------------------------------------------------- shared test components
 
 struct Pos
 {
@@ -96,7 +79,6 @@ struct Stable
     static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
-// Counts constructions/destructions to prove destructor balance everywhere.
 struct Counted
 {
     inline static int live = 0;
@@ -136,14 +118,12 @@ struct Counted
     }
 };
 
-// Stable-storage Counted (local classes cannot host the static policy member).
 struct StableCounted : Counted
 {
     using Counted::Counted;
     static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
-// Over-aligned payload; the move constructor verifies the holder honoured it.
 inline int misaligned_payloads = 0;
 
 struct alignas(64) Aligned
@@ -164,7 +144,6 @@ struct alignas(64) Aligned
     float lanes[16] = {};
 };
 
-// An injectable sort: same permute-the-range contract, different tie behavior.
 struct stable_algo
 {
     template <class It, class Cmp>
@@ -174,7 +153,6 @@ struct stable_algo
     }
 };
 
-// A minimal in-memory archive: ecs's writer/reader concepts keep encoding on the archive side.
 struct byte_writer
 {
     std::vector<std::byte> data;
@@ -201,49 +179,3 @@ struct byte_reader
         pos += sizeof(T);
     }
 };
-
-// ----------------------------------------------- cross-TU test declarations
-// Each TU defines these; main() in tests.cpp calls them.
-
-// tests_world.cpp (membership, mutation, ordering parity)
-void test_has_all_any();
-void test_amend();
-void test_driven_by();
-void test_sort_algorithm();
-void test_custom_pool_from_scratch();
-
-// tests_bonds.cpp (N-ary bonds and bond views)
-void test_bond_n_ary();
-void test_bond_n_ary_paths();
-void test_bond_n_ary_violations();  // defined (and called) under ECS_CHECKS only
-void test_bond_n_ary_unbond();
-void test_bond_observed_views();
-void test_bond_partition_sort();
-void test_bond_view_count();
-
-// tests_queries.cpp (any_of combinators)
-void test_any_of_basics();
-void test_any_of_driving();
-void test_any_of_composition();
-void test_any_of_violations();  // defined (and called) under ECS_CHECKS only
-
-// tests_reactive.cpp (watcher condition monitors)
-void test_watcher_entered();
-void test_watcher_changed();
-void test_watcher_lifetime();
-void test_watcher_violations();  // defined (and called) under ECS_CHECKS only
-
-// tests_meta.cpp (any, reflection, meta x ECS bridge)
-void test_any_basics();
-void test_reflection_registry();
-void test_reflection_fields();
-void test_reflection_methods();
-void test_reflection_construct();
-void test_reflection_ecs_fields();
-void test_reflection_ecs_verbs();
-
-// tests_traits.cpp (entity-traits templating)
-void test_traits_entity_layouts();
-void test_traits_compact_world();
-void test_traits_wide_world();
-void test_traits_relink();
