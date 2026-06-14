@@ -1,13 +1,10 @@
-// ============================================================================
-// tests_world.cpp -- has_all/has_any, amend, driven_by, sort algorithm
-// injection, and the from-scratch custom-pool example. Registered in tests.cpp.
-// ============================================================================
-
 #include "test_harness.hpp"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
+#include <vector>
 
-// Tied sort keys: `group` collides so only a stable algorithm pins tie order.
 struct SortKey
 {
     int group = 0;
@@ -21,10 +18,6 @@ struct SortKeyStable
     static constexpr auto ecs_storage = ecs::storage::stable;
 };
 
-// ------------------------------------------------ from-scratch custom pool
-// pool_of backend deriving ecs::basic_pool directly: typed surface plus cold
-// virtuals. Each payload lives in its own heap box, so pointers stay stable
-// and sorting swaps pointers only.
 template <ecs::component T>
 class boxed_pool : public ecs::basic_pool
 {
@@ -102,8 +95,6 @@ public:
         std::swap(boxes_[a], boxes_[b]);
     }
 
-    void mirror_swap(std::uint32_t a, std::uint32_t b) noexcept override { swap_positions(a, b); }
-
     void erase_if_present(std::uint32_t index) noexcept override
     {
         if (!contains(index))
@@ -154,7 +145,6 @@ private:
     std::pmr::vector<T*> boxes_;
 };
 
-// Components routed into the boxed pool; the Counted variant checks lifetimes.
 struct Crate
 {
     int v = 0;
@@ -177,140 +167,116 @@ struct ecs::pool_of<CrateCounted>
     using type = boxed_pool<CrateCounted>;
 };
 
-void test_has_all_any()
+TEST(World, HasAllAny)
 {
-    section("has_all / has_any: variadic membership");
-    ecs::world w;
+    ecs::registry w;
 
-    const ecs::entity e = w.spawn(Pos{1}, Vel{2});
-    const ecs::entity lone = w.spawn(Pos{3});
+    const ecs::entity e = w.create(Pos{1}, Vel{2});
+    const ecs::entity lone = w.create(Pos{3});
 
-    // has_all: every listed component present.
-    CHECK((w.has_all<Pos, Vel>(e)));
-    CHECK((!w.has_all<Pos, Vel>(lone)));
-    CHECK((!w.has_all<Pos, Vel, Hp>(e)));  // Hp pool never registered: absent
+    EXPECT_TRUE((w.has_all<Pos, Vel>(e)));
+    EXPECT_FALSE((w.has_all<Pos, Vel>(lone)));
+    EXPECT_FALSE((w.has_all<Pos, Vel, Hp>(e)));
 
-    // has_any: at least one present.
-    CHECK((w.has_any<Pos, Hp>(lone)));
-    CHECK((!w.has_any<Vel, Hp>(lone)));
+    EXPECT_TRUE((w.has_any<Pos, Hp>(lone)));
+    EXPECT_FALSE((w.has_any<Vel, Hp>(lone)));
 
-    // Tags are pure membership.
     w.add<TagA>(e);
-    CHECK((w.has_all<Pos, TagA>(e)));
-    CHECK((w.has_any<TagB, TagA>(e)));
-    CHECK((!w.has_any<TagB, Hp>(e)));
+    EXPECT_TRUE((w.has_all<Pos, TagA>(e)));
+    EXPECT_TRUE((w.has_any<TagB, TagA>(e)));
+    EXPECT_FALSE((w.has_any<TagB, Hp>(e)));
 
-    // Dead, stale, and null handles: false, never a violation.
-    const ecs::entity dead = w.spawn(Pos{9});
-    w.kill(dead);
-    CHECK((!w.has_all<Pos, Vel>(dead)));
-    CHECK((!w.has_any<Pos, Vel>(dead)));
-    CHECK((!w.has_all<Pos, Vel>(ecs::no_entity)));
-    CHECK((!w.has_any<Pos, Vel>(ecs::no_entity)));
+    const ecs::entity dead = w.create(Pos{9});
+    w.destroy(dead);
+    EXPECT_FALSE((w.has_all<Pos, Vel>(dead)));
+    EXPECT_FALSE((w.has_any<Pos, Vel>(dead)));
+    EXPECT_FALSE((w.has_all<Pos, Vel>(ecs::no_entity)));
+    EXPECT_FALSE((w.has_any<Pos, Vel>(ecs::no_entity)));
 
-    // A const world serves the same probes.
-    const ecs::world& cw = w;
-    CHECK((cw.has_all<Pos, Vel>(e)));
-    CHECK((cw.has_any<Hp, Vel>(e)));
+    const ecs::registry& cw = w;
+    EXPECT_TRUE((cw.has_all<Pos, Vel>(e)));
+    EXPECT_TRUE((cw.has_any<Hp, Vel>(e)));
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_amend()
+TEST(World, Amend)
 {
-    section("amend: observed in-place mutation");
-    ecs::world w;
+    ecs::registry w;
 
-    const ecs::entity e = w.spawn(Pos{1});
+    const ecs::entity e = w.create(Pos{1});
 
-    // Mutates in place and returns the same component.
     Pos& p = w.amend<Pos>(e, [](Pos& pos) { pos.x += 41; });
-    CHECK(p.x == 42);
-    CHECK(w.find<Pos>(e) == &p);
+    EXPECT_EQ(p.x, 42);
+    EXPECT_EQ(w.find<Pos>(e), &p);
 
-    // on_replace fires exactly once, after the callable has run.
     struct seen
     {
         int fired = 0;
         int value_at_fire = -1;
     } s;
     const ecs::hook_token t = w.on_replace<Pos>(
-        [](ecs::world& world, ecs::entity who, void* user)
+        [](ecs::registry& reg, ecs::entity who, void* user)
         {
             auto* k = static_cast<seen*>(user);
             ++k->fired;
-            k->value_at_fire = world.get<Pos>(who).x;
+            k->value_at_fire = reg.get<Pos>(who).x;
         },
         &s);
     w.amend<Pos>(e, [](Pos& pos) { pos.x = 7; });
-    CHECK(s.fired == 1);
-    CHECK(s.value_at_fire == 7);
+    EXPECT_EQ(s.fired, 1);
+    EXPECT_EQ(s.value_at_fire, 7);
     w.unhook(t);
 
-    // The tracker's replaced() channel collects amends like replace/put.
-    {
-        ecs::tracker<Pos> moved(w);
-        w.amend<Pos>(e, [](Pos& pos) { pos.x = 8; });
-        CHECK(moved.replaced().size() == 1);
-        CHECK(moved.replaced()[0] == e);
-    }
-
-    // Not structural: legal mid-iteration, even on the entity being visited.
-    const ecs::entity f = w.spawn(Pos{100});
+    const ecs::entity f = w.create(Pos{100});
     int visited = 0;
-    w.select<Pos>().each(
+    w.view<Pos>().each(
         [&](ecs::entity who, Pos&)
         {
             ++visited;
             w.amend<Pos>(who, [](Pos& pos) { pos.x += 1; });
         });
-    CHECK(visited == 2);
-    CHECK(w.get<Pos>(e).x == 9);
-    CHECK(w.get<Pos>(f).x == 101);
-    w.sort<Pos>([](const Pos& a, const Pos& b) { return a.x < b.x; });  // lock released
+    EXPECT_EQ(visited, 2);
+    EXPECT_EQ(w.get<Pos>(e).x, 8);
+    EXPECT_EQ(w.get<Pos>(f).x, 101);
+    w.sort<Pos>([](const Pos& a, const Pos& b) { return a.x < b.x; });
 
-    // No copies: the callable works on the live component.
     {
-        const ecs::entity c = w.spawn(Counted{5});
+        const ecs::entity c = w.create(Counted{5});
         const int after_spawn = Counted::total_ctors;
         w.amend<Counted>(c, [](Counted& k) { k.value = 6; });
-        CHECK(Counted::total_ctors == after_spawn);
-        CHECK(w.get<Counted>(c).value == 6);
+        EXPECT_EQ(Counted::total_ctors, after_spawn);
+        EXPECT_EQ(w.get<Counted>(c).value, 6);
     }
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_driven_by()
+TEST(World, DrivenBy)
 {
-    section("driven_by: manual query driver override");
-    ecs::world w;
+    ecs::registry w;
 
-    const ecs::entity a = w.spawn(Pos{3}, Vel{30});
-    const ecs::entity b = w.spawn(Pos{1}, Vel{10});
-    const ecs::entity c = w.spawn(Pos{2}, Vel{20});
-    w.spawn(Pos{99});  // Pos-only: matched only once Vel turns optional below
+    const ecs::entity a = w.create(Pos{3}, Vel{30});
+    const ecs::entity b = w.create(Pos{1}, Vel{10});
+    const ecs::entity c = w.create(Pos{2}, Vel{20});
+    w.create(Pos{99});
 
-    // Pos (4) outnumbers Vel (3), so Vel drives by default. Sort Pos, then
-    // force it to drive: ordered multi-component iteration.
     w.sort<Pos>([](const Pos& l, const Pos& r) { return l.x < r.x; });
 
-    const auto sel = w.select<Pos, Vel>();
+    const auto sel = w.view<Pos, Vel>();
     const auto by_pos = sel.driven_by<Pos>();
 
     std::vector<int> xs;
     by_pos.each([&](Pos& p, Vel&) { xs.push_back(p.x); });
-    CHECK(xs.size() == 3);
-    CHECK(xs[0] == 1 && xs[1] == 2 && xs[2] == 3);
+    EXPECT_EQ(xs.size(), 3);
+    EXPECT_TRUE(xs[0] == 1 && xs[1] == 2 && xs[2] == 3);
 
-    // The override changes WHICH pool drives, never the match set.
     std::size_t matched = 0;
     sel.each([&](Pos&, Vel&) { ++matched; });
-    CHECK(matched == 3);
-    CHECK(by_pos.count() == sel.count());
-    CHECK(by_pos.contains(a) && by_pos.contains(b) && by_pos.contains(c));
+    EXPECT_EQ(matched, 3);
+    EXPECT_EQ(by_pos.count(), sel.count());
+    EXPECT_TRUE(by_pos.contains(a) && by_pos.contains(b) && by_pos.contains(c));
 
-    // split carves the overridden driver's order: parts replay the sorted sequence.
     {
         std::vector<int> from_parts;
         const auto work = by_pos.split(2);
@@ -318,173 +284,145 @@ void test_driven_by()
         {
             work.part(i).each([&](Pos& p, Vel&) { from_parts.push_back(p.x); });
         }
-        CHECK(from_parts == xs);
+        EXPECT_EQ(from_parts, xs);
     }
 
-    // Composes with except<> and maybe<>; the override still orders the loop.
     w.add<TagA>(b);
     std::vector<int> filtered;
-    w.select<Pos, ecs::maybe<Vel>>(ecs::except<TagA>{})
+    w.view<Pos, ecs::maybe<Vel>>(!ecs::exists<TagA>{})
         .driven_by<Pos>()
         .each([&](Pos& p, Vel*) { filtered.push_back(p.x); });
-    CHECK(filtered.size() == 3);
-    CHECK(filtered[0] == 2 && filtered[1] == 3 && filtered[2] == 99);
+    EXPECT_EQ(filtered.size(), 3);
+    EXPECT_TRUE(filtered[0] == 2 && filtered[1] == 3 && filtered[2] == 99);
 
-    // Const world with unregistered pools: empty, no violation.
-    const ecs::world cold;
+    const ecs::registry cold;
     std::size_t cold_visits = 0;
-    cold.select<Pos, Vel>().driven_by<Pos>().each([&](const Pos&, const Vel&) { ++cold_visits; });
-    CHECK(cold_visits == 0);
+    cold.view<Pos, Vel>().driven_by<Pos>().each([&](const Pos&, const Vel&) { ++cold_visits; });
+    EXPECT_EQ(cold_visits, 0);
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_sort_algorithm()
+TEST(World, SortAlgorithm)
 {
-    section("sort: algorithm injection");
-    ecs::world w;
+    ecs::registry w;
 
-    // Tied groups: the injected stable_sort must keep spawn order within ties;
-    // the default std::sort guarantees no such thing.
     for (int i = 0; i < 6; ++i)
     {
-        w.spawn(SortKey{i % 2, i}, SortKeyStable{i % 2, i});
+        w.create(SortKey{i % 2, i}, SortKeyStable{i % 2, i});
     }
 
     w.sort<SortKey>([](const SortKey& l, const SortKey& r) { return l.group < r.group; },
                     stable_algo{});
 
     std::vector<std::pair<int, int>> order;
-    w.select<SortKey>().each([&](SortKey& k) { order.emplace_back(k.group, k.seq); });
+    w.view<SortKey>().each([&](SortKey& k) { order.emplace_back(k.group, k.seq); });
     const std::vector<std::pair<int, int>> expected{{0, 0}, {0, 2}, {0, 4}, {1, 1}, {1, 3}, {1, 5}};
-    CHECK(order == expected);
+    EXPECT_EQ(order, expected);
 
-    // Stable pools permute bookkeeping only: pointers survive the injected sort.
-    const ecs::entity probe = w.select<SortKeyStable>().first();
+    const ecs::entity probe = w.view<SortKeyStable>().first();
     const SortKeyStable* before = w.find<SortKeyStable>(probe);
     w.sort<SortKeyStable>([](const SortKeyStable& l, const SortKeyStable& r)
                           { return l.group < r.group; },
                           stable_algo{});
-    CHECK(w.find<SortKeyStable>(probe) == before);
+    EXPECT_EQ(w.find<SortKeyStable>(probe), before);
 
     std::vector<std::pair<int, int>> stable_order;
-    w.select<SortKeyStable>().each([&](SortKeyStable& k)
-                                   { stable_order.emplace_back(k.group, k.seq); });
-    CHECK(stable_order == expected);
+    w.view<SortKeyStable>().each([&](SortKeyStable& k)
+                                 { stable_order.emplace_back(k.group, k.seq); });
+    EXPECT_EQ(stable_order, expected);
 
-    // The entity-comparator form takes the algorithm too.
     w.sort<SortKey>([](ecs::entity l, ecs::entity r) { return l.index() < r.index(); },
                     stable_algo{});
     std::vector<int> seqs;
-    w.select<SortKey>().each([&](SortKey& k) { seqs.push_back(k.seq); });
+    w.view<SortKey>().each([&](SortKey& k) { seqs.push_back(k.seq); });
     const std::vector<int> spawn_order{0, 1, 2, 3, 4, 5};
-    CHECK(seqs == spawn_order);
+    EXPECT_EQ(seqs, spawn_order);
 
 #if ECS_CHECKS
-    // Mid-iteration sort is refused regardless of algorithm.
     {
         violation_scope guard;
-        w.select<SortKey>().each(
+        w.view<SortKey>().each(
             [&](ecs::entity, SortKey&)
             {
                 w.sort<SortKey>([](const SortKey& l, const SortKey& r) { return l.seq < r.seq; },
                                 stable_algo{});
                 return false;
             });
-        CHECK(violations_seen == 1);
+        EXPECT_EQ(violations_seen, 1);
         std::vector<int> after;
-        w.select<SortKey>().each([&](SortKey& k) { after.push_back(k.seq); });
-        CHECK(after == spawn_order);  // refused: order untouched
+        w.view<SortKey>().each([&](SortKey& k) { after.push_back(k.seq); });
+        EXPECT_EQ(after, spawn_order);
     }
 #endif
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_custom_pool_from_scratch()
+TEST(World, CustomPoolFromScratch)
 {
-    section("pool_of: from-scratch backend (boxed pool)");
-    ecs::world w;
+    ecs::registry w;
 
-    // Verbs flow through the custom emplace/at surface.
-    const ecs::entity a = w.spawn(Pos{1});
+    const ecs::entity a = w.create(Pos{1});
     Crate& c = w.add<Crate>(a, Crate{10});
-    CHECK(c.v == 10);
-    CHECK(w.has<Crate>(a));
-    CHECK(w.get<Crate>(a).v == 10);
+    EXPECT_EQ(c.v, 10);
+    EXPECT_TRUE(w.has<Crate>(a));
+    EXPECT_EQ(w.get<Crate>(a).v, 10);
 
-    // Boxed layout: pointers survive further adds.
     const Crate* pinned = w.find<Crate>(a);
     for (int i = 0; i < 64; ++i)
     {
-        w.add<Crate>(w.spawn(), Crate{100 + i});
+        w.add<Crate>(w.create(), Crate{100 + i});
     }
-    CHECK(w.find<Crate>(a) == pinned);
+    EXPECT_EQ(w.find<Crate>(a), pinned);
 
-    // replace / amend / put / obtain / remove drive the same surface.
     w.replace<Crate>(a, Crate{11});
     w.amend<Crate>(a, [](Crate& k) { k.v += 1; });
-    CHECK(w.get<Crate>(a).v == 12);
+    EXPECT_EQ(w.get<Crate>(a).v, 12);
     w.put<Crate>(a, Crate{13});
-    CHECK(w.obtain<Crate>(a).v == 13);
-    CHECK(w.remove<Crate>(a));
-    CHECK(!w.has<Crate>(a));
+    EXPECT_EQ(w.obtain<Crate>(a).v, 13);
+    EXPECT_TRUE(w.remove<Crate>(a));
+    EXPECT_FALSE(w.has<Crate>(a));
     w.add<Crate>(a, Crate{20});
 
-    // Hooks fire from the custom pool's emplace/erase paths.
     struct hook_counts
     {
         int added = 0;
         int removed = 0;
     } hc;
-    const ecs::hook_token ta = w.on_add<Crate>([](ecs::world&, ecs::entity, void* user)
+    const ecs::hook_token ta = w.on_add<Crate>([](ecs::registry&, ecs::entity, void* user)
                                                { ++static_cast<hook_counts*>(user)->added; },
                                                &hc);
-    const ecs::hook_token tr = w.on_remove<Crate>([](ecs::world&, ecs::entity, void* user)
+    const ecs::hook_token tr = w.on_remove<Crate>([](ecs::registry&, ecs::entity, void* user)
                                                   { ++static_cast<hook_counts*>(user)->removed; },
                                                   &hc);
-    const ecs::entity h = w.spawn(Crate{1});
+    const ecs::entity h = w.create(Crate{1});
     w.remove<Crate>(h);
-    CHECK(hc.added == 1 && hc.removed == 1);
+    EXPECT_TRUE(hc.added == 1 && hc.removed == 1);
     w.unhook(ta);
     w.unhook(tr);
 
-    // Selections intersect the custom pool with built-ins.
     std::size_t both = 0;
-    w.select<Crate, Pos>().each([&](Crate&, Pos&) { ++both; });
-    CHECK(both == 1);  // only `a` carries Pos too
+    w.view<Crate, Pos>().each([&](Crate&, Pos&) { ++both; });
+    EXPECT_EQ(both, 1);
 
-    // Sorting permutes boxes (pointer-stable) and honors injected algorithms.
-    // (a was re-boxed by the remove/re-add above: capture the new address.)
     const Crate* reboxed = w.find<Crate>(a);
     w.sort<Crate>([](const Crate& l, const Crate& r) { return l.v < r.v; }, stable_algo{});
-    CHECK(w.find<Crate>(a) == reboxed);
+    EXPECT_EQ(w.find<Crate>(a), reboxed);
     int prev = -1;
     bool ordered = true;
-    w.select<Crate>().each(
+    w.view<Crate>().each(
         [&](Crate& k)
         {
             ordered = ordered && prev <= k.v;
             prev = k.v;
         });
-    CHECK(ordered);
+    EXPECT_TRUE(ordered);
 
-    // Bonds run their mirrored partition through the custom mirror_swap.
-    w.bond<Crate, Pos>();
-    const auto pair = w.bonded<Crate, Pos>();
-    CHECK(pair.count() == 1);
-    const ecs::entity lone = w.select<Crate>(ecs::except<Pos>{}).first();
-    w.add<Pos>(lone, Pos{7});
-    CHECK(pair.count() == 2);
-    CHECK_VALID(w);
-    w.unbond<Crate, Pos>();
-
-    // duplicate routes through copy_item.
     const auto dup = w.duplicate(a);
-    CHECK(w.has<Crate>(dup.clone));
-    CHECK(w.get<Crate>(dup.clone).v == w.get<Crate>(a).v);
+    EXPECT_TRUE(w.has<Crate>(dup.clone));
+    EXPECT_EQ(w.get<Crate>(dup.clone).v, w.get<Crate>(a).v);
 
-    // Inspection reports the declared kind; raw access goes through item_address.
     bool seen = false;
     w.each_pool(
         [&](const ecs::pool_info& info)
@@ -492,32 +430,87 @@ void test_custom_pool_from_scratch()
             seen = seen ||
                    (info.name_hash == ecs::hash_of<Crate>() && info.kind == ecs::storage::stable);
         });
-    CHECK(seen);
+    EXPECT_TRUE(seen);
     auto pr = w.find_pool<Crate>();
-    CHECK(pr.raw(a) == static_cast<void*>(w.find<Crate>(a)));
+    EXPECT_EQ(pr.raw(a), static_cast<void*>(w.find<Crate>(a)));
 
-    // Archives drive the typed surface too.
     {
         byte_writer out;
         ecs::pack<Crate>(w, out);
-        ecs::world fresh;
+        ecs::registry fresh;
         byte_reader in{&out.data};
         const auto ok = ecs::unpack<Crate>(fresh, in);
-        CHECK(ok.has_value());
-        CHECK(fresh.select<Crate>().count() == w.select<Crate>().count());
+        EXPECT_TRUE(ok.has_value());
+        EXPECT_EQ(fresh.view<Crate>().count(), w.view<Crate>().count());
     }
 
-    // Lifetime balance through purge's wipe path.
     {
         const int live_before = Counted::live;
         for (int i = 0; i < 8; ++i)
         {
-            w.add<CrateCounted>(w.spawn(), 5);
+            w.add<CrateCounted>(w.create(), 5);
         }
-        CHECK(Counted::live == live_before + 8);
+        EXPECT_EQ(Counted::live, live_before + 8);
         w.purge<CrateCounted>();
-        CHECK(Counted::live == live_before);
+        EXPECT_EQ(Counted::live, live_before);
     }
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
+}
+
+TEST(World, BulkCreateEntities)
+{
+    ecs::registry w;
+
+    std::vector<ecs::entity> made;
+    w.create_n(5, std::back_inserter(made));
+    EXPECT_EQ(made.size(), 5u);
+    for (const ecs::entity e : made)
+    {
+        EXPECT_TRUE(w.alive(e));
+    }
+    EXPECT_EQ(w.live_count(), 5u);
+
+    int seen = 0;
+    w.create_n(3, [&](ecs::entity e) { w.add<Pos>(e, Pos{++seen}); });
+    EXPECT_EQ(seen, 3);
+    EXPECT_EQ(w.view<Pos>().count(), 3u);
+
+    w.destroy(made.begin(), made.end());
+    for (const ecs::entity e : made)
+    {
+        EXPECT_FALSE(w.alive(e));
+    }
+    EXPECT_EQ(w.live_count(), 3u);
+
+    w.create_n(0, std::back_inserter(made));
+    EXPECT_EQ(w.live_count(), 3u);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
+
+TEST(World, InsertRange)
+{
+    ecs::registry w;
+    std::vector<ecs::entity> es;
+    w.create_n(4, std::back_inserter(es));
+
+    int adds = 0;
+    const ecs::hook_token t =
+        w.on_add<Vel>([](ecs::registry&, ecs::entity, void* u) { ++*static_cast<int*>(u); }, &adds);
+    w.insert<Vel>(es.begin(), es.end(), Vel{7});
+    EXPECT_EQ(adds, 4);
+    for (const ecs::entity e : es)
+    {
+        EXPECT_EQ(w.get<Vel>(e).v, 7);
+    }
+    w.unhook(t);
+
+    const std::array<Pos, 4> seed{Pos{1}, Pos{2}, Pos{3}, Pos{4}};
+    w.insert<Pos>(es.begin(), es.end(), seed.begin());
+    int sum = 0;
+    w.view<Pos>().each([&](Pos& p) { sum += p.x; });
+    EXPECT_EQ(sum, 10);
+
+    EXPECT_TRUE(RegistryValid(w));
 }
