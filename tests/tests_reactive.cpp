@@ -1,10 +1,7 @@
-// ============================================================================
-// tests_reactive.cpp -- watcher tests: enter edges, eviction, changed<>
-// triggers, lifetime, and lock violations.
-// ============================================================================
-
 #include "test_harness.hpp"
 
+namespace
+{
 struct Burning
 {
     int heat = 0;
@@ -13,165 +10,257 @@ struct Burning
 struct Shielded
 {
 };
+}
 
-void test_watcher_entered()
+TEST(Reactive, Tracker)
 {
-    section("watcher: enter edges and live-truth eviction");
-    ecs::world w;
+    ecs::registry w;
+    ecs::tracker<Hp> hurt(w);
 
+    const ecs::entity a = w.create();
+    const ecs::entity b = w.create();
+    w.add<Hp>(a, Hp{10});
+    w.add<Hp>(b, Hp{20});
+    EXPECT_EQ(hurt.added().size(), 2U);
+
+    w.replace<Hp>(a, Hp{9});
+    w.replace<Hp>(a, Hp{8});
+    w.put<Hp>(a, Hp{7});
+    EXPECT_EQ(hurt.replaced().size(), 1U);
+    EXPECT_EQ(hurt.replaced()[0], a);
+
+    w.destroy(b);
+    EXPECT_EQ(hurt.removed().size(), 1U);
+    EXPECT_EQ(hurt.removed()[0], b);
+    EXPECT_FALSE(w.alive(hurt.removed()[0]));
+
+    hurt.clear();
+    EXPECT_TRUE(hurt.added().empty());
+    EXPECT_TRUE(hurt.replaced().empty());
+    EXPECT_TRUE(hurt.removed().empty());
+    w.replace<Hp>(a, Hp{6});
+    EXPECT_EQ(hurt.replaced().size(), 1U);
+    hurt.clear();
+
+    w.remove<Hp>(a);
+    hurt.clear();
+    w.destroy(a);
+    const ecs::entity recycled = w.create();
+    EXPECT_EQ(recycled.index(), a.index());
+    w.add<Hp>(recycled, Hp{1});
+    EXPECT_EQ(hurt.added().size(), 1U);
+    EXPECT_EQ(hurt.added()[0], recycled);
+
+    ecs::tracker<Pos> moves(w, ecs::track::added | ecs::track::removed);
+    const ecs::entity c = w.create(Pos{1});
+    w.replace<Pos>(c, Pos{2});
+    w.destroy(c);
+    EXPECT_EQ(moves.added().size(), 1U);
+    EXPECT_TRUE(moves.replaced().empty());
+    EXPECT_EQ(moves.removed().size(), 1U);
+
+    hurt.clear();
+    w.create(Hp{1});
+    w.create(Hp{2});
+    hurt.clear();
+    w.reset();
+    EXPECT_EQ(hurt.removed().size(), 3U);
+
+    {
+        struct counting_resource : std::pmr::memory_resource
+        {
+            std::size_t allocations = 0;
+            void* do_allocate(std::size_t bytes, std::size_t align) override
+            {
+                ++allocations;
+                return std::pmr::get_default_resource()->allocate(bytes, align);
+            }
+            void do_deallocate(void* p, std::size_t bytes, std::size_t align) override
+            {
+                std::pmr::get_default_resource()->deallocate(p, bytes, align);
+            }
+            [[nodiscard]] bool do_is_equal(
+                const std::pmr::memory_resource& other) const noexcept override
+            {
+                return this == &other;
+            }
+        };
+        counting_resource arena;
+        ecs::tracker<Hp> counted(w, ecs::track::all, &arena);
+        w.create(Hp{1});
+        EXPECT_GT(arena.allocations, 0U);
+    }
+    EXPECT_TRUE(RegistryValid(w));
+}
+
+TEST(Reactive, WatcherEntered)
+{
+    ecs::registry w;
     ecs::watcher<ecs::types<Burning, Hp>> entered(w);
 
-    // Gaining the LAST missing include inserts; partial sets do not.
-    const ecs::entity e = w.spawn(Hp{10});
-    CHECK(entered.count() == 0);
+    const ecs::entity e = w.create(Hp{10});
+    EXPECT_EQ(entered.count(), 0U);
+    EXPECT_TRUE(entered.empty());
     w.add<Burning>(e, Burning{5});
-    CHECK(entered.count() == 1);
-    CHECK(entered.contains(e));
+    EXPECT_EQ(entered.count(), 1U);
+    EXPECT_FALSE(entered.empty());
+    EXPECT_TRUE(entered.contains(e));
 
-    // Losing any include evicts -- matched() is live truth.
     w.remove<Hp>(e);
-    CHECK(entered.count() == 0);
-    CHECK(!entered.contains(e));
-    w.add<Hp>(e, Hp{20});  // re-enters through the other include
-    CHECK(entered.count() == 1);
+    EXPECT_EQ(entered.count(), 0U);
+    EXPECT_FALSE(entered.contains(e));
+    w.add<Hp>(e, Hp{20});
+    EXPECT_EQ(entered.count(), 1U);
 
-    // Dedup: repeated edges keep one entry.
     w.remove<Burning>(e);
     w.add<Burning>(e, Burning{6});
-    CHECK(entered.count() == 1);
+    EXPECT_EQ(entered.count(), 1U);
 
-    // Drain empties; a still-matching entity is not re-collected without a fresh edge.
     entered.clear();
-    CHECK(entered.count() == 0);
-    CHECK((w.has_all<Burning, Hp>(e)));
+    EXPECT_EQ(entered.count(), 0U);
+    EXPECT_TRUE((w.has_all<Burning, Hp>(e)));
     w.remove<Burning>(e);
-    w.add<Burning>(e, Burning{7});  // a fresh edge re-collects
-    CHECK(entered.count() == 1);
+    w.add<Burning>(e, Burning{7});
+    EXPECT_EQ(entered.count(), 1U);
 
-    // kill evicts naturally (include hooks fire on the way out).
-    w.kill(e);
-    CHECK(entered.count() == 0);
+    w.destroy(e);
+    EXPECT_EQ(entered.count(), 0U);
 
-    // Pre-existing members do NOT enter at construction: watchers see edges.
-    const ecs::entity old = w.spawn(Hp{1});
+    const ecs::entity old = w.create(Hp{1});
     w.add<Burning>(old, Burning{1});
     ecs::watcher<ecs::types<Burning, Hp>> late(w);
-    CHECK(late.count() == 0);
+    EXPECT_EQ(late.count(), 0U);
 
-    // except<>: adding the exclude evicts; removing it (includes held) inserts.
     ecs::watcher<ecs::types<Burning>, ecs::except<Shielded>> guarded(w);
-    CHECK(guarded.count() == 0);  // `old` predates the watcher
+    EXPECT_EQ(guarded.count(), 0U);
     w.add<Shielded>(old);
-    CHECK(guarded.count() == 0);
-    w.remove<Shielded>(old);  // un-shielding IS the enter edge
-    CHECK(guarded.count() == 1);
-    CHECK(guarded.contains(old));
-    w.add<Shielded>(old);  // shielding evicts
-    CHECK(guarded.count() == 0);
+    EXPECT_EQ(guarded.count(), 0U);
+    w.remove<Shielded>(old);
+    EXPECT_EQ(guarded.count(), 1U);
+    EXPECT_TRUE(guarded.contains(old));
+    w.add<Shielded>(old);
+    EXPECT_EQ(guarded.count(), 0U);
 
-    const ecs::entity f = w.spawn();
+    const ecs::entity f = w.create();
     w.add<Burning>(f, Burning{2});
-    CHECK(guarded.count() == 1);
+    EXPECT_EQ(guarded.count(), 1U);
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_watcher_changed()
+TEST(Reactive, WatcherChanged)
 {
-    section("watcher: changed<> triggers fire only while matching");
-    ecs::world w;
-
+    ecs::registry w;
     ecs::watcher<ecs::types<Burning>, ecs::changed<Hp>> hurt_while_burning(w);
 
-    const ecs::entity e = w.spawn(Burning{1}, Hp{100});
-    CHECK(hurt_while_burning.count() == 1);  // entered via the Burning edge
+    const ecs::entity e = w.create(Burning{1}, Hp{100});
+    EXPECT_EQ(hurt_while_burning.count(), 1U);
     hurt_while_burning.clear();
 
-    // replace / put / amend all trigger; a plain reference write does not.
     w.replace<Hp>(e, Hp{90});
-    CHECK(hurt_while_burning.count() == 1);
+    EXPECT_EQ(hurt_while_burning.count(), 1U);
     hurt_while_burning.clear();
     w.put<Hp>(e, Hp{80});
-    CHECK(hurt_while_burning.count() == 1);
+    EXPECT_EQ(hurt_while_burning.count(), 1U);
     hurt_while_burning.clear();
     w.amend<Hp>(e, [](Hp& hp) { hp.hp -= 10; });
-    CHECK(hurt_while_burning.count() == 1);
+    EXPECT_EQ(hurt_while_burning.count(), 1U);
     hurt_while_burning.clear();
-    w.get<Hp>(e).hp = 5;  // invisible by design
-    CHECK(hurt_while_burning.count() == 0);
+    w.get<Hp>(e).hp = 5;
+    EXPECT_EQ(hurt_while_burning.count(), 0U);
 
-    // A non-matching entity's change is ignored.
-    const ecs::entity cold = w.spawn(Hp{50});
+    const ecs::entity cold = w.create(Hp{50});
     w.amend<Hp>(cold, [](Hp& hp) { hp.hp = 1; });
-    CHECK(hurt_while_burning.count() == 0);
+    EXPECT_EQ(hurt_while_burning.count(), 0U);
 
-    // Breaking the condition evicts even a trigger-collected entry.
     w.amend<Hp>(e, [](Hp& hp) { hp.hp = 4; });
-    CHECK(hurt_while_burning.count() == 1);
+    EXPECT_EQ(hurt_while_burning.count(), 1U);
     w.remove<Burning>(e);
-    CHECK(hurt_while_burning.count() == 0);
+    EXPECT_EQ(hurt_while_burning.count(), 0U);
 
-    // A changed<> type may also be a condition.
     ecs::watcher<ecs::types<Hp>, ecs::changed<Hp>> hp_watch(w);
-    const ecs::entity g = w.spawn(Hp{7});
-    CHECK(hp_watch.count() == 1);
+    const ecs::entity g = w.create(Hp{7});
+    EXPECT_EQ(hp_watch.count(), 1U);
     hp_watch.clear();
     w.amend<Hp>(g, [](Hp& hp) { ++hp.hp; });
-    CHECK(hp_watch.count() == 1);
+    EXPECT_EQ(hp_watch.count(), 1U);
 
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
-void test_watcher_lifetime()
+TEST(Reactive, WatcherLifetime)
 {
-    section("watcher: reset, teardown, and span stability");
-    ecs::world w;
+    ecs::registry w;
+    auto watcher_box = std::make_unique<ecs::watcher<ecs::types<Burning>>>(w);
+    const ecs::entity e = w.create(Burning{1});
+    EXPECT_EQ(watcher_box->count(), 1U);
 
-    auto* watcher_box = new ecs::watcher<ecs::types<Burning>>(w);
-    const ecs::entity e = w.spawn(Burning{1});
-    CHECK(watcher_box->count() == 1);
-
-    // reset() evicts everything; the hook connections survive.
     w.reset();
-    CHECK(watcher_box->count() == 0);
-    const ecs::entity f = w.spawn(Burning{2});
-    CHECK(watcher_box->count() == 1);
-    CHECK(watcher_box->contains(f));
-    CHECK(!watcher_box->contains(e));  // dead handle: not collected
+    EXPECT_EQ(watcher_box->count(), 0U);
+    const ecs::entity f = w.create(Burning{2});
+    EXPECT_EQ(watcher_box->count(), 1U);
+    EXPECT_TRUE(watcher_box->contains(f));
+    EXPECT_FALSE(watcher_box->contains(e));
 
-    // matched() spans read the live set directly.
     int total = 0;
     for (const ecs::entity m : watcher_box->matched())
     {
         total += w.get<Burning>(m).heat;
     }
-    CHECK(total == 2);
+    EXPECT_EQ(total, 2);
 
-    // Destruction disconnects: later edges touch nothing.
-    delete watcher_box;
+    watcher_box.reset();
     w.add<Hp>(f, Hp{1});
     w.remove<Burning>(f);
     w.add<Burning>(f, Burning{3});
-    CHECK_VALID(w);
+    EXPECT_TRUE(RegistryValid(w));
 }
 
 #if ECS_CHECKS
-void test_watcher_violations()
+TEST(Reactive, WatcherViolations)
 {
-    section("watcher: hook connect/disconnect rules apply");
-    ecs::world w;
-    w.spawn(Burning{1});
+    ecs::registry w;
+    w.create(Burning{1});
 
-    // Hook connect is refused while a named pool iterates, leaving the watcher inert but safe.
     violation_scope guard;
-    w.select<Burning>().each(
-        [&](ecs::entity, Burning&)
+    w.view<Burning>().each(
+        [&](Burning&)
         {
             const ecs::watcher<ecs::types<Burning>> mid_loop(w);
-            CHECK(mid_loop.count() == 0);
-            return false;
+            EXPECT_EQ(mid_loop.count(), 0U);
         });
-    CHECK(violations_seen >= 1);
-    CHECK_VALID(w);
+    EXPECT_GE(violations_seen, 1);
+    EXPECT_TRUE(RegistryValid(w));
 }
 #endif
+
+TEST(Reactive, ViewEachOf)
+{
+    ecs::registry w;
+    ecs::tracker<Hp> hurt(w, ecs::track::replaced);
+
+    const ecs::entity a = w.create(Pos{1}, Hp{10});
+    const ecs::entity b = w.create(Hp{20});
+    const ecs::entity c = w.create(Pos{3}, Hp{30});
+    w.replace<Hp>(a, Hp{9});
+    w.replace<Hp>(b, Hp{19});
+    w.replace<Hp>(c, Hp{29});
+
+    std::vector<int> xs;
+    w.view<Pos>().each_of(hurt.replaced(), [&](Pos& p) { xs.push_back(p.x); });
+    std::sort(xs.begin(), xs.end());
+    EXPECT_EQ(xs, (std::vector<int>{1, 3}));
+
+    w.add<TagA>(a);
+    std::vector<ecs::entity> tagged;
+    w.view<Pos>(ecs::exists<TagA>{})
+        .each_of(hurt.replaced(), [&](ecs::entity e, Pos&) { tagged.push_back(e); });
+    EXPECT_EQ(tagged, (std::vector<ecs::entity>{a}));
+
+    w.destroy(c);
+    int live = 0;
+    w.view<Pos>().each_of(hurt.replaced(), [&](Pos&) { ++live; });
+    EXPECT_EQ(live, 1);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
