@@ -1,41 +1,32 @@
-#pragma once
-// ============================================================================
-// ecs.hpp -- a single-header Entity Component System for real-time games.
-//
-//   C++23 - no dependencies - no RTTI - no exceptions of its own - MIT.
-//
-//   ecs::world w;
-//   ecs::entity e = w.spawn(Transform{...}, Velocity{...});
-//   w.each<Transform, Velocity>([](ecs::entity, Transform& t, Velocity& v) { ... });
-//
-// Also in the box: reusable selections (select / range / split), bonded pool
-// pairs, maybe<T> / except<T>, command_buffer, sort / sort_along, add/remove
-// hooks (fn / member / RAII / tracker), pack/unpack serialization, globals,
-// pipeline stages, blueprints, entity refs, type-erased runtime pools and
-// queries, the pool_of<T> storage seam, ecs::types<...> manifests, std::pmr.
-//
-// Mutation rules during iteration (each/entities/range/split/bonded/children_of):
-//   ALLOWED:  writing component values; bare spawn(); recording into a
-//             command_buffer; structural changes to non-iterated pools.
-//   REFUSED (checked builds report a violation, then nothing happens):
-//             structural changes to an iterated pool -- remove, tag add,
-//             kill/duplicate of its entities, purge/sort, hook (dis)connect --
-//             plus reset/shrink/apply/world-teardown while anything iterates.
-//   REPORTED, THEN PROCEEDS: value add/put on an iterated pool (a reference
-//             must be returned); references the callback already holds may
-//             dangle -- use the command_buffer.
-//
-// Thread model: a world and the buffers feeding it are externally synchronized.
-// Component type ids and the violation handler are process-global, thread-safe.
-//
-// Exceptions: ecs throws nothing; cold grow/reserve paths may propagate
-// std::bad_alloc. Hot lookups and iteration do not allocate.
-//
-// ECS_CHECKS (default: on when NDEBUG is undefined) enables stale-handle
-// detection, iteration locks, and consistency asserts, routed through a
-// replaceable violation handler (see set_violation_handler).
-// ============================================================================
+/*  ============================================================================================  *
+ *                                                             ⠀   ⠀
+ *                                                             ⠀
+ *
+ *
+ *                      :::::::::: ::::::::   ::::::::
+ *                      :+:       :+:    :+: :+:    :+:    ⠀⠀⢀⣴⣾⠿⠿⠿⠿⠿⠿⠿⠿⢷⣦⡀⠀⠀
+ *                      +:+       +:+        +:+           ⠀⢠⡿⠏⢠⣸⣧⡀⠀⠀⢀⠰⢆⡄⠙⢿⡄⠀
+ *                      +#++:++#  +#+        +#++:++#++    ⠀⣿⡇⠀⠙⢻⡿⠁⠀⠀⠈⢡⡌⠏⠀⢸⣿⠀
+ *                      +#+       +#+               +#+    ⢠⣿⠃⠀⠀⠀⣀⣀⣀⣀⣀⣀⠀⠀⠀⠘⣿⡆
+ *                      #+#       #+#    #+# #+#    #+#    ⢸⣿⠀⠀⠀⣼⡟⠉⠉⠉⠉⢻⣧⠀⠀⠀⣿⡇
+ *                      ########## ########   ########     ⠈⠻⣶⣶⡾⠏⠀⠀⠀⠀⠀⠀⠹⣷⣶⣶⠟⠁
+ *                                                                ⠀⠀⠀
+ *                                                                ⠀⠀⠀⠀
+ *                                  << E C S   L I B R A R Y >>   ⠀⠀⠀
+ *
+ *  ============================================================================================  *
+ *
+ *      A single-header C++23 Entity Component System for real-time
+ *      games and simulation: plain-struct components, cache-friendly
+ *      view queries, and message-driven systems. No RTTI, no exceptions.
+ *
+ *    ----------------------------------------------------------------------
+ *
+ *      Repository:   https://github.com/lextpf/ecs
+ *      License:      MIT
+ */
 
+#pragma once
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -47,6 +38,7 @@
 #include <cstdlib>
 #include <expected>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <memory_resource>
@@ -73,38 +65,36 @@ namespace ecs
 inline constexpr bool checks_enabled = (ECS_CHECKS != 0);
 
 template <class Traits>
-class basic_world;
+class basic_registry;
+
 template <class Traits>
 class basic_command_buffer;
+
 template <class Traits>
 class basic_blueprint;
+
 template <class Traits>
 class basic_pool_ref;
+
 template <class Traits>
 class basic_runtime_selection;
+
 template <class Traits>
 class basic_scoped_hook;
+
 template <class W>
-class basic_entity_ref;
-template <class Traits, class Excludes, class... Ts>
-class basic_bonded_view;
-template <class Traits, class Excludes, class... Ts>
-class basic_selection;
-struct test_access;  // checked-build test backdoor; defined only when ECS_CHECKS is on
+class basic_entity_filler;
+
+template <class Traits, class Filter, class... Ts>
+class basic_view;
+
+struct test_access;
 
 namespace detail
 {
 template <class Traits>
-struct basic_kin;  // internal parent/child link component; managed via adopt/orphan/kill
+struct basic_kin;
 }
-
-// ----------------------------------------------------------------------------
-// Violation handler
-//
-// Checked-build safety violations call the installed handler (default: print
-// and abort). A handler that returns makes the offending operation skip where
-// safe, or proceed (documented per call site) where a result must be produced.
-// ----------------------------------------------------------------------------
 
 using violation_handler = void (*)(const char* message);
 
@@ -129,8 +119,6 @@ inline void violate(const char* message)
     violation_slot().load(std::memory_order_relaxed)(message);
 }
 
-// Composes "<what> '<name>'" for messages that mention a component pool.
-// Cold path, checked builds only; the buffer is thread-local scratch.
 inline void violate_pool(const char* what, std::string_view pool_name)
 {
     thread_local char buffer[192];
@@ -144,8 +132,6 @@ inline void violate_pool(const char* what, std::string_view pool_name)
 }
 }  // namespace detail
 
-// Installs a new process-wide violation handler and returns the previous one.
-// Passing nullptr restores the default (print + abort).
 inline violation_handler set_violation_handler(violation_handler handler) noexcept
 {
     if (handler == nullptr)
@@ -155,20 +141,9 @@ inline violation_handler set_violation_handler(violation_handler handler) noexce
     return detail::violation_slot().exchange(handler, std::memory_order_relaxed);
 }
 
-// ----------------------------------------------------------------------------
-// Compile-time toolkit
-//
-// Type-list vocabulary (ecs::types and friends), published because bundles of
-// component types travel between systems, archives, and queries. Traits yield
-// types (_t aliases); consteval fns yield values. O(list) instantiations.
-// ----------------------------------------------------------------------------
-
-// One compile-time constant carried as a type.
 template <auto Value>
 using constant = std::integral_constant<decltype(Value), Value>;
 
-// A bundle of types, nothing more. The size is a member so lists carry their
-// own arity; the self alias lets metafunctions return lists uniformly.
 template <class... Ts>
 struct types
 {
@@ -176,7 +151,15 @@ struct types
     static constexpr std::size_t size = sizeof...(Ts);
 };
 
-// The type at position I (compile error when out of range).
+template <class T>
+inline constexpr bool is_types_v = false;
+
+template <class... Ts>
+inline constexpr bool is_types_v<types<Ts...>> = true;
+
+template <class T>
+concept type_list = is_types_v<std::remove_cvref_t<T>>;
+
 template <std::size_t I, class List>
 struct type_at;
 
@@ -194,14 +177,18 @@ struct type_at<0, types<T, Rest...>>
 template <std::size_t I, class List>
 using type_at_t = type_at<I, List>::type;
 
-// Membership (usable directly in requires-clauses).
+template <class List>
+using front_t = type_at_t<0, List>;
+
+template <class List>
+using back_t = type_at_t<List::size - 1, List>;
+
 template <class T, class List>
 inline constexpr bool contains_type = false;
 
 template <class T, class... Ts>
 inline constexpr bool contains_type<T, types<Ts...>> = (std::same_as<T, Ts> || ...);
 
-// Position of T's first occurrence; ill-formed (with this message) if absent.
 template <class T, class... Ts>
 [[nodiscard]] consteval std::size_t index_of(types<Ts...>) noexcept
 {
@@ -214,10 +201,9 @@ template <class T, class... Ts>
             return i;
         }
     }
-    return sizeof...(Ts);  // unreachable: the static_assert above fired
+    return sizeof...(Ts);
 }
 
-// Concatenation of any number of lists.
 template <class... Lists>
 struct joined
 {
@@ -238,7 +224,6 @@ struct joined<types<Ts...>, types<Us...>, Rest...> : joined<types<Ts..., Us...>,
 template <class... Lists>
 using joined_t = joined<Lists...>::type;
 
-// The list without any occurrence of the given types.
 template <class List, class... Drop>
 struct without;
 
@@ -253,7 +238,6 @@ struct without<types<Ts...>, Drop...>
 template <class List, class... Drop>
 using without_t = without<List, Drop...>::type;
 
-// The list with duplicates removed (first occurrence wins).
 template <class List>
 struct distinct;
 
@@ -272,30 +256,119 @@ struct distinct<types<T, Rest...>>
 template <class List>
 using distinct_t = distinct<List>::type;
 
-// Element-wise application of a standard metafunction (Op<T>::type).
+template <class List>
+inline constexpr bool all_unique_v = (distinct_t<List>::size == List::size);
+
+template <class Sub, class Super>
+inline constexpr bool is_subset_v = false;
+
+template <class... Ts, class Super>
+inline constexpr bool is_subset_v<types<Ts...>, Super> = (contains_type<Ts, Super> && ...);
+
+template <class A, class B>
+struct intersected;
+
+template <class... Ts, class B>
+struct intersected<types<Ts...>, B>
+{
+    template <class T>
+    using keep_one = std::conditional_t<contains_type<T, B>, types<T>, types<>>;
+    using type = joined_t<types<>, keep_one<Ts>...>;
+};
+
+template <class A, class B>
+using intersection_t = intersected<A, B>::type;
+
+template <class A, class B>
+struct subtracted;
+
+template <class... As, class... Bs>
+struct subtracted<types<As...>, types<Bs...>>
+{
+    using type = without_t<types<As...>, Bs...>;
+};
+
+template <class A, class B>
+using difference_t = subtracted<A, B>::type;
+
 template <template <class> class Op, class List>
 struct mapped;
 
 template <template <class> class Op, class... Ts>
 struct mapped<Op, types<Ts...>>
 {
-    // Generic metafunction application; there is no _t shortcut for an
-    // arbitrary Op. NOLINTNEXTLINE(modernize-type-traits)
     using type = types<typename Op<Ts>::type...>;
 };
 
 template <template <class> class Op, class List>
 using mapped_t = mapped<Op, List>::type;
 
-// Invokes fn's templated call operator once per type, in order:
-//   for_each_type(list, []<class T>() { ... });
+template <template <class> class Pred, class List>
+inline constexpr bool all_of_v = false;
+
+template <template <class> class Pred, class... Ts>
+inline constexpr bool all_of_v<Pred, types<Ts...>> = (Pred<Ts>::value && ...);
+
+template <template <class> class Pred, class List>
+inline constexpr bool any_of_v = false;
+
+template <template <class> class Pred, class... Ts>
+inline constexpr bool any_of_v<Pred, types<Ts...>> = (Pred<Ts>::value || ...);
+
+template <template <class> class Pred, class List>
+inline constexpr bool none_of_v = false;
+
+template <template <class> class Pred, class... Ts>
+inline constexpr bool none_of_v<Pred, types<Ts...>> = (!Pred<Ts>::value && ...);
+
+template <template <class> class Pred, class List>
+inline constexpr std::size_t count_if_v = 0;
+
+template <template <class> class Pred, class... Ts>
+inline constexpr std::size_t count_if_v<Pred, types<Ts...>> =
+    (std::size_t{0} + ... + (Pred<Ts>::value ? std::size_t{1} : std::size_t{0}));
+
+template <template <class> class Pred, class List>
+struct filtered;
+
+template <template <class> class Pred, class... Ts>
+struct filtered<Pred, types<Ts...>>
+{
+    template <class T>
+    using keep_one = std::conditional_t<Pred<T>::value, types<T>, types<>>;
+    using type = joined_t<types<>, keep_one<Ts>...>;
+};
+
+template <template <class> class Pred, class List>
+using filter_t = filtered<Pred, List>::type;
+
+template <template <class> class Pred, class... Ts>
+[[nodiscard]] consteval std::size_t find_if(types<Ts...>) noexcept
+{
+    if constexpr (sizeof...(Ts) == 0)
+    {
+        return 0;
+    }
+    else
+    {
+        constexpr bool hits[]{Pred<Ts>::value...};
+        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
+        {
+            if (hits[i])
+            {
+                return i;
+            }
+        }
+        return sizeof...(Ts);
+    }
+}
+
 template <class... Ts, class F>
-constexpr void for_each_type(types<Ts...>, F&& fn)
+constexpr void for_each(types<Ts...>, F&& fn)
 {
     (fn.template operator()<Ts>(), ...);
 }
 
-// The value-side mirror, for bundles of compile-time constants.
 template <auto... Vs>
 struct values
 {
@@ -303,7 +376,6 @@ struct values
     static constexpr std::size_t size = sizeof...(Vs);
 };
 
-// The value at position I, with its exact type preserved.
 template <std::size_t I, auto First, auto... Rest>
 [[nodiscard]] consteval auto value_at(values<First, Rest...>) noexcept
 {
@@ -336,32 +408,15 @@ template <auto V, auto... Vs>
             return i;
         }
     }
-    return sizeof...(Vs);  // unreachable: the static_assert above fired
+    return sizeof...(Vs);
 }
-
-// ----------------------------------------------------------------------------
-// Entity handle
-//
-// 8 bytes: a slot index plus a generation that increments every time the slot
-// is recycled, so handles to dead entities are detectable. Two plain fields,
-// readable in any debugger. A default-constructed entity equals no_entity.
-// ----------------------------------------------------------------------------
 
 namespace detail
 {
 inline constexpr std::uint32_t npos32 = 0xFFFFFFFFu;
-// Four mechanisms are welded to the handle layout (the per-traits contract):
-//   1. the spare index bit above index_bits flags provisional handles from
-//      command_buffer::spawn() -- real slots stay below 2^index_bits;
-//   2. provisional generations carry the buffer nonce (apply() refuses
-//      foreign/pre-clear provisionals; misuse detection, not security);
-//   3. entity_table::max_slots = 2^index_bits - 1;
-//   4. bits() packs index + generation into one stable 64-bit encoding.
 inline constexpr std::uint32_t provisional_bit = 0x80000000u;
 }  // namespace detail
 
-// The handle layout contract. Widths choose field TYPES, not shift math; the
-// defaults are the classic 31-bit slots + 32-bit generations in 8 bytes.
 struct default_entity_traits
 {
     using index_type = std::uint32_t;
@@ -373,18 +428,14 @@ template <class Traits>
 concept entity_traits =
     std::unsigned_integral<typename Traits::index_type> &&
     std::unsigned_integral<typename Traits::generation_type> && (Traits::index_bits >= 1) &&
-    // One spare index bit is RESERVED for the provisional flag (weld #1).
     (Traits::index_bits <
      static_cast<std::uint32_t>(std::numeric_limits<typename Traits::index_type>::digits)) &&
-    // bits() must pack losslessly into 64 (weld #4).
     (Traits::index_bits + static_cast<std::uint32_t>(
                               std::numeric_limits<typename Traits::generation_type>::digits) <=
      64);
 
 namespace detail
 {
-// Per-traits weld constants; for the default traits these reproduce
-// npos32 / provisional_bit / 2^31-1 exactly.
 template <entity_traits Traits>
 struct entity_limits
 {
@@ -403,11 +454,11 @@ public:
     using index_type = typename Traits::index_type;
     using generation_type = typename Traits::generation_type;
 
-    static constexpr std::uint32_t index_bits = Traits::index_bits;  // above: provisional flag
-    static constexpr std::uint32_t generation_bits = static_cast<std::uint32_t>(
-        std::numeric_limits<generation_type>::digits);  // carries the buffer nonce in provisionals
+    static constexpr std::uint32_t index_bits = Traits::index_bits;
+    static constexpr std::uint32_t generation_bits =
+        static_cast<std::uint32_t>(std::numeric_limits<generation_type>::digits);
 
-    constexpr basic_entity() noexcept = default;  // == the null handle
+    constexpr basic_entity() noexcept = default;
 
     constexpr basic_entity(index_type index, generation_type generation) noexcept
         : index_(index),
@@ -418,14 +469,12 @@ public:
     [[nodiscard]] constexpr index_type index() const noexcept { return index_; }
     [[nodiscard]] constexpr generation_type generation() const noexcept { return generation_; }
 
-    // Stable 64-bit encoding, handy for hashing and serialization.
     [[nodiscard]] constexpr std::uint64_t bits() const noexcept
     {
         return (static_cast<std::uint64_t>(index_) << generation_bits) |
                static_cast<std::uint64_t>(generation_);
     }
 
-    // Non-null check only; liveness is world::alive's job.
     constexpr explicit operator bool() const noexcept
     {
         return index_ != detail::entity_limits<Traits>::npos;
@@ -439,13 +488,10 @@ private:
     generation_type generation_ = 0;
 };
 
-// The classic handle: 8 bytes, 31-bit slots, 32-bit generations. Everything
-// in this header that is not yet basic_-templated runs on this alias.
 using entity = basic_entity<default_entity_traits>;
 
 inline constexpr entity no_entity{};
 
-// Pins: the traits machinery must reproduce the historic layout bit for bit.
 static_assert(sizeof(entity) == 8);
 static_assert(entity::index_bits == 31 && entity::generation_bits == 32);
 static_assert(entity{5, 7}.bits() == ((std::uint64_t{5} << 32) | 7));
@@ -463,21 +509,6 @@ template <entity_traits Traits>
            e.index() != entity_limits<Traits>::npos;
 }
 }  // namespace detail
-
-// ----------------------------------------------------------------------------
-// Storage policies
-//
-//   packed  - dense arrays, swap-remove; fastest iteration; add/remove on the
-//             pool invalidates pointers/references. The default.
-//   stable  - fixed chunks, components never move; pointers valid until that
-//             component is removed (or pool purged / world reset). One extra
-//             indirection on access.
-//   tag     - membership only, no per-entity data. Automatic for empty types.
-//
-// Precedence: ecs::storage_policy<T> specialization > T::ecs_storage member >
-// tag for empty types > packed. Must be identical in every TU and never change
-// after a world has first used T.
-// ----------------------------------------------------------------------------
 
 enum class storage : std::uint8_t
 {
@@ -511,9 +542,6 @@ consteval storage default_storage()
 }
 }  // namespace detail
 
-// Specialize for types you do not own:
-//   template <> inline constexpr ecs::storage ecs::storage_policy<Name>
-//       = ecs::storage::stable;
 template <class T>
 inline constexpr storage storage_policy = detail::default_storage<T>();
 
@@ -538,19 +566,8 @@ consteval std::size_t default_chunk_items()
 }
 }  // namespace detail
 
-// Stable-storage tuning: components per chunk (~4 KiB default). Override via
-// trait specialization or an ecs_chunk_items member; same every-TU rule as
-// storage_policy.
 template <class T>
 inline constexpr std::size_t chunk_capacity = detail::default_chunk_items<T>();
-
-// ----------------------------------------------------------------------------
-// Component concept
-//
-// Movability is deliberately NOT required: stable storage builds/destroys in
-// place, so pinned types (atomics, mutexes) are legal there. Packed storage
-// and command_buffer payloads re-impose it with named static_asserts.
-// ----------------------------------------------------------------------------
 
 template <class T>
 concept component = std::is_object_v<T> && !std::is_array_v<T> && !std::is_const_v<T> &&
@@ -564,10 +581,6 @@ using bare = std::remove_const_t<T>;
 template <class T>
 inline constexpr bool is_tag_v = storage_policy<bare<T>> == storage::tag;
 }  // namespace detail
-
-// ----------------------------------------------------------------------------
-// Compile-time component names (for the inspector and diagnostics; no RTTI)
-// ----------------------------------------------------------------------------
 
 namespace detail
 {
@@ -618,15 +631,8 @@ constexpr std::string_view extract_type_name(std::string_view raw) noexcept
 }
 }  // namespace detail
 
-// User-pinned component identity: makes name_of<T>() -- and hash_of<T>(), the
-// key archives persist -- portable across compilers and renames. Two forms: a
-// `static constexpr std::string_view ecs_label` member (preferred for types
-// you own) or a component_label<T> specialization. Namespace labels
-// ("game.Transform") so they cannot collide with compiler-derived spellings.
-// Labels are INHERITED: a strong typedef must re-pin its own ecs_label or it
-// shares the base's archive key. Must be unique per world and non-empty.
 template <class T>
-inline constexpr std::string_view component_label{};  // empty: compiler-derived name
+inline constexpr std::string_view component_label{};
 
 namespace detail
 {
@@ -636,8 +642,6 @@ concept has_label_member = requires {
 };
 }  // namespace detail
 
-// Human-readable, persistable name of T, e.g. "game::Transform". Computed at
-// compile time; overridable (see component_label above).
 template <class T>
 [[nodiscard]] constexpr std::string_view name_of() noexcept
 {
@@ -676,10 +680,6 @@ constexpr std::uint64_t fnv1a(std::string_view text) noexcept
 }
 }  // namespace detail
 
-// Stable, RTTI-free identity: a 64-bit hash of name_of<T>(), persistable
-// across runs (unlike the first-use-order dense type ids). Without a pinned
-// label it follows the compiler's spelling, so pin an ecs_label for keys that
-// cross toolchains. Checked builds report per-world hash collisions.
 template <class T>
 [[nodiscard]] constexpr std::uint64_t hash_of() noexcept
 {
@@ -687,13 +687,10 @@ template <class T>
     return hash;
 }
 
-// ----------------------------------------------------------------------------
-// Component type ids
-//
-// Dense process-wide ids handed out on first use (thread-safe). First-use
-// order means not stable across runs or modules; never persisted. Keep one
-// world inside one module (DLL boundaries may disagree about ids).
-// ----------------------------------------------------------------------------
+[[nodiscard]] constexpr std::uint64_t string_id(std::string_view text) noexcept
+{
+    return detail::fnv1a(text);
+}
 
 namespace detail
 {
@@ -710,9 +707,6 @@ inline std::uint32_t type_id() noexcept
     return id;
 }
 
-// Process-unique stamp for command buffers; carried in the generation field of
-// provisional handles so apply() can tell a foreign (or pre-clear) provisional
-// handle from one of its own.
 inline std::uint32_t next_buffer_nonce() noexcept
 {
     static std::atomic<std::uint32_t> counter{1};
@@ -720,68 +714,62 @@ inline std::uint32_t next_buffer_nonce() noexcept
 }
 }  // namespace detail
 
-// ----------------------------------------------------------------------------
-// Faults (cold-path error reporting for validate() and restore_entity())
-// ----------------------------------------------------------------------------
-
 enum class fault_code : std::uint8_t
 {
-    bad_handle,           // restore_entity: null or provisional handle
-    slot_occupied,        // restore_entity: target slot already holds a live entity
-    table_out_of_sync,    // entity table bookkeeping broken
-    sparse_dense_desync,  // a pool's index and its dense array disagree
-    dense_entity_dead,    // a pool holds an entity the table says is dead
-    slot_map_broken,      // a stable pool's slot bookkeeping broken
-    links_broken,         // parent/child links inconsistent
-    bond_broken,          // a bonded pair's mirrored partition inconsistent
-    archive_mismatch,     // unpack/graft: the stream disagrees with the types
-    world_not_empty,      // unpack requires a fresh world
-    globals_broken,       // more than one globals entity
+    bad_handle,
+    slot_occupied,
+    table_out_of_sync,
+    sparse_dense_desync,
+    dense_entity_dead,
+    slot_map_broken,
+    links_broken,
+    archive_mismatch,
+    world_not_empty,
+    globals_broken,
+    archive_too_large,
 };
 
 struct fault
 {
     fault_code code;
-    std::string_view pool;  // offending pool name, if any
+    std::string_view pool;
     const char* note = "";
 };
 
-// One row of the pool inspector (see world::each_pool).
 struct pool_info
 {
     std::string_view name;
-    std::uint32_t id;               // dense process-local type id; never persist
-    std::uint64_t name_hash;        // hash_of<T>(): stable across runs, persistable
-    std::size_t size;               // live components
-    std::size_t capacity;           // allocated component slots
-    std::size_t bytes_per_item;     // 0 for tag pools
-    std::size_t index_bytes;        // the paged sparse index (16 KiB pages add up)
-    std::size_t bookkeeping_bytes;  // dense entity array, slot maps, free lists
+    std::uint32_t id;
+    std::uint64_t name_hash;
+    std::size_t size;
+    std::size_t capacity;
+    std::size_t bytes_per_item;
+    std::size_t index_bytes;
+    std::size_t bookkeeping_bytes;
     storage kind;
 };
 
-// Result of world::apply.
 struct apply_result
 {
     std::uint32_t applied = 0;
-    std::uint32_t skipped = 0;  // ops whose target was dead at apply time
+    std::uint32_t skipped = 0;
 };
 
-// Result of world::duplicate.
 struct duplicate_result
 {
-    entity clone;               // no_entity when the source was dead
-    std::uint32_t copied = 0;   // components copy-constructed onto the clone
-    std::uint32_t skipped = 0;  // components whose type is not copy-constructible
+    entity clone;
+    std::uint32_t copied = 0;
+    std::uint32_t skipped = 0;
+
+    operator entity() const noexcept { return clone; }  // NOLINT(google-explicit-constructor)
 };
 
-// Result of world::footprint -- per-category byte counts.
 struct memory_footprint
 {
     std::size_t entity_table_bytes = 0;
-    std::size_t component_bytes = 0;    // payload capacity across all pools
-    std::size_t index_bytes = 0;        // paged sparse indices
-    std::size_t bookkeeping_bytes = 0;  // dense arrays, slot maps, free lists
+    std::size_t component_bytes = 0;
+    std::size_t index_bytes = 0;
+    std::size_t bookkeeping_bytes = 0;
 
     [[nodiscard]] std::size_t total() const noexcept
     {
@@ -789,47 +777,30 @@ struct memory_footprint
     }
 };
 
-// Marks the world's globals entity (see world::globals()). Public so archives
-// can round-trip it and broad tools can except<globals_mark> it out.
 struct globals_mark
 {
 };
 
-// ----------------------------------------------------------------------------
-// Reactive hooks
-//
-// Per-pool callbacks fired on structural changes (on_add / on_remove). No-hook
-// pools pay one pointer test per structural op. Dispatch holds the pool's
-// iteration lock, so a hook structurally mutating ITS OWN pool is a reported
-// violation, not UB (other pools are fair game). on_remove fires before the
-// component is destroyed, so the hook may read it. Hooks do not fire during
-// world destruction and must not throw; the user pointer passes through.
-// Connect via world.on_add<T>(fn, user), <T, &free_fn>(), or
-// <T, &Class::member>(&instance); each returns a hook_token (scoped_hook =
-// RAII).
-// ----------------------------------------------------------------------------
-
 template <class Traits>
-using basic_component_hook = void (*)(basic_world<Traits>&, basic_entity<Traits>, void* user);
+using basic_component_hook = void (*)(basic_registry<Traits>&, basic_entity<Traits>, void* user);
 
 using component_hook = basic_component_hook<default_entity_traits>;
 
 struct hook_token
 {
-    std::uint32_t pool = 0xFFFFFFFFu;  // type id of the hooked pool
-    std::uint32_t id = 0;              // serial within that pool; 0 = empty token
+    std::uint32_t pool = 0xFFFFFFFFu;
+    std::uint32_t id = 0;
 
     constexpr explicit operator bool() const noexcept { return id != 0; }
 };
 
 namespace detail
 {
-// Adapts a compile-time callable to the component_hook convention; candidates
-// may take (world&, entity) or just (entity).
+
 template <class Traits, auto Candidate>
 consteval basic_component_hook<Traits> free_hook_thunk()
 {
-    using world = basic_world<Traits>;
+    using world = basic_registry<Traits>;
     using entity = basic_entity<Traits>;
     if constexpr (std::invocable<decltype(Candidate), world&, entity>)
     {
@@ -844,12 +815,10 @@ consteval basic_component_hook<Traits> free_hook_thunk()
     }
 }
 
-// Adapts a member function (or instance-first callable) plus an instance
-// pointer. Constness flows through Inst.
 template <class Traits, auto Candidate, class Inst>
 consteval basic_component_hook<Traits> bound_hook_thunk()
 {
-    using world = basic_world<Traits>;
+    using world = basic_registry<Traits>;
     using entity = basic_entity<Traits>;
     if constexpr (std::invocable<decltype(Candidate), Inst&, world&, entity>)
     {
@@ -867,14 +836,657 @@ consteval basic_component_hook<Traits> bound_hook_thunk()
 }
 }  // namespace detail
 
-// ----------------------------------------------------------------------------
-// detail: paged sparse index (entity slot index -> dense position)
-// ----------------------------------------------------------------------------
+class any
+{
+    static constexpr std::size_t sbo_bytes = 3 * sizeof(void*);
+
+    union storage
+    {
+        void* remote;
+        alignas(std::max_align_t) std::byte local[sbo_bytes];
+    };
+
+    template <class T>
+    static constexpr bool fits_inline =
+        sizeof(T) <= sbo_bytes && alignof(T) <= alignof(std::max_align_t) &&
+        std::is_nothrow_move_constructible_v<T>;
+
+    enum class place : std::uint8_t
+    {
+        local,
+        remote,
+        ref,
+    };
+
+    struct vtable_t
+    {
+        std::uint64_t hash;
+        place where;
+        void (*destroy)(any&) noexcept;
+        void (*copy)(any& dst, const any& src);
+        void (*move)(any& dst, any& src) noexcept;
+        void* (*address)(const any&) noexcept;
+    };
+
+    template <class T, place Where>
+    static const vtable_t* table() noexcept
+    {
+        static constexpr vtable_t vt{
+            hash_of<T>(),
+            Where,
+            +[](any& self) noexcept
+            {
+                if constexpr (Where == place::local)
+                {
+                    std::destroy_at(static_cast<T*>(static_cast<void*>(self.store_.local)));
+                }
+                else if constexpr (Where == place::remote)
+                {
+                    T* payload = static_cast<T*>(self.store_.remote);
+                    std::destroy_at(payload);
+                    ::operator delete(payload, std::align_val_t{alignof(T)});
+                }
+            },
+            []() -> void (*)(any&, const any&)
+            {
+                if constexpr (Where == place::ref)
+                {
+                    return +[](any& dst, const any& src)
+                    {
+                        dst.vt_ = src.vt_;
+                        dst.store_.remote = src.store_.remote;
+                    };
+                }
+                else if constexpr (std::copy_constructible<T>)
+                {
+                    return +[](any& dst, const any& src)
+                    { dst.emplace_value<T>(*static_cast<const T*>(src.vt_->address(src))); };
+                }
+                else
+                {
+                    return nullptr;
+                }
+            }(),
+            +[](any& dst, any& src) noexcept
+            {
+                if constexpr (Where == place::local)
+                {
+                    std::construct_at(
+                        static_cast<T*>(static_cast<void*>(dst.store_.local)),
+                        std::move(*static_cast<T*>(static_cast<void*>(src.store_.local))));
+                    dst.vt_ = src.vt_;
+                    src.vt_->destroy(src);
+                }
+                else
+                {
+                    dst.store_.remote = src.store_.remote;
+                    dst.vt_ = src.vt_;
+                }
+                src.vt_ = nullptr;
+            },
+            +[](const any& self) noexcept -> void*
+            {
+                if constexpr (Where == place::local)
+                {
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                    return const_cast<std::byte*>(self.store_.local);
+                }
+                else
+                {
+                    return self.store_.remote;
+                }
+            },
+        };
+        return &vt;
+    }
+
+    template <class T, class... Args>
+    void emplace_value(Args&&... args)
+    {
+        if constexpr (fits_inline<T>)
+        {
+            std::construct_at(static_cast<T*>(static_cast<void*>(store_.local)),
+                              std::forward<Args>(args)...);
+            vt_ = table<T, place::local>();
+        }
+        else
+        {
+            void* raw = ::operator new(sizeof(T), std::align_val_t{alignof(T)});
+            try
+            {
+                store_.remote =
+                    std::construct_at(static_cast<T*>(raw), std::forward<Args>(args)...);
+            }
+            catch (...)
+            {
+                ::operator delete(raw, std::align_val_t{alignof(T)});
+                throw;
+            }
+            vt_ = table<T, place::remote>();
+        }
+    }
+
+public:
+    any() noexcept = default;
+
+    template <class T, class... Args>
+    [[nodiscard]] static any make(Args&&... args)
+    {
+        static_assert(std::same_as<T, detail::bare<T>>,
+                      "ecs: any::make<T> takes a plain, unqualified value type");
+        any out;
+        out.emplace_value<T>(std::forward<Args>(args)...);
+        return out;
+    }
+
+    template <class T>
+    [[nodiscard]] static any ref(T& object) noexcept
+    {
+        static_assert(std::same_as<T, detail::bare<T>>,
+                      "ecs: any::ref<T> views a plain, unqualified value type");
+        any out;
+        out.store_.remote = &object;
+        out.vt_ = table<T, place::ref>();
+        return out;
+    }
+
+    any(const any& other)
+    {
+        if (other.vt_ == nullptr)
+        {
+            return;
+        }
+        if (other.vt_->copy == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "copy of an any holding a non-copyable payload (the copy is "
+                    "empty; move it or pass any::ref)");
+            }
+            return;
+        }
+        other.vt_->copy(*this, other);
+    }
+
+    any(any&& other) noexcept
+    {
+        if (other.vt_ != nullptr)
+        {
+            other.vt_->move(*this, other);
+        }
+    }
+
+    any& operator=(const any& other)
+    {
+        if (this != &other)
+        {
+            any copy(other);
+            reset();
+            if (copy.vt_ != nullptr)
+            {
+                copy.vt_->move(*this, copy);
+            }
+        }
+        return *this;
+    }
+
+    any& operator=(any&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            if (other.vt_ != nullptr)
+            {
+                other.vt_->move(*this, other);
+            }
+        }
+        return *this;
+    }
+
+    ~any() { reset(); }
+
+    void reset() noexcept
+    {
+        if (vt_ != nullptr)
+        {
+            vt_->destroy(*this);
+            vt_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] bool holds() const noexcept { return vt_ != nullptr; }
+    explicit operator bool() const noexcept { return holds(); }
+
+    [[nodiscard]] std::uint64_t type_hash() const noexcept
+    {
+        return vt_ != nullptr ? vt_->hash : 0;
+    }
+
+    template <class T>
+    [[nodiscard]] T* try_as() noexcept
+    {
+        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
+                   ? static_cast<T*>(vt_->address(*this))
+                   : nullptr;
+    }
+
+    template <class T>
+    [[nodiscard]] const T* try_as() const noexcept
+    {
+        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
+                   ? static_cast<const T*>(vt_->address(*this))
+                   : nullptr;
+    }
+
+    template <class T>
+    [[nodiscard]] T& as()
+    {
+        T* payload = try_as<T>();
+        if (payload == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "as<T> on an any holding a different type (or nothing); "
+                    "try_as<T> is the safe form");
+            }
+            std::abort();
+        }
+        return *payload;
+    }
+
+    template <class T>
+    [[nodiscard]] const T& as() const
+    {
+        const T* payload = try_as<T>();
+        if (payload == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate(
+                    "as<T> on an any holding a different type (or nothing); "
+                    "try_as<T> is the safe form");
+            }
+            std::abort();
+        }
+        return *payload;
+    }
+
+    [[nodiscard]] void* data() noexcept { return vt_ != nullptr ? vt_->address(*this) : nullptr; }
+    [[nodiscard]] const void* data() const noexcept
+    {
+        return vt_ != nullptr ? vt_->address(*this) : nullptr;
+    }
+
+private:
+    const vtable_t* vt_ = nullptr;
+    storage store_{};
+};
+
+template <class T>
+concept reflectable_aggregate =
+    std::is_aggregate_v<T> && !std::is_array_v<T> && !std::is_union_v<T>;
 
 namespace detail
 {
-// Doubles capacity when full so the push_back that follows cannot throw;
-// sequences "allocate bookkeeping first, construct the component last".
+
+template <class T>
+struct ubiq
+{
+    template <class U>
+        requires(!std::same_as<std::remove_cvref_t<U>, T>)
+    constexpr operator U() const noexcept;
+};
+
+template <class T, std::size_t N>
+[[nodiscard]] consteval bool brace_initable() noexcept
+{
+    return []<std::size_t... I>(std::index_sequence<I...>)
+    {
+        return requires { T{(static_cast<void>(I), ubiq<T>{})...}; };
+    }(std::make_index_sequence<N>{});
+}
+
+template <class T, std::size_t N = 0>
+[[nodiscard]] consteval std::size_t aggregate_field_count() noexcept
+{
+    if constexpr (N < 64 && brace_initable<T, N + 1>())
+    {
+        return aggregate_field_count<T, N + 1>();
+    }
+    else
+    {
+        return N;
+    }
+}
+}  // namespace detail
+
+template <reflectable_aggregate T>
+inline constexpr std::size_t field_count_v = detail::aggregate_field_count<T>();
+
+template <class T>
+    requires reflectable_aggregate<std::remove_cvref_t<T>>
+[[nodiscard]] constexpr auto tie_fields(T& object) noexcept
+{
+    constexpr std::size_t n = field_count_v<std::remove_cvref_t<T>>;
+    static_assert(n <= 16, "ecs: tie_fields supports aggregates of up to 16 members");
+    if constexpr (n == 0)
+    {
+        return std::tuple<>{};
+    }
+    else if constexpr (n == 1)
+    {
+        auto& [a] = object;
+        return std::tie(a);
+    }
+    else if constexpr (n == 2)
+    {
+        auto& [a, b] = object;
+        return std::tie(a, b);
+    }
+    else if constexpr (n == 3)
+    {
+        auto& [a, b, c] = object;
+        return std::tie(a, b, c);
+    }
+    else if constexpr (n == 4)
+    {
+        auto& [a, b, c, d] = object;
+        return std::tie(a, b, c, d);
+    }
+    else if constexpr (n == 5)
+    {
+        auto& [a, b, c, d, e] = object;
+        return std::tie(a, b, c, d, e);
+    }
+    else if constexpr (n == 6)
+    {
+        auto& [a, b, c, d, e, f] = object;
+        return std::tie(a, b, c, d, e, f);
+    }
+    else if constexpr (n == 7)
+    {
+        auto& [a, b, c, d, e, f, g] = object;
+        return std::tie(a, b, c, d, e, f, g);
+    }
+    else if constexpr (n == 8)
+    {
+        auto& [a, b, c, d, e, f, g, h] = object;
+        return std::tie(a, b, c, d, e, f, g, h);
+    }
+    else if constexpr (n == 9)
+    {
+        auto& [a, b, c, d, e, f, g, h, i] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i);
+    }
+    else if constexpr (n == 10)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j);
+    }
+    else if constexpr (n == 11)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k);
+    }
+    else if constexpr (n == 12)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k, l] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k, l);
+    }
+    else if constexpr (n == 13)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k, l, m] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k, l, m);
+    }
+    else if constexpr (n == 14)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, o] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k, l, m, o);
+    }
+    else if constexpr (n == 15)
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, o, p] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k, l, m, o, p);
+    }
+    else
+    {
+        auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, o, p, q] = object;
+        return std::tie(a, b, c, d, e, f, g, h, i, j, k, l, m, o, p, q);
+    }
+}
+
+template <class T, class F>
+    requires reflectable_aggregate<std::remove_cvref_t<T>>
+constexpr void for_each(T& object, F&& fn)
+{
+    std::apply([&fn](auto&... members) { (static_cast<void>(fn(members)), ...); },
+               tie_fields(object));
+}
+
+template <reflectable_aggregate T>
+[[nodiscard]] constexpr auto as_tuple(const T& object)
+{
+    return std::apply([](const auto&... members)
+                      { return std::tuple<std::remove_cvref_t<decltype(members)>...>(members...); },
+                      tie_fields(object));
+}
+
+template <class T, class F>
+    requires reflectable_aggregate<std::remove_cvref_t<T>>
+constexpr void for_each_leaf(T& object, F&& fn)
+{
+    for_each(object,
+             [&fn](auto& member)
+             {
+                 if constexpr (reflectable_aggregate<std::remove_cvref_t<decltype(member)>>)
+                 {
+                     for_each_leaf(member, fn);
+                 }
+                 else
+                 {
+                     static_cast<void>(fn(member));
+                 }
+             });
+}
+
+template <class Archive, class T>
+    requires reflectable_aggregate<std::remove_cvref_t<T>>
+void write_fields(Archive&& archive, const T& object)
+{
+    for_each_leaf(object, [&archive](const auto& leaf) { archive(leaf); });
+}
+
+template <class Archive, class T>
+    requires reflectable_aggregate<std::remove_cvref_t<T>>
+void read_fields(Archive&& archive, T& object)
+{
+    for_each_leaf(object, [&archive](auto& leaf) { archive(leaf); });
+}
+
+namespace detail
+{
+template <class M>
+[[nodiscard]] constexpr bool leaf_equal(const M& a, const M& b);
+}  // namespace detail
+
+template <reflectable_aggregate T>
+[[nodiscard]] constexpr bool fields_equal(const T& lhs, const T& rhs)
+{
+    return [&]<std::size_t... Is>(std::index_sequence<Is...>)
+    {
+        return (detail::leaf_equal(std::get<Is>(tie_fields(lhs)), std::get<Is>(tie_fields(rhs))) &&
+                ...);
+    }(std::make_index_sequence<field_count_v<T>>{});
+}
+
+namespace detail
+{
+template <class M>
+[[nodiscard]] constexpr bool leaf_equal(const M& a, const M& b)
+{
+    if constexpr (reflectable_aggregate<M>)
+    {
+        return ecs::fields_equal(a, b);
+    }
+    else
+    {
+        return a == b;
+    }
+}
+}  // namespace detail
+
+template <reflectable_aggregate T>
+[[nodiscard]] inline std::size_t hash_fields(const T& object)
+{
+    constexpr auto golden = static_cast<std::size_t>(0x9e3779b97f4a7c15ULL);
+    std::size_t seed = 0;
+    for_each_leaf(object,
+                  [&seed](const auto& leaf)
+                  {
+                      const std::size_t h = std::hash<std::remove_cvref_t<decltype(leaf)>>{}(leaf);
+                      seed ^= h + golden + (seed << 6) + (seed >> 2);
+                  });
+    return seed;
+}
+
+#if (defined(_MSC_VER) && _MSC_VER >= 1927 && !defined(__clang__)) || defined(__clang__) || \
+    defined(__GNUC__)
+inline constexpr bool field_names_supported = true;
+#else
+inline constexpr bool field_names_supported = false;
+#endif
+
+namespace detail
+{
+
+template <class T>
+struct name_probe
+{
+    T value;
+};
+template <class T>
+
+// NOLINTNEXTLINE(clang-diagnostic-undefined-internal)
+extern const name_probe<T> name_probe_obj;
+
+template <class P>
+struct name_nttp
+{
+    const P* p;
+};
+template <class P>
+constexpr auto name_as_nttp(const P* p) noexcept
+{
+#if defined(__clang__)
+    return name_nttp<P>{p};
+#else
+    return p;
+#endif
+}
+
+template <class Tag, auto Ptr>
+[[nodiscard]] consteval std::string_view raw_field_name() noexcept
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    std::string_view s = __FUNCSIG__;  // ...<...,&...->NAME>(void) noexcept
+    s = s.substr(0, s.find(">(void) noexcept"));
+    return s.substr(s.rfind("->") + 2);
+#elif defined(__clang__)
+    std::string_view s = __PRETTY_FUNCTION__;  // ...{&...NAME}]
+    s = s.substr(0, s.size() - 2);
+    return s.substr(s.find_last_of(":.") + 1);
+#elif defined(__GNUC__)
+    std::string_view s = __PRETTY_FUNCTION__;  // ...fake_object.NAME)]
+    s = s.substr(0, s.size() - 2);
+    return s.substr(s.find_last_of(":.") + 1);
+#else
+    return {};
+#endif
+}
+
+template <class T, std::size_t I>
+[[nodiscard]] consteval std::string_view extracted_field_name() noexcept
+{
+    return raw_field_name<T, name_as_nttp(&std::get<I>(tie_fields(name_probe_obj<T>.value)))>();
+}
+}  // namespace detail
+
+template <reflectable_aggregate T, std::size_t I>
+[[nodiscard]] consteval std::string_view field_name() noexcept
+{
+    if constexpr (field_names_supported)
+    {
+        return detail::extracted_field_name<T, I>();
+    }
+    else
+    {
+        return {};
+    }
+}
+
+template <reflectable_aggregate T>
+inline constexpr auto field_names_v = []<std::size_t... Is>(std::index_sequence<Is...>)
+{
+    return std::array<std::string_view, sizeof...(Is)>{field_name<T, Is>()...};
+}(std::make_index_sequence<field_count_v<T>>{});
+
+template <class T>
+concept reflectable = reflectable_aggregate<T>;
+
+template <std::size_t N>
+struct field_key
+{
+    char text[N]{};
+
+    consteval field_key(const char (&literal)[N]) noexcept  // NOLINT(google-explicit-constructor)
+    {
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            text[i] = literal[i];
+        }
+    }
+
+    [[nodiscard]] constexpr std::string_view view() const noexcept { return {text, N - 1}; }
+};
+
+namespace detail
+{
+template <reflectable_aggregate T, field_key Name>
+[[nodiscard]] consteval bool spells_a_field() noexcept
+{
+    for (const std::string_view spelled : field_names_v<T>)
+    {
+        if (spelled == Name.view())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <reflectable_aggregate T, template <class> class Trait>
+[[nodiscard]] consteval bool every_field_is() noexcept
+{
+    return []<std::size_t... Is>(std::index_sequence<Is...>)
+    {
+        return (Trait<std::remove_cvref_t<
+                    std::tuple_element_t<Is, decltype(tie_fields(std::declval<T&>()))>>>::value &&
+                ...);
+    }(std::make_index_sequence<field_count_v<T>>{});
+}
+}  // namespace detail
+
+template <class T, field_key Name>
+concept has_field = reflectable<T> && detail::spells_a_field<T, Name>();
+
+template <class T, template <class> class Trait>
+concept fields_all = reflectable<T> && detail::every_field_is<T, Trait>();
+
+namespace detail
+{
+
 template <class Vector>
 void grow_if_full(Vector& v)
 {
@@ -891,7 +1503,7 @@ public:
     using index_type = typename Traits::index_type;
 
     static constexpr index_type npos = entity_limits<Traits>::npos;
-    static constexpr std::uint32_t page_size = 4096;  // entries; bytes follow the width
+    static constexpr std::uint32_t page_size = 4096;
 
     explicit basic_sparse_index(std::pmr::memory_resource* memory) noexcept
         : memory_(memory),
@@ -901,12 +1513,11 @@ public:
 
     basic_sparse_index(const basic_sparse_index&) = delete;
     basic_sparse_index& operator=(const basic_sparse_index&) = delete;
-    basic_sparse_index(basic_sparse_index&&) = delete;  // pools never move
+    basic_sparse_index(basic_sparse_index&&) = delete;
     basic_sparse_index& operator=(basic_sparse_index&&) = delete;
 
     ~basic_sparse_index() { clear(); }
 
-    // O(1): page lookup. npos when the key is absent.
     [[nodiscard]] index_type get(index_type key) const noexcept
     {
         const std::size_t p = key / page_size;
@@ -919,16 +1530,13 @@ public:
 
     void set(index_type key, index_type value) { page(key / page_size)[key % page_size] = value; }
 
-    // Pre-allocates the page for key, so a following set(key, ...) cannot throw.
     void ensure(index_type key) { page(key / page_size); }
 
-    // Write for a key whose page is known to exist (the key is already mapped).
     void set_existing(index_type key, index_type value) noexcept
     {
         pages_[key / page_size][key % page_size] = value;
     }
 
-    // Allocated pages plus the page-table vector itself.
     [[nodiscard]] std::size_t bytes() const noexcept
     {
         std::size_t pages = 0;
@@ -960,7 +1568,6 @@ public:
         pages_.clear();
     }
 
-    // Visits every present (key, value) pair; cold path (validation).
     template <class F>
     void visit(F&& fn) const
     {
@@ -1001,14 +1608,6 @@ private:
     std::pmr::vector<index_type*> pages_;
 };
 
-// ----------------------------------------------------------------------------
-// detail: entity table
-//
-// Per slot: a generation and a free flag. Free slots recycle through a stack
-// with lazy invalidation: restore_entity may claim a stacked slot, so spawn
-// discards entries whose flag says the slot is taken. Amortized O(1).
-// ----------------------------------------------------------------------------
-
 template <entity_traits Traits>
 class basic_entity_table
 {
@@ -1026,7 +1625,6 @@ public:
     {
     }
 
-    // Moved-from tables are empty and reusable (scalar counters reset too).
     basic_entity_table(basic_entity_table&& other) noexcept
         : generation_(std::move(other.generation_)),
           free_flag_(std::move(other.free_flag_)),
@@ -1035,8 +1633,6 @@ public:
     {
     }
 
-    // Not noexcept: cross-resource assignment falls back to element-wise
-    // moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
     basic_entity_table& operator=(basic_entity_table&& other)
     {
@@ -1057,8 +1653,6 @@ public:
     basic_entity_table& operator=(const basic_entity_table&) = delete;
     ~basic_entity_table() = default;
 
-    // O(1) amortized. Never touches component pools (that is what makes bare
-    // spawn() legal during iteration).
     entity create()
     {
         while (!free_stack_.empty())
@@ -1067,32 +1661,27 @@ public:
             free_stack_.pop_back();
             if (free_flag_[index] != 0)
             {
-                // Pop + claim leaves size+live unchanged: slack is preserved.
                 free_flag_[index] = 0;
                 ++live_;
                 return entity(index, generation_[index]);
             }
-            // Stale entry: the slot was claimed by restore() after being freed.
         }
         const auto index = static_cast<index_type>(generation_.size());
-        if (index >= max_slots)  // unconditional: the provisional index bit is reserved
+        if (index >= max_slots)
         {
             violate("entity table is full (2^index_bits - 1 slots)");
-            std::abort();  // fatal even with a returning handler: no valid handle exists
+            std::abort();
         }
         generation_.push_back(0);
         free_flag_.push_back(0);
         ++live_;
-        ensure_destroy_slack();  // pay for the future destroy here, where we allocate anyway
+        ensure_destroy_slack();
         return entity(index, 0);
     }
-
-    // O(1). The generation bump invalidates old handles. Never allocates:
-    // create()/restore() keep free-stack slack, so kill() stays noexcept.
-    // NOLINTNEXTLINE(bugprone-exception-escape) -- nofail push_back: slack invariant above
+    // NOLINTNEXTLINE(bugprone-exception-escape)
     void destroy(index_type index) noexcept
     {
-        ++generation_[index];  // wraps mod 2^generation_bits by design
+        ++generation_[index];
         free_flag_[index] = 1;
         free_stack_.push_back(index);
         --live_;
@@ -1115,8 +1704,6 @@ public:
         return generation_[index];
     }
 
-    // Claims an exact slot at an exact generation (snapshot restore); stale
-    // free-stack entries for the slot are discarded lazily by create().
     std::expected<entity, fault> restore(entity e)
     {
         if (!e || is_provisional(e) || e.index() >= max_slots)
@@ -1144,8 +1731,6 @@ public:
         return e;
     }
 
-    // Frees every live slot, bumping generations so old handles die. Keeps
-    // capacity. O(slots).
     void destroy_all() noexcept
     {
         for (index_type index = 0; index < generation_.size(); ++index)
@@ -1164,16 +1749,13 @@ public:
         free_stack_.reserve(n);
     }
 
-    // Drops stale free-stack entries and returns slack memory.
     void shrink()
     {
         std::erase_if(free_stack_, [this](index_type index) { return free_flag_[index] == 0; });
-        // A slot can sit on the stack twice (freed, restored, freed again);
-        // keep only the newest entry of each.
         std::pmr::vector<std::uint8_t> seen(generation_.size(), 0, generation_.get_allocator());
         std::pmr::vector<index_type> kept(free_stack_.get_allocator());
         kept.reserve(free_stack_.size());
-        for (std::size_t i = free_stack_.size(); i-- > 0;)  // newest entry of each slot wins
+        for (std::size_t i = free_stack_.size(); i-- > 0;)
         {
             const index_type index = free_stack_[i];
             if (seen[index] == 0)
@@ -1186,7 +1768,7 @@ public:
         free_stack_ = std::move(kept);
         generation_.shrink_to_fit();
         free_flag_.shrink_to_fit();
-        ensure_destroy_slack();  // the rebuilt stack must keep destroy() nofail
+        ensure_destroy_slack();
     }
 
     [[nodiscard]] std::size_t slots() const noexcept { return generation_.size(); }
@@ -1239,8 +1821,6 @@ public:
 private:
     friend struct ecs::test_access;
 
-    // Invariant: free_stack_ has room for one entry per live entity, so
-    // destroy() never reallocates. Re-established by create/restore/shrink.
     void ensure_destroy_slack()
     {
         const std::size_t needed = free_stack_.size() + live_;
@@ -1251,23 +1831,14 @@ private:
     }
 
     std::pmr::vector<generation_type> generation_;
-    std::pmr::vector<std::uint8_t> free_flag_;  // 1 = free
+    std::pmr::vector<std::uint8_t> free_flag_;
     std::pmr::vector<index_type> free_stack_;
     std::size_t live_ = 0;
 };
 
 using entity_table = basic_entity_table<default_entity_traits>;
 
-// Invariant 3 of the handle layout (see the comment at provisional_bit).
 static_assert(entity_table::max_slots == provisional_bit - 1);
-
-// ----------------------------------------------------------------------------
-// detail: component pools
-//
-// pool_base owns the membership data (sparse index + dense entity array) so
-// that iteration and filtering never make a virtual call. The virtual surface
-// is cold-path only: kill / purge / reset / shrink / inspect / validate.
-// ----------------------------------------------------------------------------
 
 template <entity_traits Traits>
 class basic_pool_base;
@@ -1275,9 +1846,6 @@ class basic_pool_base;
 template <entity_traits Traits>
 class basic_single_pool_lock;
 
-// Default sorting algorithm, injectable via world::sort's Algorithm parameter.
-// Replacements must fully sort the range (the cycle-walk consumes a gather
-// permutation): std::stable_sort qualifies, a partial sort does not.
 struct std_sort
 {
     template <class It, class Cmp>
@@ -1287,52 +1855,18 @@ struct std_sort
     }
 };
 
-// One bonded group (world::bond<Ts...>): every owner keeps the N-way
-// intersection mirror-partitioned at dense positions [0, paired) -- the same
-// entity at the same position in ALL owners. Heap-stable, owned by the world;
-// unbond() tombstones it so stored bonded views degrade to empty.
-template <entity_traits Traits>
-struct basic_group_core
-{
-    using pool_base = basic_pool_base<Traits>;
-    using index_type = typename Traits::index_type;
-
-    static constexpr std::uint32_t max_owners = 8;
-
-    std::array<pool_base*, max_owners> owners{};
-    std::uint32_t owner_count = 0;
-    index_type paired = 0;  // k: dense_[0, k) is the mirrored intersection
-
-    [[nodiscard]] bool owns(const pool_base* p) const noexcept
-    {
-        for (std::uint32_t i = 0; i < owner_count; ++i)
-        {
-            if (owners[i] == p)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-};
-
-using group_core = basic_group_core<default_entity_traits>;
-
 template <entity_traits Traits>
 class basic_pool_base
 {
 public:
     using entity = ecs::basic_entity<Traits>;
     using entity_table = basic_entity_table<Traits>;
-    using group_core = basic_group_core<Traits>;
-    using index_type = typename Traits::index_type;  // slot indices AND dense positions
-    using pool_base = basic_pool_base;               // the historical body spelling
+    using index_type = typename Traits::index_type;
+    using pool_base = basic_pool_base;
     using single_pool_lock = basic_single_pool_lock<Traits>;
-    using world = ecs::basic_world<Traits>;
+    using world = ecs::basic_registry<Traits>;
     using component_hook = ecs::basic_component_hook<Traits>;
 
-    // Positions are bounded by slots (rows <= live <= max_slots < npos), so
-    // one sentinel serves both lanes.
     static constexpr index_type npos = entity_limits<Traits>::npos;
 
     basic_pool_base(std::pmr::memory_resource* memory,
@@ -1354,8 +1888,6 @@ public:
     basic_pool_base(const basic_pool_base&) = delete;
     basic_pool_base& operator=(const basic_pool_base&) = delete;
 
-    // --- hot, non-virtual membership ---
-
     [[nodiscard]] bool contains(index_type index) const noexcept
     {
         return sparse_.get(index) != npos;
@@ -1369,18 +1901,12 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return dense_.size(); }
     [[nodiscard]] entity entity_at(std::size_t pos) const noexcept { return dense_[pos]; }
 
-    // --- cold, type-erased operations ---
-
-    // Copies the component at src_index onto dst (false when T cannot be
-    // copy-constructed). Cold path, drives world::duplicate.
     virtual bool copy_item(index_type src_index, entity dst) = 0;
 
     virtual void erase_if_present(index_type index) noexcept = 0;
-    virtual void wipe() noexcept = 0;  // destroy all components, keep the pool object
+    virtual void wipe() noexcept = 0;
     virtual void compact() = 0;
 
-    // Type-erased payload bytes at a dense position; null for tag pools
-    // (pool_ref::raw). Obeys the pool's usual invalidation rules.
     [[nodiscard]] virtual void* item_address(index_type /*pos*/) noexcept { return nullptr; }
 
     [[nodiscard]] virtual std::size_t item_capacity() const noexcept = 0;
@@ -1403,31 +1929,6 @@ public:
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
     [[nodiscard]] std::uint64_t name_hash() const noexcept { return name_hash_; }
     [[nodiscard]] bool locked() const noexcept { return locks_ != 0; }
-
-    // Structural changes on a bonded pool can mirror-swap every co-owner, so
-    // any co-owner's iteration couples into this pool's structural refusals.
-    [[nodiscard]] bool bond_locked() const noexcept
-    {
-        if (locked())
-        {
-            return true;
-        }
-        if (bond_ != nullptr)
-        {
-            for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
-            {
-                if (bond_->owners[i] != this && bond_->owners[i]->locked())
-                {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    [[nodiscard]] const group_core* bond() const noexcept { return bond_; }
-
-    // --- reactive hooks (world::on_add/on_remove/on_replace connect here) ---
 
     enum class hook_kind : std::uint8_t
     {
@@ -1458,7 +1959,6 @@ public:
         return drop(hooks_->on_add) || drop(hooks_->on_remove) || drop(hooks_->on_replace);
     }
 
-    // One pointer test on the common (hook-free) path.
     void fire_add(entity e) { dispatch_if(hooks_ ? &hooks_->on_add : nullptr, e); }
     void fire_remove(entity e) { dispatch_if(hooks_ ? &hooks_->on_remove : nullptr, e); }
     void fire_replace(entity e) { dispatch_if(hooks_ ? &hooks_->on_replace : nullptr, e); }
@@ -1467,8 +1967,6 @@ public:
     {
         if (hooks_ && !hooks_->on_remove.empty())
         {
-            // Index loop: stays valid if a hook grows dense_ via the
-            // report-then-proceed add path.
             // NOLINTNEXTLINE(modernize-loop-convert)
             for (std::size_t i = 0; i < dense_.size(); ++i)
             {
@@ -1478,102 +1976,26 @@ public:
     }
 
 protected:
-    // Swaps two dense positions INCLUDING the derived pool's payload mirror.
-    // Cold; bond maintenance and the bond build pass run through this.
-    virtual void mirror_swap(index_type a, index_type b) noexcept = 0;
-
-    // Membership insert; the caller appends payload first (so a throwing
-    // component constructor leaves the pool untouched).
     void attach(entity e)
     {
         dense_.push_back(e);
         sparse_.set(e.index(), static_cast<index_type>(dense_.size() - 1));
-        if (bond_ != nullptr)
-        {
-            bond_on_attach(e);
-        }
     }
 
-    // Membership swap-remove. Returns the dense position that was vacated;
-    // the caller mirrors the same swap in its payload arrays.
     index_type detach(index_type index) noexcept
     {
-        if (bond_ != nullptr)
-        {
-            bond_on_detach(index);  // moves the entity out of the partition first
-        }
         const index_type pos = sparse_.get(index);
         const auto last = static_cast<index_type>(dense_.size() - 1);
         if (pos != last)
         {
             dense_[pos] = dense_[last];
-            sparse_.set_existing(dense_[pos].index(), pos);  // page exists: member entity
+            sparse_.set_existing(dense_[pos].index(), pos);
         }
         dense_.pop_back();
         sparse_.erase(index);
         return pos;
     }
 
-    // Called after this pool attached e at the back. If EVERY other owner
-    // holds e too, swap e to slot `paired` in ALL owners: the mirrored prefix
-    // gains e at the same index everywhere. O(owners).
-    void bond_on_attach(entity e) noexcept
-    {
-        for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
-        {
-            pool_base* other = bond_->owners[i];
-            if (other != this && !other->contains(e.index()))
-            {
-                return;
-            }
-        }
-        const index_type k = bond_->paired;
-        for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
-        {
-            pool_base* owner = bond_->owners[i];
-            const index_type at = owner->sparse_.get(e.index());
-            if (at != k)
-            {
-                owner->mirror_swap(k, at);
-            }
-        }
-        bond_->paired = static_cast<index_type>(k + 1);
-    }
-
-    // Before swap-removing the entity at slot `index`: if paired, move it
-    // (mirrored in every owner) to the partition edge so the removal's swap
-    // stays in the unpaired tail. It stays in other owners, unpaired. O(owners).
-    void bond_on_detach(index_type index) noexcept
-    {
-        const index_type pos = sparse_.get(index);
-        if (pos >= bond_->paired)
-        {
-            return;
-        }
-        if constexpr (checks_enabled)
-        {
-            for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
-            {
-                if (bond_->owners[i]->sparse_.get(index) != pos)  // the mirror invariant
-                {
-                    violate_pool("bonded partition out of mirror; pool", name_);
-                    break;
-                }
-            }
-        }
-        const auto edge = static_cast<index_type>(bond_->paired - 1);
-        if (pos != edge)
-        {
-            for (std::uint32_t i = 0; i < bond_->owner_count; ++i)
-            {
-                bond_->owners[i]->mirror_swap(pos, edge);
-            }
-        }
-        bond_->paired = edge;
-    }
-
-    // Swaps two dense positions and repairs both sparse links; payload
-    // mirroring is the derived pool's job.
     void swap_dense(index_type a, index_type b) noexcept
     {
         std::swap(dense_[a], dense_[b]);
@@ -1581,9 +2003,6 @@ protected:
         sparse_.set_existing(dense_[b].index(), b);
     }
 
-    // Sorts the dense order by a position comparator, then applies the gather
-    // permutation with cycle-walking swaps (swap_payload mirrors each swap).
-    // Cold: one O(n) scratch allocation plus the O(n log n) sort.
     template <class PosCompare, class SwapPayload, class Algo = std_sort>
     void sort_dense_impl(PosCompare cmp, SwapPayload swap_payload, Algo&& algo = {})
     {
@@ -1593,9 +2012,7 @@ protected:
         {
             perm[i] = i;
         }
-        algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
-        // Apply the gather permutation in place, cycle by cycle: position i
-        // receives the element that was at perm[i].
+        algo(perm.begin(), perm.end(), cmp);
         for (index_type i = 0; i < n; ++i)
         {
             index_type curr = i;
@@ -1645,16 +2062,14 @@ protected:
     }
 
     template <class>
-    friend class ecs::basic_world;
+    friend class ecs::basic_registry;
     template <entity_traits>
     friend class basic_single_pool_lock;
     template <class>
     friend class ecs::basic_runtime_selection;
     template <class, class, class...>
-    friend class ecs::basic_selection;
-    template <class, class, class...>
-    friend class ecs::basic_bonded_view;
-    friend struct ecs::test_access;  // declared unconditionally; defined only under checks
+    friend class ecs::basic_view;
+    friend struct ecs::test_access;
 
     struct hook_entry
     {
@@ -1682,30 +2097,26 @@ protected:
             case hook_kind::replace:
                 return hooks_->on_replace;
         }
-        std::unreachable();  // the enum is exhaustive
+        std::unreachable();
     }
 
-    // Defined after single_pool_lock (dispatch runs under it).
     void dispatch_if(const std::vector<hook_entry>* list, entity e);
 
     basic_sparse_index<Traits> sparse_;
     std::pmr::vector<entity> dense_;
-    std::unique_ptr<hook_lists> hooks_;  // null until the first hook connects
-    group_core* bond_ = nullptr;         // null unless this pool is owned by a bond
-    world* owner_ = nullptr;             // set at registration; hooks receive it
-    std::pmr::memory_resource* memory_;  // scaling allocations route through this
+    std::unique_ptr<hook_lists> hooks_;
+    world* owner_ = nullptr;
+    std::pmr::memory_resource* memory_;
     std::string_view name_;
     std::uint64_t name_hash_;
     storage kind_;
     std::size_t item_bytes_;
-    std::uint32_t id_ = 0;             // global type id, set by the owning world
-    mutable std::uint32_t locks_ = 0;  // running iterations that include this pool
+    std::uint32_t id_ = 0;
+    mutable std::uint32_t locks_ = 0;
 };
 
 using pool_base = basic_pool_base<default_entity_traits>;
 
-// RAII iteration lock over one pool (children_of and friends). Counter
-// maintenance is compiled out with ECS_CHECKS off, like selection locks.
 template <entity_traits Traits>
 class basic_single_pool_lock
 {
@@ -1736,8 +2147,6 @@ private:
 
 using single_pool_lock = basic_single_pool_lock<default_entity_traits>;
 
-// Hook dispatch runs under the pool's iteration lock: a hook structurally
-// mutating its own pool is a reported violation, not UB. Hooks must not throw.
 template <entity_traits Traits>
 void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, entity e)
 {
@@ -1746,7 +2155,6 @@ void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, e
         return;
     }
     const single_pool_lock lock(this);
-    // Index loop: robust against a hook that ignores the refusal and proceeds.
     // NOLINTNEXTLINE(modernize-loop-convert)
     for (std::size_t i = 0; i < list->size(); ++i)
     {
@@ -1755,7 +2163,6 @@ void basic_pool_base<Traits>::dispatch_if(const std::vector<hook_entry>* list, e
     }
 }
 
-// Packed: components in one dense vector parallel to the entity array.
 template <component T, entity_traits Traits = default_entity_traits>
 class packed_pool : public basic_pool_base<Traits>
 {
@@ -1798,15 +2205,12 @@ public:
     template <class... Args>
     T& emplace(entity e, Args&&... args)
     {
-        // Secure bookkeeping capacity first: then neither a throwing T
-        // constructor nor attach() can leave the pool half-updated.
         grow_if_full(items_);
         grow_if_full(dense_);
         sparse_.ensure(e.index());
         items_.emplace_back(std::forward<Args>(args)...);
         attach(e);
         fire_add(e);
-        // Re-read last: a bond fix-up in attach() or a hook may have moved it.
         return items_[sparse_.get(e.index())];
     }
 
@@ -1843,7 +2247,6 @@ public:
     {
         if constexpr (std::copy_constructible<T>)
         {
-            // Copy first: emplace may reallocate items_ and dangle the source.
             T detached(items_[sparse_.get(src_index)]);
             emplace(dst, std::move(detached));
             return true;
@@ -1863,28 +2266,13 @@ public:
         std::swap(items_[a], items_[b]);
     }
 
-    // The if constexpr is load-bearing: virtuals instantiate with the class,
-    // and non-swappable packed pools are legal as long as they are never
-    // bonded (bond() statically refuses them).
-    void mirror_swap(index_type a, index_type b) noexcept override
-    {
-        if constexpr (std::is_swappable_v<T>)
-        {
-            swap_positions(a, b);
-        }
-        else
-        {
-            std::abort();  // unreachable: bond() refuses this pool at compile time
-        }
-    }
-
     void erase_if_present(index_type index) noexcept override
     {
         if (!contains(index))
         {
             return;
         }
-        fire_remove(dense_[sparse_.get(index)]);  // before destruction: hooks may read it
+        fire_remove(dense_[sparse_.get(index)]);
         const index_type pos = detach(index);
         const auto last = static_cast<index_type>(items_.size() - 1);
         if (pos != last)
@@ -1937,7 +2325,6 @@ private:
     std::pmr::vector<T> items_;
 };
 
-// Tag: membership only.
 template <component T, entity_traits Traits = default_entity_traits>
 class tag_pool : public basic_pool_base<Traits>
 {
@@ -1980,21 +2367,16 @@ public:
     template <class PosCompare, class Algo = std_sort>
     void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
-        sort_dense_impl(
-            cmp,
-            [](index_type, index_type) {},  // membership only
-            std::forward<Algo>(algo));
+        sort_dense_impl(cmp, [](index_type, index_type) {}, std::forward<Algo>(algo));
     }
 
     bool copy_item(index_type, entity dst) override
     {
-        emplace(dst);  // membership is the whole payload
+        emplace(dst);
         return true;
     }
 
     void swap_positions(index_type a, index_type b) noexcept { swap_dense(a, b); }
-
-    void mirror_swap(index_type a, index_type b) noexcept override { swap_dense(a, b); }
 
     void erase_if_present(index_type index) noexcept override
     {
@@ -2024,8 +2406,6 @@ public:
     }
 };
 
-// Stable: components in fixed chunks that never move. The dense entity array
-// is mirrored by a dense slot array; a free list recycles vacated slots.
 template <component T, entity_traits Traits = default_entity_traits>
 class stable_pool : public basic_pool_base<Traits>
 {
@@ -2053,7 +2433,6 @@ protected:
     using base::swap_dense;
 
 public:
-    // Per-component via ecs::chunk_capacity<T>; defaults to ~4 KiB chunks.
     static constexpr std::size_t chunk_items = chunk_capacity<T>;
     static_assert(chunk_items > 0, "ecs: chunk_capacity<T> must be at least 1");
 
@@ -2074,18 +2453,16 @@ public:
     template <class... Args>
     T& emplace(entity e, Args&&... args)
     {
-        // Bookkeeping first, construction last: a throwing step leaves the
-        // pool exactly as it was.
         grow_if_full(dense_);
         grow_if_full(slot_of_);
         sparse_.ensure(e.index());
-        const index_type slot = peek_free_slot();  // may allocate a chunk
+        const index_type slot = peek_free_slot();
         T* item = std::construct_at(slot_ptr(slot), std::forward<Args>(args)...);
-        commit_free_slot(slot);  // nofail; only after construction succeeded
+        commit_free_slot(slot);
         slot_of_.push_back(slot);
         attach(e);
         fire_add(e);
-        return *item;  // stable: hooks cannot have moved it
+        return *item;
     }
 
     [[nodiscard]] T* at(index_type index) noexcept
@@ -2112,8 +2489,6 @@ public:
         return slot_ptr(slot_of_[pos]);
     }
 
-    // Payloads never move: only the dense/slot mirrors permute, so stable
-    // pointers survive sorting.
     template <class PosCompare, class Algo = std_sort>
     void sort_dense(PosCompare cmp, Algo&& algo = {})
     {
@@ -2139,10 +2514,8 @@ public:
     void swap_positions(index_type a, index_type b) noexcept
     {
         swap_dense(a, b);
-        std::swap(slot_of_[a], slot_of_[b]);  // payloads stay put
+        std::swap(slot_of_[a], slot_of_[b]);
     }
-
-    void mirror_swap(index_type a, index_type b) noexcept override { swap_positions(a, b); }
 
     [[nodiscard]] std::size_t extra_bookkeeping_bytes() const noexcept override
     {
@@ -2151,7 +2524,6 @@ public:
                (chunks_.capacity() * sizeof(std::byte*));
     }
 
-    // add_chunk pre-reserves one free-list entry per slot: nofail push_back.
     // NOLINTNEXTLINE(bugprone-exception-escape)
     void erase_if_present(index_type index) noexcept override
     {
@@ -2159,7 +2531,7 @@ public:
         {
             return;
         }
-        fire_remove(dense_[sparse_.get(index)]);  // before destruction: hooks may read it
+        fire_remove(dense_[sparse_.get(index)]);
         const index_type pos = detach(index);
         const index_type slot = slot_of_[pos];
         std::destroy_at(slot_ptr(slot));
@@ -2184,8 +2556,6 @@ public:
         slot_count_ = 0;
     }
 
-    // Chunks are deliberately never freed by compact(): that is the pointer
-    // stability contract. Only bookkeeping slack is returned.
     void compact() override
     {
         dense_.shrink_to_fit();
@@ -2280,11 +2650,9 @@ private:
         {
             chunks_.reserve(std::max<std::size_t>(4, chunks_.capacity() * 2));
         }
-        // erase_if_present is noexcept (a virtual contract), so the free list
-        // must never need to grow there: one reserved entry per slot.
         free_slots_.reserve((chunks_.size() + 1) * chunk_items);
         auto* raw = static_cast<std::byte*>(memory_->allocate(chunk_items * sizeof(T), alignof(T)));
-        chunks_.push_back(raw);  // nofail: reserved above
+        chunks_.push_back(raw);
     }
 
     void release_all() noexcept
@@ -2304,10 +2672,10 @@ private:
         chunks_.clear();
     }
 
-    std::pmr::vector<index_type> slot_of_;  // parallel to dense_
-    std::pmr::vector<std::byte*> chunks_;   // fixed blocks, never relocated
+    std::pmr::vector<index_type> slot_of_;
+    std::pmr::vector<std::byte*> chunks_;
     std::pmr::vector<index_type> free_slots_;
-    std::size_t slot_count_ = 0;  // slots handed out so far (used + free)
+    std::size_t slot_count_ = 0;
 };
 
 template <component T, entity_traits Traits = default_entity_traits>
@@ -2318,20 +2686,8 @@ using pool_for = std::conditional_t<storage_policy<T> == storage::tag,
                                                        packed_pool<T, Traits>>>;
 }  // namespace detail
 
-// ----------------------------------------------------------------------------
-// Custom storage backends -- the pool_of seam
-//
-// Specialize pool_of<T> (identical in every TU) to supply custom storage for
-// one component type: derive from the built-in pool matching storage_policy<T>,
-// override the cold virtuals, and call the base -- membership bookkeeping is
-// not optional. The typed surface is non-virtual: copy_item drives duplicate,
-// so keep per-add side effects in on_add hooks or override copy_item too.
-// ----------------------------------------------------------------------------
-
 using basic_pool = detail::pool_base;
 
-// Seam names default the Traits parameter, so existing default-traits
-// specializations and derivations keep their spellings.
 template <component T, entity_traits Traits = default_entity_traits>
 using packed_pool_of = detail::packed_pool<T, Traits>;
 template <component T, entity_traits Traits = default_entity_traits>
@@ -2346,49 +2702,29 @@ struct pool_of
 };
 
 template <class T, entity_traits Traits = default_entity_traits>
-using pool_of_t = pool_of<T, Traits>::type;  // alias-declarations: typename-optional in C++20
+using pool_of_t = pool_of<T, Traits>::type;
 
-// What world registration requires of a pool_of specialization.
 template <class P, class Traits = default_entity_traits>
 concept component_pool = std::derived_from<P, detail::basic_pool_base<Traits>> &&
                          std::constructible_from<P, std::pmr::memory_resource*>;
 
 namespace detail
 {
-// Helpers for select<>'s static_asserts, built on the public type toolkit.
 
 template <class T, class... Us>
 inline constexpr bool type_among = contains_type<bare<T>, types<bare<Us>...>>;
 
 template <class... Ts>
-inline constexpr bool all_distinct = distinct_t<types<bare<Ts>...>>::size == sizeof...(Ts);
+inline constexpr bool all_distinct = all_unique_v<types<bare<Ts>...>>;
 }  // namespace detail
 
-// ----------------------------------------------------------------------------
-// Filters
-// ----------------------------------------------------------------------------
-
-// Exclude filter for select()/each(): entities holding any of these components
-// do not match.   world.select<A, B>(ecs::except<C>{})
-template <class... Ts>
-struct except
-{
-};
-
-// Optional marker for select(): maybe<T> never filters and never drives
-// iteration; the callback receives T* (nullptr when absent), const-propagated.
 template <class T>
 struct maybe
 {
 };
 
-// OR-alternatives inside select(): any_of<A, B, ...> matches entities holding
-// at least one alternative. The callback receives one (const-propagated)
-// pointer per non-tag alternative, at least one non-null per row; tag
-// alternatives filter without contributing an argument. Alternatives are
-// plain (possibly const) component types -- no nesting, no negation.
-template <class... Alternatives>
-struct any_of
+template <class T>
+struct exists
 {
 };
 
@@ -2414,82 +2750,14 @@ inline constexpr bool is_maybe_v = maybe_traits<T>::is_maybe;
 template <class T>
 using maybe_inner = maybe_traits<T>::inner;
 
-// any_of introspection: width is the number of pool slots an element
-// occupies in a selection's flattened include array (1 for everything else).
 template <class T>
-struct any_of_traits
+struct not_maybe
 {
-    static constexpr bool is_group = false;
-    static constexpr std::size_t width = 1;
-    using alts = types<T>;
-};
-
-template <class... As>
-struct any_of_traits<any_of<As...>>
-{
-    static constexpr bool is_group = true;
-    static constexpr std::size_t width = sizeof...(As);
-    using alts = types<As...>;
+    static constexpr bool value = !is_maybe_v<T>;
 };
 
 template <class T>
-inline constexpr bool is_any_of_v = any_of_traits<T>::is_group;
-
-// Per-group validity, reported with named static_asserts at the use site.
-template <class T>
-struct group_ok : std::true_type
-{
-};
-
-template <class... As>
-struct group_ok<any_of<As...>> : std::true_type
-{
-    static_assert(sizeof...(As) >= 2, "ecs: any_of<> needs at least two alternatives");
-    static_assert((component<bare<As>> && ...),
-                  "ecs: any_of<> alternatives must be plain component types "
-                  "(const-qualified is fine)");
-    static_assert((!is_maybe_v<bare<As>> && ...) && (!is_any_of_v<bare<As>> && ...),
-                  "ecs: any_of<> alternatives cannot nest maybe<> or any_of<>");
-    static_assert(all_distinct<bare<As>...>, "ecs: duplicate alternative in any_of<>");
-};
-
-// The flattened inner component list one element contributes (for global
-// distinctness and exclude-overlap checks).
-template <class T>
-struct flat_inners
-{
-    using type = types<bare<maybe_inner<T>>>;
-};
-
-template <class... As>
-struct flat_inners<any_of<As...>>
-{
-    using type = types<bare<As>...>;
-};
-
-template <class List>
-struct list_distinct;
-
-template <class... Us>
-struct list_distinct<types<Us...>>
-{
-    static constexpr bool value = all_distinct<Us...>;
-};
-
-template <class List, class... Xs>
-struct list_none_among;
-
-template <class... Us, class... Xs>
-struct list_none_among<types<Us...>, Xs...>
-{
-    static constexpr bool value = (!type_among<Us, Xs...> && ...);
-};
-
-// The callback-argument fragment of one select<> element: nothing for tags,
-// a pointer for maybe<T>, one pointer per non-tag any_of<> alternative, a
-// reference otherwise. Shared by each() and the range iterator's value_type.
-template <class T>
-struct sel_part
+struct view_part
 {
     using type = std::conditional_t<
         is_maybe_v<T>,
@@ -2502,22 +2770,9 @@ struct sel_part
             std::tuple<std::conditional_t<std::is_const_v<T>, const bare<T>&, bare<T>&>>>>;
 };
 
-template <class... As>
-struct sel_part<any_of<As...>>
-{
-    using type = decltype(std::tuple_cat(
-        std::declval<std::conditional_t<
-            is_tag_v<bare<As>>,
-            std::tuple<>,
-            std::tuple<
-                std::conditional_t<std::is_const_v<As>, const bare<As>*, bare<As>*>>>>()...));
-};
-
 template <class T>
-using sel_part_t = sel_part<T>::type;
+using view_part_t = view_part<T>::type;
 
-// Const-world mapping: plain types gain const, maybe wrappers gain it
-// inside, any_of alternatives each gain it.
 template <class T>
 struct as_const_part
 {
@@ -2530,27 +2785,6 @@ struct as_const_part<maybe<T>>
     using type = maybe<const bare<T>>;
 };
 
-template <class... As>
-struct as_const_part<any_of<As...>>
-{
-    using type = any_of<const bare<As>...>;
-};
-}  // namespace detail
-
-// ----------------------------------------------------------------------------
-// Selections
-//
-// The query object, built by world::select: raw pool pointers, cheap to copy,
-// allocation-free, valid for the world's lifetime -- keep one across frames.
-// Iteration drives from the smallest included pool (re-chosen each call) and
-// probes the others. const-qualified types are read-only (a const world is
-// all-const); tags filter but are not passed to callbacks.
-// ----------------------------------------------------------------------------
-
-namespace detail
-{
-// Callback shapes accepted by each(): with or without the leading entity, and
-// optionally returning something bool-like (false = stop iterating).
 template <class F, class Entity, class Tuple>
 struct callback_traits;
 
@@ -2560,116 +2794,168 @@ struct callback_traits<F, Entity, std::tuple<Refs...>>
     static constexpr bool with_entity = std::invocable<F&, Entity, Refs...>;
     static constexpr bool without_entity = std::invocable<F&, Refs...>;
 };
+
+struct true_filter
+{
+};
+template <class L, class R>
+struct and_filter
+{
+    L lhs;
+    R rhs;
+};
+template <class L, class R>
+struct or_filter
+{
+    L lhs;
+    R rhs;
+};
+template <class E>
+struct not_filter
+{
+    E inner;
+};
+
+template <class T>
+struct is_filter : std::false_type
+{
+};
+template <>
+struct is_filter<true_filter> : std::true_type
+{
+};
+template <class T>
+struct is_filter<exists<T>> : std::true_type
+{
+};
+template <class E>
+struct is_filter<not_filter<E>> : std::true_type
+{
+};
+template <class L, class R>
+struct is_filter<and_filter<L, R>> : std::true_type
+{
+};
+template <class L, class R>
+struct is_filter<or_filter<L, R>> : std::true_type
+{
+};
+
+template <class T>
+concept filter_expr = is_filter<std::remove_cvref_t<T>>::value;
+
+template <class F>
+struct filter_node
+{
+    static constexpr int kind = 0;
+};
+template <class T>
+struct filter_node<exists<T>>
+{
+    static constexpr int kind = 1;
+    using comp = bare<T>;
+};
+template <class E>
+struct filter_node<not_filter<E>>
+{
+    static constexpr int kind = 4;
+    using inner = E;
+};
+template <class L, class R>
+struct filter_node<and_filter<L, R>>
+{
+    static constexpr int kind = 2;
+    using lhs = L;
+    using rhs = R;
+};
+template <class L, class R>
+struct filter_node<or_filter<L, R>>
+{
+    static constexpr int kind = 3;
+    using lhs = L;
+    using rhs = R;
+};
+
+template <class F>
+struct filter_leaves
+{
+    using type = types<>;
+};
+template <class T>
+struct filter_leaves<exists<T>>
+{
+    using type = types<bare<T>>;
+};
+template <class E>
+struct filter_leaves<not_filter<E>>
+{
+    using type = typename filter_leaves<E>::type;
+};
+template <class L, class R>
+struct filter_leaves<and_filter<L, R>>
+{
+    using type = joined_t<typename filter_leaves<L>::type, typename filter_leaves<R>::type>;
+};
+template <class L, class R>
+struct filter_leaves<or_filter<L, R>>
+{
+    using type = joined_t<typename filter_leaves<L>::type, typename filter_leaves<R>::type>;
+};
+template <class F>
+using filter_leaves_t = typename filter_leaves<F>::type;
 }  // namespace detail
 
-template <class Traits, class... Ts, class... Xs>
-class basic_selection<Traits, except<Xs...>, Ts...>
+template <class L, class R>
+    requires detail::filter_expr<L> && detail::filter_expr<R>
+[[nodiscard]] constexpr detail::and_filter<L, R> operator&&(L lhs, R rhs) noexcept
+{
+    return {lhs, rhs};
+}
+template <class L, class R>
+    requires detail::filter_expr<L> && detail::filter_expr<R>
+[[nodiscard]] constexpr detail::or_filter<L, R> operator||(L lhs, R rhs) noexcept
+{
+    return {lhs, rhs};
+}
+template <class E>
+    requires detail::filter_expr<E>
+[[nodiscard]] constexpr detail::not_filter<E> operator!(E inner) noexcept
+{
+    return {inner};
+}
+
+template <class Traits, class Filter, class... Ts>
+class basic_view
 {
     using entity = ecs::basic_entity<Traits>;
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
-    using selection_t = basic_selection;  // the historical body spelling
+    using view_t = basic_view;
     template <class T>
     using pool_of_t = ecs::pool_of_t<T, Traits>;
 
-    static_assert(sizeof...(Ts) > 0, "ecs: select() needs at least one component type");
-    static_assert(((detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> ||
-                    component<detail::bare<detail::maybe_inner<Ts>>>) &&
-                   ...),
-                  "ecs: select() component types must be plain object types "
-                  "(no references, pointers-to-const, arrays, or cv-qualified types)");
-    static_assert((detail::group_ok<detail::bare<detail::maybe_inner<Ts>>>::value && ...));
-    static_assert((!(detail::is_maybe_v<Ts> &&
-                     detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) &&
-                   ...),
-                  "ecs: maybe<any_of<...>> is meaningless -- any_of alternatives already "
-                  "arrive as nullable pointers");
+    static_assert(sizeof...(Ts) > 0, "ecs: a view needs at least one component type");
+    static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
+                  "ecs: view component types must be plain object types "
+                  "(no references, pointers, arrays, or cv-qualified types; maybe<T> is fine)");
     static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
                   "ecs: maybe<T> of a tag component carries no data to point at; tags are "
-                  "filter-only -- include the tag directly or use has<T>");
+                  "filter-only -- list the tag directly or use exists<T> in the filter");
     static_assert(!(detail::is_maybe_v<Ts> && ...),
-                  "ecs: a selection needs at least one required (non-maybe) component to "
-                  "drive iteration");
-    static_assert((component<Xs> && ...),
-                  "ecs: except<> types must be plain, non-const component types");
-    static_assert(
-        detail::list_distinct<joined_t<
-            typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>>::value,
-        "ecs: duplicate component type in select<...> (any_of alternatives count)");
-    static_assert(detail::all_distinct<Xs...>, "ecs: duplicate component type in except<...>");
-    static_assert(
-        detail::list_none_among<
-            joined_t<typename detail::flat_inners<detail::bare<detail::maybe_inner<Ts>>>::type...>,
-            Xs...>::value,
-        "ecs: a component type appears in both select<...> and except<...> "
-        "(any_of alternatives count)");
+                  "ecs: a view needs at least one required (non-maybe) component to drive "
+                  "iteration");
+    static_assert(detail::all_distinct<detail::bare<detail::maybe_inner<Ts>>...>,
+                  "ecs: duplicate component type in view<...>");
+    static_assert(detail::is_filter<Filter>::value,
+                  "ecs: the view's second argument is not a "
+                  "filter (compose exists<T> with && || !)");
 
-    // Per-element flags/positions, indexable at runtime alongside includes_.
     static constexpr std::array<bool, sizeof...(Ts)> optional_include{detail::is_maybe_v<Ts>...};
-    static constexpr std::array<bool, sizeof...(Ts)> group_include{
-        detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>...};
-    static constexpr std::size_t group_count =
-        (std::size_t{0} + ... +
-         std::size_t{detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>});
-    static constexpr bool has_plain_include =
-        ((!detail::is_maybe_v<Ts> && !detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>>) ||
-         ...);
+    static constexpr std::size_t leaf_count = detail::filter_leaves_t<Filter>::size;
 
-    // Flattened include array: an any_of element contributes one pool slot
-    // per alternative, everything else one. Without any_of the mapping is
-    // the identity.
-    static constexpr std::array<std::size_t, sizeof...(Ts)> element_width{
-        detail::any_of_traits<detail::bare<detail::maybe_inner<Ts>>>::width...};
-    static constexpr std::size_t flat_count =
-        (std::size_t{0} + ... +
-         detail::any_of_traits<detail::bare<detail::maybe_inner<Ts>>>::width);
-
-    static consteval std::array<std::size_t, sizeof...(Ts)> build_offsets()
-    {
-        std::array<std::size_t, sizeof...(Ts)> out{};
-        std::size_t at = 0;
-        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
-        {
-            out[i] = at;
-            at += element_width[i];
-        }
-        return out;
-    }
-
-    static constexpr std::array<std::size_t, sizeof...(Ts)> flat_offset = build_offsets();
-
-    static consteval std::size_t find_first_required()
-    {
-        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
-        {
-            if (!optional_include[i] && !group_include[i])
-            {
-                return i;
-            }
-        }
-        return sizeof...(Ts);  // pure-any_of selection: no plain element
-    }
-
-    static constexpr std::size_t first_required = find_first_required();
-
-    static consteval std::size_t find_first_group()
-    {
-        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
-        {
-            if (group_include[i])
-            {
-                return i;
-            }
-        }
-        return sizeof...(Ts);
-    }
-
-    static constexpr std::size_t first_group = find_first_group();
-
-    // Slot of T among Ts... (matching through const and maybe<> spellings);
-    // sizeof...(Ts) when absent. Drives driven_by's static checks.
+    static constexpr std::size_t first_required = find_if<detail::not_maybe>(types<Ts...>{});
     template <class T>
-    static consteval std::size_t driver_slot_of()
+    static consteval std::size_t slot_of()
     {
         constexpr std::array<bool, sizeof...(Ts)> match{
             std::same_as<detail::bare<detail::maybe_inner<Ts>>, detail::bare<T>>...};
@@ -2683,19 +2969,16 @@ class basic_selection<Traits, except<Xs...>, Ts...>
         return sizeof...(Ts);
     }
 
-    // Locks every included pool for the duration of a user-callback loop.
-    // Lock counters exist only in checked builds; release builds write nothing
-    // here, which is what makes concurrent const iteration safe there.
     struct iteration_lock
     {
-        explicit iteration_lock(const std::array<pool_base*, flat_count>& pools) noexcept
+        explicit iteration_lock(const std::array<pool_base*, sizeof...(Ts)>& pools) noexcept
             : pools_(pools)
         {
             if constexpr (checks_enabled)
             {
                 for (pool_base* pool : pools_)
                 {
-                    if (pool != nullptr)  // unregistered maybe<> pools
+                    if (pool != nullptr)
                     {
                         ++pool->locks_;
                     }
@@ -2720,21 +3003,15 @@ class basic_selection<Traits, except<Xs...>, Ts...>
         iteration_lock(const iteration_lock&) = delete;
         iteration_lock& operator=(const iteration_lock&) = delete;
 
-        const std::array<pool_base*, flat_count>& pools_;
+        const std::array<pool_base*, sizeof...(Ts)>& pools_;
     };
 
 public:
-    // Introspection: the include/exclude lists as toolkit types<>, markers
-    // (const, maybe<>) preserved as spelled.
     using included = types<Ts...>;
-    using excluded = types<Xs...>;
+    using filter_type = Filter;
 
-    basic_selection() = default;  // empty selection; matches nothing
+    basic_view() = default;
 
-    // Calls fn(entity, refs...) or fn(refs...) for every match -- entity-first
-    // wins when both compile. refs are the non-tag components in declaration
-    // order, const where spelled const. A bool-like false return stops the
-    // loop. O(smallest included pool) probes; no allocation.
     template <class F>
     void each(F&& fn) const
     {
@@ -2743,7 +3020,6 @@ public:
             { return this->invoke_with_refs(f, e, index); });
     }
 
-    // Entity-only iteration with the same matching and early-exit rules.
     template <class F>
     void entities(F&& fn) const
     {
@@ -2763,123 +3039,117 @@ public:
                 }
             });
     }
+    template <class F>
+    void each_of(std::span<const entity> ids, F&& fn) const
+    {
+        if (includes_[first_required] == nullptr)
+        {
+            return;
+        }
+        const iteration_lock lock(includes_);
+        for (const entity e : ids)
+        {
+            if (contains(e) && !invoke_with_refs(fn, e, e.index()))
+            {
+                break;
+            }
+        }
+    }
 
-    // O(1) for a single included pool without excludes; otherwise walks the
-    // driver pool (or the alternative union when one drives).
+    template <class T>
+    [[nodiscard]] decltype(auto) get(entity e) const
+    {
+        constexpr std::size_t slot = slot_of<T>();
+        static_assert(slot < sizeof...(Ts),
+                      "ecs: view::get<T> needs T to be one of the view's component types");
+        static_assert(slot >= sizeof...(Ts) || !optional_include[slot],
+                      "ecs: view::get<T> cannot fetch a maybe<T> (it may be absent) -- use "
+                      "each() or the range, which deliver maybe<> components as pointers");
+        constexpr std::size_t s = slot < sizeof...(Ts) ? slot : 0;
+        constexpr bool slot_is_const =
+            std::array<bool, sizeof...(Ts)>{std::is_const_v<detail::maybe_inner<Ts>>...}[s];
+        auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[s]);
+        if constexpr (slot_is_const)
+        {
+            return static_cast<const detail::bare<T>&>(*pool->at(e.index()));
+        }
+        else
+        {
+            return static_cast<detail::bare<T>&>(*pool->at(e.index()));
+        }
+    }
+
+    template <class T, class U, class... Rest>
+    [[nodiscard]] auto get(entity e) const
+    {
+        return std::tuple<decltype(get<T>(e)), decltype(get<U>(e)), decltype(get<Rest>(e))...>{
+            get<T>(e), get<U>(e), (get<Rest>(e))...};
+    }
+
     [[nodiscard]] std::size_t count() const noexcept
     {
-        if constexpr (group_count == 0)
+        const pool_base* driver = smallest();
+        if (driver == nullptr)
         {
-            const pool_base* driver = smallest();
-            if (driver == nullptr)
-            {
-                return 0;
-            }
-            if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
-            {
-                return driver->size();
-            }
-            else
-            {
-                std::size_t n = 0;
-                for (std::size_t pos = 0; pos < driver->size(); ++pos)
-                {
-                    n += matches_rest(driver->entity_at(pos).index(), driver) ? 1 : 0;
-                }
-                return n;
-            }
+            return 0;
+        }
+        if constexpr (sizeof...(Ts) == 1 && std::same_as<Filter, detail::true_filter>)
+        {
+            return driver->size();
         }
         else
         {
             std::size_t n = 0;
-            entities([&](entity) { ++n; });
+            for (std::size_t pos = 0; pos < driver->size(); ++pos)
+            {
+                n += matches_rest(driver->entity_at(pos).index(), driver) ? 1 : 0;
+            }
             return n;
         }
     }
 
     [[nodiscard]] bool empty() const noexcept
     {
-        if constexpr (group_count == 0)
+        const pool_base* driver = smallest();
+        if (driver == nullptr || driver->size() == 0)
         {
-            const pool_base* driver = smallest();
-            if (driver == nullptr || driver->size() == 0)
-            {
-                return true;
-            }
-            if constexpr (sizeof...(Ts) == 1 && sizeof...(Xs) == 0)
-            {
-                return false;
-            }
-            else
-            {
-                for (std::size_t pos = 0; pos < driver->size(); ++pos)
-                {
-                    if (matches_rest(driver->entity_at(pos).index(), driver))
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            }
+            return true;
         }
-        else
+        if constexpr (sizeof...(Ts) == 1 && std::same_as<Filter, detail::true_filter>)
         {
-            bool any = false;
-            entities(
-                [&](entity)
-                {
-                    any = true;
-                    return false;
-                });
-            return !any;
-        }
-    }
-
-    // True if e is alive and matches the selection.
-    [[nodiscard]] bool contains(entity e) const noexcept
-    {
-        // Pools only ever hold live entities, and a slot index maps to at most
-        // one live entity, so an exact dense match doubles as a liveness test.
-        if constexpr (first_required < sizeof...(Ts))
-        {
-            pool_base* first = includes_[flat_offset[first_required]];
-            if (first == nullptr)
-            {
-                return false;
-            }
-            const auto pos = first->position_of(e.index());
-            if (pos == detail::entity_limits<Traits>::npos || first->entity_at(pos) != e)
-            {
-                return false;
-            }
-            return matches_rest(e.index(), first);
-        }
-        else
-        {
-            // Pure-any_of selection: the exact dense match may sit in ANY
-            // alternative of the first group.
-            const std::size_t off = flat_offset[first_group];
-            for (std::size_t k = 0; k < element_width[first_group]; ++k)
-            {
-                pool_base* alt = includes_[off + k];
-                if (alt == nullptr)
-                {
-                    continue;
-                }
-                const auto pos = alt->position_of(e.index());
-                if (pos != detail::entity_limits<Traits>::npos && alt->entity_at(pos) == e)
-                {
-                    return matches_rest(e.index(), alt);
-                }
-            }
             return false;
         }
+        else
+        {
+            for (std::size_t pos = 0; pos < driver->size(); ++pos)
+            {
+                if (matches_rest(driver->entity_at(pos).index(), driver))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
-    // The first matching entity, or no_entity.
+    [[nodiscard]] bool contains(entity e) const noexcept
+    {
+        pool_base* first = includes_[first_required];
+        if (first == nullptr)
+        {
+            return false;
+        }
+        const auto pos = first->position_of(e.index());
+        if (pos == detail::entity_limits<Traits>::npos || first->entity_at(pos) != e)
+        {
+            return false;
+        }
+        return matches_rest(e.index(), first);
+    }
+
     [[nodiscard]] entity first() const noexcept
     {
-        entity result = no_entity;
+        entity result{};
         entities(
             [&](entity e)
             {
@@ -2889,38 +3159,69 @@ public:
         return result;
     }
 
-    // A copy of the selection that drives iteration from T's pool (pair with
-    // sort<T> for ordered iteration). Changes visit order and probe count,
-    // never the match set. T must be a required (non-maybe) include, const or
-    // not; a missing T pool yields the empty selection.
-    template <class T>
-    [[nodiscard]] selection_t driven_by() const noexcept
+    [[nodiscard]] entity back() const noexcept
     {
-        constexpr std::size_t slot = driver_slot_of<T>();
-        static_assert(slot < sizeof...(Ts),
-                      "ecs: driven_by<T> needs T to be one of the selection's component "
-                      "types (const-qualified spelling is fine)");
-        if constexpr (slot < sizeof...(Ts))
+        pool_base* driver = smallest();
+        if (driver == nullptr)
         {
-            static_assert(!optional_include[slot],
-                          "ecs: driven_by<T> cannot drive from a maybe<> component -- "
-                          "optional pools never drive iteration");
-            static_assert(!group_include[slot],
-                          "ecs: driven_by<T> cannot name an any_of<> group -- union driving "
-                          "is automatic; force a PLAIN include instead");
+            return entity{};
         }
-        selection_t out = *this;
-        out.driver_override_ = static_cast<std::uint8_t>(flat_offset[slot]);
+        for (std::size_t pos = driver->size(); pos-- > 0;)
+        {
+            const entity e = driver->entity_at(pos);
+            if (matches_rest(e.index(), driver))
+            {
+                return e;
+            }
+        }
+        return entity{};
+    }
+
+    [[nodiscard]] entity single() const
+    {
+        entity found{};
+        std::size_t seen = 0;
+        entities(
+            [&](entity e)
+            {
+                if (seen == 0)
+                {
+                    found = e;
+                }
+                ++seen;
+                return seen < 2;
+            });
+        if constexpr (checks_enabled)
+        {
+            if (seen != 1)
+            {
+                detail::violate("view::single() expected exactly one match");
+            }
+        }
+        return seen == 1 ? found : entity{};
+    }
+
+    [[nodiscard]] std::vector<entity> collect() const
+    {
+        std::vector<entity> out;
+        entities([&out](entity e) { out.push_back(e); });
         return out;
     }
 
-    // Range-for iteration with each()'s matching, constness, tag, and lock
-    // rules. The range owns the iteration lock for its whole lifetime and is
-    // pinned in place -- bind it directly: for (auto [e, t, v] : sel.range()).
-    // Rows are std::tuple<entity, components&...>; maybe<> elements appear as
-    // pointers, tags not at all.
-    // (A template so it can hold the selection by value; instantiated via range().)
-    template <class Self = selection_t>
+    template <class T>
+    [[nodiscard]] view_t driven_by() const noexcept
+    {
+        constexpr std::size_t slot = slot_of<T>();
+        static_assert(slot < sizeof...(Ts),
+                      "ecs: driven_by<T> needs T to be one of the view's component types");
+        static_assert(slot >= sizeof...(Ts) || !optional_include[slot],
+                      "ecs: driven_by<T> cannot drive from a maybe<> component");
+        view_t out = *this;
+        out.driver_override_ = static_cast<std::uint8_t>(slot);
+        return out;
+    }
+
+    template <class Self = view_t>
     class basic_range
     {
     public:
@@ -2964,9 +3265,8 @@ public:
         basic_range(const basic_range&) = delete;
         basic_range& operator=(const basic_range&) = delete;
 
-        // One row per matching entity, materialized on dereference.
         using row = decltype(std::tuple_cat(std::declval<std::tuple<entity>>(),
-                                            std::declval<detail::sel_part_t<Ts>>()...));
+                                            std::declval<detail::view_part_t<Ts>>()...));
 
         class iterator
         {
@@ -3004,7 +3304,6 @@ public:
             }
 
         private:
-            // A member (unlike the hidden friend) may reach the private size_.
             [[nodiscard]] bool at_end() const noexcept { return pos_ >= owner_->size_; }
 
             void settle() noexcept
@@ -3025,39 +3324,180 @@ public:
         [[nodiscard]] static std::default_sentinel_t end() noexcept { return {}; }
 
     private:
-        Self self_;  // cheap pointer bundle; keeps the range self-contained
+        Self self_;
         pool_base* driver_ = nullptr;
-        std::size_t size_ = 0;  // sound to cache: locked pools cannot change size
+        std::size_t size_ = 0;
     };
 
-    using range_t = basic_range<>;  // nameable for stored ranges; see range()
+    using range_t = basic_range<>;
 
-    [[nodiscard]] auto range() const noexcept
+    template <class Self = view_t>
+    class basic_reverse_range
     {
-        static_assert(group_count == 0 || has_plain_include,
-                      "ecs: range() needs at least one plain include to drive; iterate "
-                      "pure any_of selections with each()/entities()");
-        return basic_range<>(*this);
-    }
+    public:
+        explicit basic_reverse_range(const Self& s) noexcept
+            : self_(s),
+              driver_(self_.smallest()),
+              size_(driver_ != nullptr ? driver_->size() : 0)
+        {
+            if constexpr (checks_enabled)
+            {
+                if (driver_ != nullptr)
+                {
+                    for (pool_base* pool : self_.includes_)
+                    {
+                        if (pool != nullptr)
+                        {
+                            ++pool->locks_;
+                        }
+                    }
+                }
+            }
+        }
 
-    // ------------------------------------------------------------- splitting
-    //
-    // split(n) carves the driver pool's dense order into n near-equal slices
-    // for parallel const iteration. The split owns the iteration locks (taken
-    // and released on the constructing thread -- lock counters are not atomic)
-    // and must outlive its parts, which are passive copyable views into it.
-    // Workers write only through the callback references (parts never share
-    // an entity); no structural verbs, spawning, or apply() -- record into
-    // per-worker command buffers and apply after joining. Violations raised
-    // on workers reach the process-global handler, which must be thread-safe.
+        ~basic_reverse_range()
+        {
+            if constexpr (checks_enabled)
+            {
+                if (driver_ != nullptr)
+                {
+                    for (pool_base* pool : self_.includes_)
+                    {
+                        if (pool != nullptr)
+                        {
+                            --pool->locks_;
+                        }
+                    }
+                }
+            }
+        }
 
-    template <class Self = selection_t>
-    class basic_split;
+        basic_reverse_range(const basic_reverse_range&) = delete;
+        basic_reverse_range& operator=(const basic_reverse_range&) = delete;
+
+        using row = decltype(std::tuple_cat(std::declval<std::tuple<entity>>(),
+                                            std::declval<detail::view_part_t<Ts>>()...));
+
+        class iterator
+        {
+        public:
+            using value_type = row;
+            using difference_type = std::ptrdiff_t;
+            using iterator_concept = std::input_iterator_tag;
+
+            iterator() = default;
+
+            explicit iterator(const basic_reverse_range* owner) noexcept
+                : owner_(owner),
+                  pos_(owner->size_)
+            {
+                settle();
+            }
+
+            [[nodiscard]] row operator*() const
+            {
+                const entity e = owner_->driver_->entity_at(pos_ - 1);
+                return std::tuple_cat(std::tuple<entity>{e}, owner_->self_.value_refs(e.index()));
+            }
+
+            iterator& operator++() noexcept
+            {
+                --pos_;
+                settle();
+                return *this;
+            }
+
+            void operator++(int) noexcept { ++*this; }
+
+            friend bool operator==(const iterator& it, std::default_sentinel_t) noexcept
+            {
+                return it.at_end();
+            }
+
+        private:
+            [[nodiscard]] bool at_end() const noexcept { return pos_ == 0; }
+
+            void settle() noexcept
+            {
+                while (pos_ > 0 &&
+                       !owner_->self_.matches_rest(owner_->driver_->entity_at(pos_ - 1).index(),
+                                                   owner_->driver_))
+                {
+                    --pos_;
+                }
+            }
+
+            const basic_reverse_range* owner_ = nullptr;
+            std::size_t pos_ = 0;
+        };
+
+        [[nodiscard]] iterator begin() const noexcept { return iterator(this); }
+        [[nodiscard]] static std::default_sentinel_t end() noexcept { return {}; }
+
+    private:
+        Self self_;
+        pool_base* driver_ = nullptr;
+        std::size_t size_ = 0;
+    };
+
+    using reverse_range_t = basic_reverse_range<>;
+
+    [[nodiscard]] auto each() const noexcept { return basic_range<>(*this); }
+    [[nodiscard]] auto reversed() const noexcept { return basic_reverse_range<>(*this); }
+
+    class entity_cursor
+    {
+    public:
+        using value_type = entity;
+        using difference_type = std::ptrdiff_t;
+        using iterator_concept = std::input_iterator_tag;
+
+        entity_cursor() = default;
+
+        explicit entity_cursor(const basic_view* view) noexcept
+            : view_(view),
+              driver_(view->smallest())
+        {
+            settle();
+        }
+
+        [[nodiscard]] entity operator*() const noexcept { return driver_->entity_at(pos_); }
+
+        entity_cursor& operator++() noexcept
+        {
+            ++pos_;
+            settle();
+            return *this;
+        }
+        void operator++(int) noexcept { ++*this; }
+
+        friend bool operator==(const entity_cursor& it, std::default_sentinel_t) noexcept
+        {
+            return it.driver_ == nullptr || it.pos_ >= it.driver_->size();
+        }
+
+    private:
+        void settle() noexcept
+        {
+            while (driver_ != nullptr && pos_ < driver_->size() &&
+                   !view_->matches_rest(driver_->entity_at(pos_).index(), driver_))
+            {
+                ++pos_;
+            }
+        }
+
+        const basic_view* view_ = nullptr;
+        pool_base* driver_ = nullptr;
+        std::size_t pos_ = 0;
+    };
+
+    [[nodiscard]] entity_cursor begin() const noexcept { return entity_cursor(this); }
+    [[nodiscard]] static std::default_sentinel_t end() noexcept { return {}; }
 
     class part_t
     {
     public:
-        part_t() = default;  // empty part
+        part_t() = default;
 
         template <class F>
         void each(F&& fn) const
@@ -3066,10 +3506,10 @@ public:
             {
                 return;
             }
-            const selection_t& s = *owner_self_;
+            const view_t& s = *owner_self_;
             s.run_span(
                 fn,
-                [&s]<class G>(G& f, entity e, typename Traits::index_type index)
+                [&s]<class G>(G& f, entity e, index_type index)
                 { return s.invoke_with_refs(f, e, index); },
                 driver_,
                 begin_,
@@ -3085,7 +3525,7 @@ public:
             }
             owner_self_->run_span(
                 fn,
-                []<class G>(G& f, entity e, typename Traits::index_type)
+                []<class G>(G& f, entity e, index_type)
                 {
                     if constexpr (std::predicate<G&, entity>)
                     {
@@ -3106,13 +3546,9 @@ public:
         }
 
     private:
-        template <class Self>
-        friend class basic_split;
+        friend class basic_view;
 
-        part_t(const selection_t* self,
-               pool_base* driver,
-               std::size_t begin,
-               std::size_t end) noexcept
+        part_t(const view_t* self, pool_base* driver, std::size_t begin, std::size_t end) noexcept
             : owner_self_(self),
               driver_(driver),
               begin_(begin),
@@ -3120,7 +3556,7 @@ public:
         {
         }
 
-        const selection_t* owner_self_ = nullptr;
+        const view_t* owner_self_ = nullptr;
         pool_base* driver_ = nullptr;
         std::size_t begin_ = 0;
         std::size_t end_ = 0;
@@ -3139,7 +3575,7 @@ public:
         {
         }
 
-        basic_split(const basic_split&) = delete;  // pinned: parts point at it
+        basic_split(const basic_split&) = delete;
         basic_split& operator=(const basic_split&) = delete;
 
         [[nodiscard]] std::size_t parts() const noexcept { return parts_; }
@@ -3156,49 +3592,42 @@ public:
     private:
         Self self_;
         pool_base* driver_;
-        iteration_lock lock_;  // references self_.includes_; member order matters
+        iteration_lock lock_;
         std::size_t size_;
         std::size_t parts_;
     };
 
     [[nodiscard]] auto split(std::size_t parts) const noexcept
     {
-        static_assert(group_count == 0 || has_plain_include,
-                      "ecs: split() needs at least one plain include to carve; iterate "
-                      "pure any_of selections with each()/entities()");
-        return basic_split<selection_t>(*this, parts);
+        return basic_split<view_t>(*this, parts);
     }
 
 private:
     template <class>
-    friend class basic_world;
+    friend class basic_registry;
     friend struct test_access;
 
-    explicit basic_selection(std::array<pool_base*, flat_count> includes,
-                             std::array<pool_base*, sizeof...(Xs)> excludes) noexcept
+    explicit basic_view(std::array<pool_base*, sizeof...(Ts)> includes,
+                        std::array<pool_base*, leaf_count> filter_pools) noexcept
         : includes_(includes),
-          excludes_(excludes)
+          filter_pools_(filter_pools)
     {
     }
 
-    // The plain driver pool: the smallest required non-group include, or the
-    // driven_by<T> choice; null when a plain include pool is missing (const
-    // world) or the selection is pure any_of (the union drives in run()).
-    // maybe<> pools never drive; a missing one never disqualifies.
     [[nodiscard]] pool_base* smallest() const noexcept
     {
         if (driver_override_ != no_driver_override)
         {
-            return includes_[driver_override_];  // null = empty selection
+            return includes_[driver_override_];
         }
         pool_base* best = nullptr;
         for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
-            if (optional_include[i] || group_include[i])
+            if (optional_include[i])
             {
                 continue;
             }
-            pool_base* pool = includes_[flat_offset[i]];
+            pool_base* pool = includes_[i];
             if (pool == nullptr)
             {
                 return nullptr;
@@ -3213,160 +3642,77 @@ private:
 
     [[nodiscard]] bool matches_rest(index_type index, const pool_base* driver) const noexcept
     {
-        return matches_from(index, driver, sizeof...(Ts));
-    }
-
-    // The full predicate, optionally skipping one element (the union-driving
-    // group satisfies itself by construction).
-    [[nodiscard]] bool matches_from(index_type index,
-                                    const pool_base* driver,
-                                    std::size_t skip_element) const noexcept
-    {
         for (std::size_t i = 0; i < sizeof...(Ts); ++i)
         {
-            if (optional_include[i] || i == skip_element)
+            if (optional_include[i])
             {
-                continue;  // maybe<> never filters
+                continue;
             }
-            if constexpr (group_count > 0)
-            {
-                if (group_include[i])
-                {
-                    bool satisfied = false;
-                    const std::size_t off = flat_offset[i];
-                    for (std::size_t k = 0; k < element_width[i]; ++k)
-                    {
-                        pool_base* alt = includes_[off + k];
-                        if (alt != nullptr && (alt == driver || alt->contains(index)))
-                        {
-                            satisfied = true;
-                            break;
-                        }
-                    }
-                    if (!satisfied)
-                    {
-                        return false;
-                    }
-                    continue;
-                }
-            }
-            pool_base* pool = includes_[flat_offset[i]];
+            pool_base* pool = includes_[i];
             if (pool != driver && (pool == nullptr || !pool->contains(index)))
             {
                 return false;
             }
         }
-        for (pool_base* pool : excludes_)
+        return passes_filter(index);
+    }
+
+    [[nodiscard]] bool passes_filter(index_type index) const noexcept
+    {
+        if constexpr (std::same_as<Filter, detail::true_filter>)
         {
-            if (pool != nullptr && pool->contains(index))
-            {
-                return false;
-            }
+            return true;
         }
-        return true;
+        else
+        {
+            std::size_t leaf = 0;
+            return eval_filter<Filter>(index, leaf);
+        }
+    }
+
+    template <class F>
+    [[nodiscard]] bool eval_filter(index_type index, std::size_t& leaf) const noexcept
+    {
+        using node = detail::filter_node<F>;
+        if constexpr (node::kind == 1)  // exists<T>
+        {
+            pool_base* pool = filter_pools_[leaf++];
+            return pool != nullptr && pool->contains(index);
+        }
+        else if constexpr (node::kind == 2)  // and
+        {
+            const bool l = eval_filter<typename node::lhs>(index, leaf);
+            const bool r = eval_filter<typename node::rhs>(index, leaf);
+            return l && r;
+        }
+        else if constexpr (node::kind == 3)  // or
+        {
+            const bool l = eval_filter<typename node::lhs>(index, leaf);
+            const bool r = eval_filter<typename node::rhs>(index, leaf);
+            return l || r;
+        }
+        else if constexpr (node::kind == 4)  // not
+        {
+            return !eval_filter<typename node::inner>(index, leaf);
+        }
+        else  // true_filter
+        {
+            return true;
+        }
     }
 
     template <class F, class Invoke>
     void run(F& fn, Invoke&& invoke) const
     {
-        if constexpr (group_count == 0)
+        pool_base* driver = smallest();
+        if (driver == nullptr)
         {
-            pool_base* driver = smallest();
-            if (driver == nullptr)
-            {
-                return;
-            }
-            const iteration_lock lock(includes_);
-            // Locked pools cannot change size, so a forward walk visits every
-            // matching entity exactly once.
-            run_span(fn, invoke, driver, 0, driver->size());
+            return;
         }
-        else
-        {
-            // A missing PLAIN include pool is an empty selection, as ever.
-            pool_base* driver = smallest();
-            if constexpr (has_plain_include)
-            {
-                if (driver == nullptr)
-                {
-                    return;
-                }
-            }
-            // The cheapest union among the groups (a group whose every
-            // alternative pool is missing or empty matches nothing).
-            std::size_t best_union = static_cast<std::size_t>(-1);
-            std::size_t best_group_elem = sizeof...(Ts);
-            for (std::size_t i = 0; i < sizeof...(Ts); ++i)
-            {
-                if (!group_include[i])
-                {
-                    continue;
-                }
-                std::size_t sum = 0;
-                const std::size_t off = flat_offset[i];
-                for (std::size_t k = 0; k < element_width[i]; ++k)
-                {
-                    sum += includes_[off + k] != nullptr ? includes_[off + k]->size() : 0;
-                }
-                if (sum == 0)
-                {
-                    return;  // unsatisfiable group: nothing matches
-                }
-                if (sum < best_union)
-                {
-                    best_union = sum;
-                    best_group_elem = i;
-                }
-            }
-            // Pick the cheaper walk: the plain driver or the smallest union
-            // (a driven_by override always forces the plain pool).
-            if (driver != nullptr &&
-                (driver_override_ != no_driver_override || driver->size() <= best_union))
-            {
-                const iteration_lock lock(includes_);
-                run_span(fn, invoke, driver, 0, driver->size());
-                return;
-            }
-            // Union drive: walk each alternative's dense array, skipping
-            // entities already seen through an earlier alternative (O(1)
-            // sparse probes, exact dedup).
-            const iteration_lock lock(includes_);
-            const std::size_t off = flat_offset[best_group_elem];
-            for (std::size_t k = 0; k < element_width[best_group_elem]; ++k)
-            {
-                pool_base* alt = includes_[off + k];
-                if (alt == nullptr)
-                {
-                    continue;
-                }
-                for (std::size_t pos = 0; pos < alt->size(); ++pos)
-                {
-                    const entity e = alt->entity_at(pos);
-                    bool seen_earlier = false;
-                    for (std::size_t j = 0; j < k; ++j)
-                    {
-                        pool_base* prev = includes_[off + j];
-                        if (prev != nullptr && prev->contains(e.index()))
-                        {
-                            seen_earlier = true;
-                            break;
-                        }
-                    }
-                    if (seen_earlier || !matches_from(e.index(), nullptr, best_group_elem))
-                    {
-                        continue;
-                    }
-                    if (!invoke(fn, e, e.index()))
-                    {
-                        return;
-                    }
-                }
-            }
-        }
+        const iteration_lock lock(includes_);
+        run_span(fn, invoke, driver, 0, driver->size());
     }
 
-    // The bounded loop body of run(); split parts call it with the umbrella
-    // object already holding the locks.
     template <class F, class Invoke>
     void run_span(
         F& fn, Invoke&& invoke, pool_base* driver, std::size_t begin, std::size_t end) const
@@ -3385,20 +3731,14 @@ private:
         }
     }
 
-    // Must produce exactly detail::sel_part_t<T> so the range iterator's
-    // value_type stays in lockstep with each()'s callback arguments.
     template <std::size_t I, class T>
-    [[nodiscard]] detail::sel_part_t<T> ref_tuple(index_type index) const
+    [[nodiscard]] detail::view_part_t<T> ref_tuple(index_type index) const
     {
-        if constexpr (detail::is_any_of_v<detail::bare<detail::maybe_inner<T>>>)
-        {
-            return group_parts<detail::bare<detail::maybe_inner<T>>>(flat_offset[I], index);
-        }
-        else if constexpr (detail::is_maybe_v<T>)
+        if constexpr (detail::is_maybe_v<T>)
         {
             using inner = detail::bare<detail::maybe_inner<T>>;
-            auto* pool = static_cast<pool_of_t<inner>*>(includes_[flat_offset[I]]);
-            return detail::sel_part_t<T>{pool == nullptr ? nullptr : pool->at(index)};
+            auto* pool = static_cast<pool_of_t<inner>*>(includes_[I]);
+            return detail::view_part_t<T>{pool == nullptr ? nullptr : pool->at(index)};
         }
         else if constexpr (detail::is_tag_v<T>)
         {
@@ -3406,35 +3746,8 @@ private:
         }
         else
         {
-            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[flat_offset[I]]);
-            return detail::sel_part_t<T>{*pool->at(index)};
-        }
-    }
-
-    // One pointer per non-tag alternative, each fetched independently (the
-    // matching machinery already guaranteed at least one is non-null).
-    template <class Group>
-    [[nodiscard]] detail::sel_part_t<Group> group_parts(std::size_t off, index_type index) const
-    {
-        return [&]<std::size_t... Ks, class... As>(std::index_sequence<Ks...>, types<As...>)
-        { return std::tuple_cat(this->template alternative_part<As>(off + Ks, index)...); }(
-            std::make_index_sequence<detail::any_of_traits<Group>::width>{},
-            typename detail::any_of_traits<Group>::alts{});
-    }
-
-    template <class A>
-    [[nodiscard]] auto alternative_part(std::size_t slot, index_type index) const
-    {
-        if constexpr (detail::is_tag_v<detail::bare<A>>)
-        {
-            return std::tuple<>{};
-        }
-        else
-        {
-            using pointer =
-                std::conditional_t<std::is_const_v<A>, const detail::bare<A>*, detail::bare<A>*>;
-            auto* pool = static_cast<pool_of_t<detail::bare<A>>*>(includes_[slot]);
-            return std::tuple<pointer>(pool == nullptr ? nullptr : pool->at(index));
+            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[I]);
+            return detail::view_part_t<T>{*pool->at(index)};
         }
     }
 
@@ -3461,13 +3774,11 @@ private:
         }
         else
         {
-            // Terminal branch: nothing below instantiates, so this message is
-            // the only error the user sees.
             static_assert(traits::with_entity || traits::without_entity,
-                          "ecs: each() callback must be callable as (entity, components&...) "
-                          "or (components&...). Components from a const world or marked const in "
-                          "select<...> are passed as const&. Tag components are filter-only and "
-                          "are not passed at all.");
+                          "ecs: each() callback must be callable as (entity, components&...) or "
+                          "(components&...). Components from a const world or marked const are "
+                          "passed as const&; maybe<T> as a pointer; tags are filter-only and not "
+                          "passed at all.");
             return false;
         }
     }
@@ -3488,601 +3799,16 @@ private:
     }
 
     static constexpr std::uint8_t no_driver_override = 0xFF;
-    static_assert(flat_count < no_driver_override,
-                  "ecs: selections cap at 254 flattened include slots");
+    static_assert(sizeof...(Ts) < no_driver_override, "ecs: a view caps at 254 component types");
 
-    std::array<pool_base*, flat_count> includes_{};
-    std::array<pool_base*, sizeof...(Xs)> excludes_{};
+    std::array<pool_base*, sizeof...(Ts)> includes_{};
+    std::array<pool_base*, leaf_count> filter_pools_{};
     std::uint8_t driver_override_ = no_driver_override;
 };
 
-// The classic spelling: a default-traits selection.
-template <class Excludes, class... Ts>
-using selection_t = basic_selection<default_entity_traits, Excludes, Ts...>;
+template <class... Ts>
+using view = basic_view<default_entity_traits, detail::true_filter, Ts...>;
 
-namespace detail
-{
-template <class T>
-struct is_except : std::false_type
-{
-};
-
-template <class... Xs>
-struct is_except<except<Xs...>> : std::true_type
-{
-};
-}  // namespace detail
-
-// The public spelling: selection<A, const B> or selection<except<C>, A, B>.
-// world::select deduces this; spell it out only for stored members.
-template <class First, class... Rest>
-using selection = std::conditional_t<detail::is_except<First>::value,
-                                     selection_t<First, Rest...>,
-                                     selection_t<except<>, First, Rest...>>;
-
-// ----------------------------------------------------------------------------
-// Bonded pools -- mirrored partitions, 2..N owners
-//
-// world.bond<Ts...>() keeps the N-way intersection mirror-partitioned at the
-// front of every owner pool -- the same entity at the same dense position in
-// each, within [0, paired) -- maintained by O(1) mirrored swaps, and
-// bonded<Ts...>() iterates it as N parallel arrays with zero sparse probes.
-// One bond per pool: owned sets may not overlap or nest; tags may be owned.
-// Refused: structural changes to an owned pool while any co-owner iterates
-// (checked builds), hooks structurally touching a co-owner (use a command
-// buffer), and sort<T> / sort_along on owned pools.
-// ----------------------------------------------------------------------------
-
-namespace detail
-{
-// Invocability over a tuple's element types, checked without naming
-// std::apply (whose noexcept spec hard-errors on some standard libraries).
-template <class F, class Tuple>
-inline constexpr bool row_invocable = false;
-template <class F, class... Es>
-inline constexpr bool row_invocable<F, std::tuple<Es...>> = std::invocable<F&, Es...>;
-
-template <class F, class Tuple>
-inline constexpr bool row_stops = false;  // bool-returning callback = early exit
-template <class F, class... Es>
-    requires std::invocable<F&, Es...>
-inline constexpr bool row_stops<F, std::tuple<Es...>> =
-    std::same_as<std::invoke_result_t<F&, Es...>, bool>;
-}  // namespace detail
-
-template <class Traits, class... Ts, class... Xs>  // const-qualify for read-only payload access
-class basic_bonded_view<Traits, except<Xs...>, Ts...>
-{
-    using entity = ecs::basic_entity<Traits>;
-    using index_type = typename Traits::index_type;
-    using pool_base = detail::basic_pool_base<Traits>;
-    using group_core = detail::basic_group_core<Traits>;
-    using bonded_view_t = basic_bonded_view;  // the historical body spelling
-    template <class T>
-    using pool_of_t = ecs::pool_of_t<T, Traits>;
-
-    static_assert(sizeof...(Ts) >= 2, "ecs: a bonded view spans at least two pools");
-    static_assert((!detail::is_any_of_v<detail::bare<detail::maybe_inner<Ts>>> && ...),
-                  "ecs: bonds own pools, not alternatives -- any_of<> belongs in select");
-    static_assert((component<detail::bare<detail::maybe_inner<Ts>>> && ...),
-                  "ecs: bonded view component types must be plain object types");
-    static_assert((!(detail::is_maybe_v<Ts> && detail::is_tag_v<detail::maybe_inner<Ts>>) && ...),
-                  "ecs: maybe<T> of a tag component carries no data to point at; probe "
-                  "has<T> in the callback body instead");
-    static_assert(detail::all_distinct<detail::maybe_inner<Ts>...>,
-                  "ecs: duplicate component type in bonded<...>");
-    static_assert((component<Xs> && ...),
-                  "ecs: except<> types must be plain, non-const component types");
-    static_assert(detail::all_distinct<Xs...>, "ecs: duplicate component type in except<...>");
-    static_assert((!detail::type_among<detail::maybe_inner<Ts>, Xs...> && ...),
-                  "ecs: a component type appears in both bonded<...> and except<...>");
-
-    // Plain-listed types are the OWNED set (the partition's identity); maybe<>
-    // types are OBSERVED -- probed per row as pointers, null when absent.
-    static constexpr std::array<bool, sizeof...(Ts)> observed_part{detail::is_maybe_v<Ts>...};
-
-    static consteval std::size_t find_first_owned()
-    {
-        for (std::size_t i = 0; i < sizeof...(Ts); ++i)
-        {
-            if (!observed_part[i])
-            {
-                return i;
-            }
-        }
-        return 0;  // unreachable: the owned-count static_assert below
-    }
-
-    static constexpr std::size_t first_owned = find_first_owned();
-    static constexpr std::size_t owned_count =
-        sizeof...(Ts) - (std::size_t{0} + ... + std::size_t{detail::is_maybe_v<Ts>});
-    static_assert(owned_count >= 2,
-                  "ecs: a bonded view lists the standing owned set plain (at least two "
-                  "non-maybe types); observed extras are maybe<>");
-
-    // Tags contribute nothing to callback arguments and rows; observed parts
-    // probe by entity INDEX (their pools do not share the partition layout).
-    template <class T>
-    [[nodiscard]] auto part_at(std::size_t slot, index_type pos, index_type index) const noexcept
-    {
-        if constexpr (detail::is_maybe_v<T>)
-        {
-            using inner = detail::bare<detail::maybe_inner<T>>;
-            using pointer =
-                std::conditional_t<std::is_const_v<detail::maybe_inner<T>>, const inner*, inner*>;
-            auto* pool = static_cast<pool_of_t<inner>*>(bases_[slot]);
-            return std::tuple<pointer>(pool == nullptr ? nullptr : pool->at(index));
-        }
-        else if constexpr (detail::is_tag_v<detail::bare<T>>)
-        {
-            (void)pos;
-            return std::tuple<>{};
-        }
-        else
-        {
-            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(bases_[slot]);
-            if constexpr (std::is_const_v<T>)
-            {
-                return std::tuple<const detail::bare<T>&>(std::as_const(*pool).at_pos(pos));
-            }
-            else
-            {
-                return std::tuple<detail::bare<T>&>(pool->at_pos(pos));
-            }
-        }
-    }
-
-    // One row's payload parts: owners in lockstep at the partition position,
-    // observed pools probed by the row entity's index.
-    [[nodiscard]] auto row_parts(index_type pos, index_type index) const noexcept
-    {
-        return [this, pos, index]<std::size_t... Is>(std::index_sequence<Is...>)
-        {
-            return std::tuple_cat(this->template part_at<Ts>(Is, pos, index)...);
-        }(std::index_sequence_for<Ts...>{});
-    }
-
-    // Row filter: every except<> pool must lack the entity. Null pools
-    // (never registered) exclude nothing.
-    [[nodiscard]] bool passes(index_type index) const noexcept
-    {
-        for (pool_base* pool : excludes_)
-        {
-            if (pool != nullptr && pool->contains(index))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Locks the listed pools for a user-callback loop; tolerates null pools
-    // (the empty view). Holds the array by value so ranges can own a copy.
-    struct view_locks
-    {
-        explicit view_locks(const std::array<pool_base*, sizeof...(Ts)>& pools) noexcept
-            : pools_(pools)
-        {
-            if constexpr (checks_enabled)
-            {
-                for (pool_base* pool : pools_)
-                {
-                    if (pool != nullptr)
-                    {
-                        ++pool->locks_;
-                    }
-                }
-            }
-        }
-
-        ~view_locks()
-        {
-            if constexpr (checks_enabled)
-            {
-                for (pool_base* pool : pools_)
-                {
-                    if (pool != nullptr)
-                    {
-                        --pool->locks_;
-                    }
-                }
-            }
-        }
-
-        view_locks(const view_locks&) = delete;
-        view_locks& operator=(const view_locks&) = delete;
-
-        std::array<pool_base*, sizeof...(Ts)> pools_;
-    };
-
-public:
-    // Introspection, as spelled (const and maybe<> markers preserved):
-    // `owned` is the plain-listed partition identity, `parts` the full list.
-    using parts = types<Ts...>;
-    using owned = joined_t<std::conditional_t<detail::is_maybe_v<Ts>, types<>, types<Ts>>...>;
-    using excluded = types<Xs...>;
-    using pair = owned;  // the historical 2-ary name, kept for manifests
-
-    basic_bonded_view() = default;  // empty: matches nothing
-
-    // O(1) without excludes; with excludes the partition is walked and
-    // filtered (observed parts never filter).
-    [[nodiscard]] std::size_t count() const noexcept
-    {
-        if (bond_ == nullptr)
-        {
-            return 0;
-        }
-        if constexpr (sizeof...(Xs) == 0)
-        {
-            return bond_->paired;
-        }
-        else
-        {
-            std::size_t n = 0;
-            for (index_type pos = 0; pos < bond_->paired; ++pos)
-            {
-                n += passes(bases_[first_owned]->entity_at(pos).index()) ? 1 : 0;
-            }
-            return n;
-        }
-    }
-
-    [[nodiscard]] bool empty() const noexcept { return count() == 0; }
-
-    [[nodiscard]] entity entity_at(std::size_t pos) const noexcept
-    {
-        return bases_[first_owned]->entity_at(pos);
-    }
-
-    [[nodiscard]] bool contains(entity e) const noexcept
-    {
-        if (bond_ == nullptr || bond_->paired == 0)
-        {
-            return false;
-        }
-        const index_type pos = bases_[first_owned]->position_of(e.index());
-        return pos < bond_->paired && bases_[first_owned]->entity_at(pos) == e && passes(e.index());
-    }
-
-    // fn(entity, comps&...) or fn(comps&...) -- entity-first wins when both
-    // bind; tags are filter-only; observed maybe<> parts arrive as pointers
-    // (null when absent); bool return stops. Locks EVERY listed pool.
-    template <class F>
-    void each(F&& fn) const
-    {
-        using parts_row = decltype(std::declval<const bonded_view_t&>().row_parts(0, 0));
-        using full_row =
-            decltype(std::tuple_cat(std::declval<std::tuple<entity>>(), std::declval<parts_row>()));
-        constexpr bool with_entity = detail::row_invocable<F, full_row>;
-        static_assert(with_entity || detail::row_invocable<F, parts_row>,
-                      "ecs: bonded callback must take (entity, comps&...) or (comps&...); "
-                      "tags contribute no argument, observed maybe<T> parts arrive as T*");
-        if (bond_ == nullptr || bond_->paired == 0)
-        {
-            return;
-        }
-        const view_locks locks(bases_);
-        const index_type n = bond_->paired;
-        for (index_type pos = 0; pos < n; ++pos)
-        {
-            const entity e = bases_[first_owned]->entity_at(pos);
-            if (!passes(e.index()))
-            {
-                continue;
-            }
-            if constexpr (with_entity)
-            {
-                const auto row = std::tuple_cat(std::tuple<entity>(e), row_parts(pos, e.index()));
-                if constexpr (detail::row_stops<F, full_row>)
-                {
-                    if (!std::apply(fn, row))
-                    {
-                        break;
-                    }
-                }
-                else
-                {
-                    std::apply(fn, row);
-                }
-            }
-            else
-            {
-                const auto row = row_parts(pos, e.index());
-                if constexpr (detail::row_stops<F, parts_row>)
-                {
-                    if (!std::apply(fn, row))
-                    {
-                        break;
-                    }
-                }
-                else
-                {
-                    std::apply(fn, row);
-                }
-            }
-        }
-    }
-
-    // fn(entity) over the (filtered) intersection; bool return stops. A
-    // direct walk: works for every part shape, including all-value rows.
-    template <class F>
-    void entities(F&& fn) const
-    {
-        if (bond_ == nullptr || bond_->paired == 0)
-        {
-            return;
-        }
-        const view_locks locks(bases_);
-        const index_type n = bond_->paired;
-        for (index_type pos = 0; pos < n; ++pos)
-        {
-            const entity e = bases_[first_owned]->entity_at(pos);
-            if (!passes(e.index()))
-            {
-                continue;
-            }
-            if constexpr (std::predicate<F&, entity>)
-            {
-                if (!fn(e))
-                {
-                    break;
-                }
-            }
-            else
-            {
-                fn(e);
-            }
-        }
-    }
-
-    // Reorders the partition itself, mirrored into EVERY owner. cmp compares
-    // (entity, entity); sort<T> compares an OWNED component's values; the
-    // optional algorithm follows world::sort's contract. Packed owners swap
-    // payloads (outstanding T* die), stable owners permute bookkeeping only.
-    // Refused while any listed pool iterates; a tombstoned/empty view no-ops.
-    template <class Compare, class Algorithm = detail::std_sort>
-        requires std::invocable<Compare&, entity, entity>
-    void sort(Compare cmp, Algorithm&& algo = {})
-    {
-        sort_partition(
-            [&](index_type a, index_type b)
-            {
-                return static_cast<bool>(
-                    cmp(bases_[first_owned]->entity_at(a), bases_[first_owned]->entity_at(b)));
-            },
-            std::forward<Algorithm>(algo));
-    }
-
-    template <class T, class Compare, class Algorithm = detail::std_sort>
-    void sort(Compare cmp, Algorithm&& algo = {})
-    {
-        constexpr std::size_t slot = sort_slot_of<T>();
-        static_assert(slot < sizeof...(Ts),
-                      "ecs: bonded sort<T> needs T to be one of the view's OWNED component "
-                      "types (observed maybe<> parts have no partition order)");
-        if constexpr (slot < sizeof...(Ts))
-        {
-            static_assert(!observed_part[slot],
-                          "ecs: bonded sort<T> cannot order by an observed maybe<> part");
-            static_assert(!detail::is_tag_v<detail::bare<T>>,
-                          "ecs: T uses tag storage and carries no values to compare; sort by "
-                          "(entity, entity) instead");
-            auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(bases_[slot]);
-            sort_partition([&](index_type a, index_type b)
-                           { return static_cast<bool>(cmp(pool->at_pos(a), pool->at_pos(b))); },
-                           std::forward<Algorithm>(algo));
-        }
-    }
-
-    // Lock-owning range for structured bindings; pinned like selection ranges.
-    template <class Self = bonded_view_t>
-    class basic_range
-    {
-    public:
-        using row = decltype(std::tuple_cat(std::declval<std::tuple<entity>>(),
-                                            std::declval<const Self&>().row_parts(0, 0)));
-
-        explicit basic_range(const Self& view) noexcept
-            : view_(view),
-              locks_(view_.bases_),
-              size_(view_.bond_ != nullptr ? view_.bond_->paired : 0)
-        {
-        }
-
-        basic_range(const basic_range&) = delete;
-        basic_range& operator=(const basic_range&) = delete;
-
-        class iterator
-        {
-        public:
-            using value_type = row;
-            using difference_type = std::ptrdiff_t;
-
-            iterator() = default;
-
-            iterator(const Self* view, typename Traits::index_type pos) noexcept
-                : view_(view),
-                  pos_(pos)
-            {
-            }
-
-            [[nodiscard]] row operator*() const
-            {
-                const entity e = view_->bases_[Self::first_owned]->entity_at(pos_);
-                return std::tuple_cat(std::tuple<entity>(e), view_->row_parts(pos_, e.index()));
-            }
-
-            iterator& operator++() noexcept
-            {
-                ++pos_;
-                seek();
-                return *this;
-            }
-
-            void operator++(int) noexcept
-            {
-                ++pos_;
-                seek();
-            }
-
-            [[nodiscard]] friend bool operator==(const iterator& it,
-                                                 std::default_sentinel_t) noexcept
-            {
-                return it.pos_ >= it.end_;
-            }
-
-        private:
-            friend class basic_range;
-
-            // Advance past rows the excludes filter out.
-            void seek() noexcept
-            {
-                if constexpr (sizeof...(Xs) > 0)
-                {
-                    while (
-                        pos_ < end_ &&
-                        !view_->passes(view_->bases_[Self::first_owned]->entity_at(pos_).index()))
-                    {
-                        ++pos_;
-                    }
-                }
-            }
-
-            const Self* view_ = nullptr;
-            typename Traits::index_type pos_ = 0;
-            typename Traits::index_type end_ = 0;
-        };
-
-        [[nodiscard]] iterator begin() const noexcept
-        {
-            iterator it(&view_, 0);
-            it.end_ = static_cast<typename Traits::index_type>(size_);
-            it.seek();
-            return it;
-        }
-
-        [[nodiscard]] std::default_sentinel_t end() const noexcept { return {}; }
-
-    private:
-        Self view_;
-        view_locks locks_;
-        std::size_t size_;
-    };
-
-    [[nodiscard]] auto range() const noexcept { return basic_range<>(*this); }
-
-private:
-    template <class>
-    friend class basic_world;
-    template <class, class, class...>
-    friend class basic_bonded_view;
-
-    // Slot of T among the listed types (matching through const), for sort<T>.
-    template <class T>
-    static consteval std::size_t sort_slot_of()
-    {
-        constexpr std::array<bool, sizeof...(Ts)> match{
-            std::same_as<detail::bare<detail::maybe_inner<Ts>>, detail::bare<T>>...};
-        for (std::size_t i = 0; i < match.size(); ++i)
-        {
-            if (match[i])
-            {
-                return i;
-            }
-        }
-        return sizeof...(Ts);
-    }
-
-    // The shared sort engine: gather-permute [0, paired) and mirror every
-    // swap into every OWNER pool (observed pools are not partition members).
-    template <class PosCompare, class Algorithm>
-    void sort_partition(PosCompare cmp, Algorithm&& algo)
-    {
-        static_assert((!std::is_const_v<detail::maybe_inner<Ts>> && ...),
-                      "ecs: sort on an all-const bonded view (const world) -- sorting "
-                      "reorders the owners' payloads");
-        if (bond_ == nullptr || bond_->paired < 2)
-        {
-            return;
-        }
-        if constexpr (checks_enabled)
-        {
-            for (pool_base* pool : bases_)
-            {
-                if (pool != nullptr && pool->locked())
-                {
-                    detail::violate_pool("bonded sort during iteration over pool", pool->name());
-                    return;
-                }
-            }
-        }
-        const index_type n = bond_->paired;
-        std::pmr::vector<index_type> perm(n, bases_[first_owned]->memory_);
-        for (index_type i = 0; i < n; ++i)
-        {
-            perm[i] = i;
-        }
-        algo(perm.begin(), perm.end(), cmp);  // gather: perm[new] = old position
-        const auto swap_all = [&](index_type a, index_type b) noexcept
-        {
-            for (std::size_t slot = 0; slot < sizeof...(Ts); ++slot)
-            {
-                if (!observed_part[slot])
-                {
-                    bases_[slot]->mirror_swap(a, b);
-                }
-            }
-        };
-        for (index_type i = 0; i < n; ++i)
-        {
-            index_type curr = i;
-            index_type next = perm[curr];
-            while (next != i)
-            {
-                swap_all(curr, next);
-                perm[curr] = curr;
-                curr = next;
-                next = perm[curr];
-            }
-            perm[curr] = curr;
-        }
-    }
-
-    basic_bonded_view(std::array<pool_base*, sizeof...(Ts)> pools,
-                      std::array<pool_base*, sizeof...(Xs)> excludes,
-                      const group_core* bond) noexcept
-        : bases_(pools),
-          excludes_(excludes),
-          bond_(bond)
-    {
-    }
-
-    std::array<pool_base*, sizeof...(Ts)> bases_{};
-    std::array<pool_base*, sizeof...(Xs)> excludes_{};
-    const group_core* bond_ = nullptr;
-};
-
-// The classic spelling: a default-traits bonded view.
-template <class Excludes, class... Ts>
-using bonded_view_t = basic_bonded_view<default_entity_traits, Excludes, Ts...>;
-
-// The public spelling: bonded_view<A, B> or bonded_view<except<C>, A, B>.
-// world::bonded deduces this; spell it out only for stored members.
-template <class First, class... Rest>
-using bonded_view = std::conditional_t<detail::is_except<First>::value,
-                                       bonded_view_t<First, Rest...>,
-                                       bonded_view_t<except<>, First, Rest...>>;
-
-// ----------------------------------------------------------------------------
-// Runtime queries
-//
-// The type-erased layer for editors, debug consoles, and scripting: pools are
-// addressed by runtime ids or name hashes instead of compile-time types, and
-// matches are enumerated by entity only -- payload access stays compile-time.
-// ----------------------------------------------------------------------------
-
-// A nullable, opaque view of one component pool.
 template <class Traits>
 class basic_pool_ref
 {
@@ -4108,7 +3834,6 @@ public:
         return pool_ != nullptr ? pool_->info() : pool_info{};
     }
 
-    // Exact-handle membership (stale handles answer false). O(1).
     [[nodiscard]] bool contains(entity e) const noexcept
     {
         if (pool_ == nullptr)
@@ -4119,10 +3844,6 @@ public:
         return pos != detail::entity_limits<Traits>::npos && pool_->entity_at(pos) == e;
     }
 
-    // Type-erased payload bytes of e, or null (absent entity, stale handle,
-    // or a tag pool). Pair with info().bytes_per_item; the pointer obeys the
-    // pool's invalidation rules and is writable only when the source world
-    // was writable. O(1).
     [[nodiscard]] void* raw(entity e) const noexcept
     {
         if (pool_ == nullptr)
@@ -4134,13 +3855,11 @@ public:
         {
             return nullptr;
         }
-        // Stored const for const-world compatibility; mutability is the caller's contract.
+
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         return const_cast<pool_base*>(pool_)->item_address(pos);
     }
 
-    // The same, by dense position (0 <= pos < size()): walk a whole pool
-    // type-erased via entity_at + raw_at.
     [[nodiscard]] void* raw_at(std::size_t pos) const noexcept
     {
         if (pool_ == nullptr || pos >= pool_->size())
@@ -4152,7 +3871,6 @@ public:
             static_cast<typename Traits::index_type>(pos));
     }
 
-    // The entity at a dense position (pairs with raw_at).
     [[nodiscard]] entity entity_at(std::size_t pos) const noexcept
     {
         return pool_ != nullptr && pos < pool_->size() ? pool_->entity_at(pos) : entity{};
@@ -4160,7 +3878,7 @@ public:
 
 private:
     template <class>
-    friend class basic_world;
+    friend class basic_registry;
     template <class>
     friend class basic_runtime_selection;
 
@@ -4174,10 +3892,6 @@ private:
 
 using pool_ref = basic_pool_ref<default_entity_traits>;
 
-// A selection assembled at runtime from pool_refs: entity-only iteration with
-// selection_t's smallest-pool driving, matching, and lock rules. Building one
-// allocates, iterating does not. At least one include is required; including
-// an empty pool_ref makes the selection match nothing.
 template <class Traits>
 class basic_runtime_selection
 {
@@ -4185,7 +3899,7 @@ class basic_runtime_selection
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
     using pool_ref = basic_pool_ref<Traits>;
-    using runtime_selection = basic_runtime_selection;  // the historical body spelling
+    using runtime_selection = basic_runtime_selection;
 
 public:
     basic_runtime_selection() = default;
@@ -4205,7 +3919,7 @@ public:
 
     runtime_selection& exclude(pool_ref pool)
     {
-        if (pool.pool_ != nullptr)  // an absent pool excludes nothing
+        if (pool.pool_ != nullptr)
         {
             excludes_.push_back(pool.pool_);
         }
@@ -4219,8 +3933,6 @@ public:
         impossible_ = false;
     }
 
-    // fn(entity), bool return = early exit. O(smallest include pool). The pool
-    // lists are snapshotted; edits mid-walk only affect future iterations.
     template <class F>
     void entities(F&& fn) const
     {
@@ -4257,7 +3969,6 @@ public:
         }
     }
 
-    // Not noexcept: the walk snapshots the pool lists (tooling path).
     [[nodiscard]] std::size_t count() const
     {
         std::size_t n = 0;
@@ -4285,8 +3996,6 @@ public:
     }
 
 private:
-    // Locks the SNAPSHOT taken by entities(): unlock always mirrors lock
-    // exactly, even if the live selection is edited mid-iteration.
     struct lock_all
     {
         explicit lock_all(const std::vector<const pool_base*>& pools) noexcept
@@ -4378,18 +4087,10 @@ private:
 
     std::vector<const pool_base*> includes_;
     std::vector<const pool_base*> excludes_;
-    bool impossible_ = false;  // an include named a pool that does not exist
+    bool impossible_ = false;
 };
 
 using runtime_selection = basic_runtime_selection<default_entity_traits>;
-
-// ----------------------------------------------------------------------------
-// detail: payload arena
-//
-// Bump allocation from chunks that never move, so payload pointers recorded
-// by command buffers and blueprints stay valid as they grow. Chunks are
-// reused across reset(); over-aligned payloads get dedicated chunks.
-// ----------------------------------------------------------------------------
 
 namespace detail
 {
@@ -4416,9 +4117,9 @@ public:
     {
         if (this != &other)
         {
-            release();  // our chunks die via our resource...
+            release();
             chunks_.swap(other.chunks_);
-            memory_ = other.memory_;  // ...adopted chunks free via theirs
+            memory_ = other.memory_;
             cursor_ = std::exchange(other.cursor_, 0);
         }
         return *this;
@@ -4433,8 +4134,6 @@ public:
     {
         if (align > bump_align)
         {
-            // Dedicated, exactly-aligned chunks -- reused after reset(), so a
-            // warm buffer recording over-aligned payloads stays allocation-free.
             for (chunk& c : chunks_)
             {
                 if (c.used == 0 && c.align >= align && c.capacity >= bytes)
@@ -4445,7 +4144,7 @@ public:
             }
             reserve_chunk_slot();
             auto* memory = static_cast<std::byte*>(memory_->allocate(bytes, align));
-            chunks_.push_back(chunk{memory, bytes, bytes, align});  // nofail: reserved above
+            chunks_.push_back(chunk{memory, bytes, bytes, align});
             return memory;
         }
         while (cursor_ < chunks_.size())
@@ -4462,13 +4161,11 @@ public:
         reserve_chunk_slot();
         const std::size_t capacity = std::max(chunk_bytes, bytes);
         auto* memory = static_cast<std::byte*>(memory_->allocate(capacity, bump_align));
-        chunks_.push_back(chunk{memory, capacity, bytes, bump_align});  // nofail: reserved above
+        chunks_.push_back(chunk{memory, capacity, bytes, bump_align});
         cursor_ = chunks_.size() - 1;
         return memory;
     }
 
-    // Forgets every payload (callers destroy objects first) but keeps the
-    // chunks: a warm arena re-records a steady frame without allocating.
     void reset() noexcept
     {
         for (chunk& c : chunks_)
@@ -4494,7 +4191,7 @@ private:
         std::byte* memory;
         std::size_t capacity;
         std::size_t used;
-        std::size_t align;  // the alignment it was allocated (and must be freed) with
+        std::size_t align;
     };
 
     void reserve_chunk_slot()
@@ -4506,35 +4203,22 @@ private:
     }
 
     std::pmr::memory_resource* memory_;
-    std::vector<chunk> chunks_;  // records only; payload memory comes from memory_
-    std::size_t cursor_ = 0;     // first chunk allocate() should try
+    std::vector<chunk> chunks_;
+    std::size_t cursor_ = 0;
 };
 }  // namespace detail
-
-// ----------------------------------------------------------------------------
-// Command buffer
-//
-// Records work now; world.apply(cmd) replays it later, in recording order.
-// spawn() returns a provisional handle, valid only as a target of later ops
-// in the same buffer; apply() resolves it to a real entity. An op whose
-// target is not alive when it would run is skipped (and counted), so buffers
-// never touch recycled slots. Recorded handles are only meaningful to the
-// world whose handles they are.
-// ----------------------------------------------------------------------------
 
 template <class Traits>
 class basic_command_buffer
 {
     using entity = ecs::basic_entity<Traits>;
-    using world = ecs::basic_world<Traits>;
+    using world = ecs::basic_registry<Traits>;
     using kin = detail::basic_kin<Traits>;
     using limits = detail::entity_limits<Traits>;
     using index_type = typename Traits::index_type;
     using generation_type = typename Traits::generation_type;
 
 public:
-    // The optional memory resource feeds the op list and the payload arena;
-    // it must outlive the buffer.
     explicit basic_command_buffer(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : ops_(memory),
@@ -4543,8 +4227,6 @@ public:
     {
     }
 
-    // The moved-from buffer is as good as freshly constructed, with a new
-    // identity so moved-away provisional handles cannot match later ones.
     basic_command_buffer(basic_command_buffer&& other) noexcept
         : ops_(std::move(other.ops_)),
           arena_(std::move(other.arena_)),
@@ -4554,16 +4236,14 @@ public:
     {
     }
 
-    // Not noexcept: assigning between buffers on different memory resources
-    // falls back to element-wise moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
     basic_command_buffer& operator=(basic_command_buffer&& other)
     {
         if (this != &other)
         {
-            destroy_payloads();            // our pending payloads die before adopting other's
-            ops_.clear();                  // never leave records for destroyed payloads if the
-            ops_ = std::move(other.ops_);  // cross-resource assignment throws
+            destroy_payloads();
+            ops_.clear();
+            ops_ = std::move(other.ops_);
             other.ops_.clear();
             arena_ = std::move(other.arena_);
             resolved_ = std::move(other.resolved_);
@@ -4579,9 +4259,7 @@ public:
 
     ~basic_command_buffer() { destroy_payloads(); }
 
-    // Deferred create. The returned handle is provisional: feed it to later
-    // ops in this buffer; apply() spawns the real entity. O(1).
-    entity spawn()
+    entity create()
     {
         const entity provisional(static_cast<index_type>(limits::provisional_bit | ticket_count_),
                                  nonce_);
@@ -4598,35 +4276,30 @@ public:
         return provisional;
     }
 
-    // Deferred world.spawn(Cs&&...): payloads are constructed now and moved
-    // into place at apply time; tags ride along as empty values. O(components).
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint<Traits>> && ...))
-    entity spawn(Cs&&... components)
+    entity create(Cs&&... components)
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "ecs: duplicate component type in spawn(...)");
-        const entity provisional = spawn();
+                      "ecs: duplicate component type in create(...)");
+        const entity provisional = create();
         (record_value(provisional, std::forward<Cs>(components)), ...);
         return provisional;
     }
 
-    // Deferred world.add<T>: constructed now, moved into place at apply time.
     template <component T, class... Args>
     void add(entity target, Args&&... args)
     {
         record<T, op_kind::add>(target, std::forward<Args>(args)...);
     }
 
-    // Deferred world.put<T> (add-or-replace).
     template <component T, class... Args>
     void put(entity target, Args&&... args)
     {
         record<T, op_kind::put>(target, std::forward<Args>(args)...);
     }
 
-    // Deferred world.remove<T>.
     template <component T>
     void remove(entity target)
     {
@@ -4640,19 +4313,35 @@ public:
                           nullptr});
     }
 
-    // Deferred world.kill.
-    void kill(entity target)
+    void destroy(entity target)
     {
         reserve_op();
         ops_.push_back(op{op_kind::kill, target, nullptr, nullptr, nullptr});
     }
 
+    void adopt(entity parent, entity child)
+    {
+        reserve_op();
+        auto* slot = static_cast<entity*>(arena_.allocate(sizeof(entity), alignof(entity)));
+        std::construct_at(slot, parent);
+        ops_.push_back(op{op_kind::adopt, child, nullptr, nullptr, slot});
+    }
+
+    void orphan(entity child)
+    {
+        reserve_op();
+        ops_.push_back(op{op_kind::orphan, child, nullptr, nullptr, nullptr});
+    }
+
+    void destroy_subtree(entity root)
+    {
+        reserve_op();
+        ops_.push_back(op{op_kind::subtree_kill, root, nullptr, nullptr, nullptr});
+    }
+
     [[nodiscard]] bool empty() const noexcept { return ops_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return ops_.size(); }
 
-    // Destroys unapplied payloads and resets for reuse; the arena is retained
-    // (warm reuse allocates nothing). Provisional handles from before the
-    // clear go stale and are refused by apply().
     void clear() noexcept
     {
         destroy_payloads();
@@ -4665,10 +4354,8 @@ public:
 
 private:
     template <class>
-    friend class basic_world;
+    friend class basic_registry;
 
-    // The process-wide nonce, truncated to this layout's generation lane
-    // (narrower generations narrow the misuse net, never the mechanism).
     [[nodiscard]] static generation_type fresh_nonce() noexcept
     {
         return static_cast<generation_type>(detail::next_buffer_nonce());
@@ -4681,6 +4368,9 @@ private:
         put,
         remove,
         kill,
+        adopt,
+        orphan,
+        subtree_kill,
     };
 
     struct op
@@ -4703,8 +4393,6 @@ private:
         }
     }
 
-    // Guarantees the next ops_.push_back cannot throw, so a constructed
-    // payload is never stranded without its destroy record.
     void reserve_op()
     {
         if (ops_.size() == ops_.capacity())
@@ -4713,8 +4401,6 @@ private:
         }
     }
 
-    // Value-pack recording for spawn(Cs&&...): tags arrive as empty values,
-    // everything else is forwarded into the arena.
     template <class C>
     void record_value(entity target, C&& value)
     {
@@ -4756,7 +4442,6 @@ private:
             {
                 destroy_fn = [](void* p) noexcept { std::destroy_at(static_cast<T*>(p)); };
             }
-            // nofail: reserve_op() ran before the payload was constructed.
             ops_.push_back(op{Kind,
                               target,
                               [](world& w, entity e, void* p) { erased_apply<T, Kind>(w, e, p); },
@@ -4765,8 +4450,6 @@ private:
         }
     }
 
-    // Bodies live in-class: member templates instantiate at apply() time,
-    // when basic_world<Traits> is complete.
     template <component T, op_kind Kind>
     static void erased_apply(world& w, entity target, void* payload)
     {
@@ -4802,33 +4485,21 @@ private:
 
     std::pmr::vector<op> ops_;
     detail::payload_arena arena_;
-    std::pmr::vector<entity> resolved_;  // scratch used by world::apply; reused across applies
+    std::pmr::vector<entity> resolved_;
     index_type ticket_count_ = 0;
-    generation_type nonce_ = fresh_nonce();  // this buffer's identity
+    generation_type nonce_ = fresh_nonce();
 };
 
 using command_buffer = basic_command_buffer<default_entity_traits>;
-
-// ----------------------------------------------------------------------------
-// Blueprint
-//
-// A reusable spawn recipe: record component values once, stamp them onto any
-// number of fresh entities via world.spawn(blueprint). Payloads are COPIED at
-// every spawn, so blueprint components must be copy-constructible. Blueprints
-// are move-only; stamping writes component pools, so spawn(blueprint) follows
-// the same iteration rules as spawn with components.
-// ----------------------------------------------------------------------------
 
 template <class Traits>
 class basic_blueprint
 {
     using entity = ecs::basic_entity<Traits>;
-    using world = ecs::basic_world<Traits>;
-    using blueprint = basic_blueprint;  // the historical body spelling
+    using world = ecs::basic_registry<Traits>;
+    using blueprint = basic_blueprint;
 
 public:
-    // The optional memory resource feeds the recipe storage; it must outlive
-    // the blueprint.
     explicit basic_blueprint(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : ops_(memory),
@@ -4836,8 +4507,6 @@ public:
     {
     }
 
-    // Records the whole recipe from component values in one expression; tags
-    // ride along as empty values. Equivalent to one add per value.
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
@@ -4850,7 +4519,6 @@ public:
         (record_value(std::forward<Cs>(components)), ...);
     }
 
-    // The same, with the recipe storage fed by an explicit memory resource.
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, basic_blueprint> && ...) &&
@@ -4870,15 +4538,13 @@ public:
         other.ops_.clear();
     }
 
-    // Not noexcept: assigning between blueprints on different memory
-    // resources falls back to element-wise moves, which may allocate.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
     basic_blueprint& operator=(basic_blueprint&& other)
     {
         if (this != &other)
         {
             destroy_payloads();
-            ops_.clear();  // no stale records if the cross-resource assignment throws
+            ops_.clear();
             ops_ = std::move(other.ops_);
             other.ops_.clear();
             arena_ = std::move(other.arena_);
@@ -4891,8 +4557,6 @@ public:
 
     ~basic_blueprint() { destroy_payloads(); }
 
-    // Records one component for every future stamp: arguments evaluate once,
-    // each spawn copy-constructs from the stored value. Returns *this.
     template <component T, class... Args>
     basic_blueprint& add(Args&&... args)
     {
@@ -4932,7 +4596,6 @@ public:
             {
                 destroy_fn = [](void* p) noexcept { std::destroy_at(static_cast<T*>(p)); };
             }
-            // nofail: reserve_op() ran before the payload was constructed.
             ops_.push_back(op{detail::type_id<T>(),
                               [](world& w, entity e, const void* p)
                               { erased_stamp_value<T>(w, e, p); },
@@ -4945,7 +4608,6 @@ public:
     [[nodiscard]] bool empty() const noexcept { return ops_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return ops_.size(); }
 
-    // Forgets the recipe; the arena is retained for re-recording.
     void clear() noexcept
     {
         destroy_payloads();
@@ -4955,7 +4617,7 @@ public:
 
 private:
     template <class>
-    friend class basic_world;
+    friend class basic_registry;
 
     struct op
     {
@@ -4984,8 +4646,6 @@ private:
         }
     }
 
-    // Value-pack recording: tags arrive as empty values, everything else is
-    // forwarded into the arena.
     template <class C>
     void record_value(C&& value)
     {
@@ -5000,8 +4660,6 @@ private:
         }
     }
 
-    // Bodies live in-class: member templates instantiate at stamp time, when
-    // basic_world<Traits> is complete.
     template <component T>
     static void erased_stamp(world& w, entity e)
     {
@@ -5011,7 +4669,7 @@ private:
     template <component T>
     static void erased_stamp_value(world& w, entity e, const void* payload)
     {
-        w.template add<T>(e, *static_cast<const T*>(payload));  // copy: the recipe is reusable
+        w.template add<T>(e, *static_cast<const T*>(payload));
     }
 
     std::pmr::vector<op> ops_;
@@ -5020,14 +4678,9 @@ private:
 
 using blueprint = basic_blueprint<default_entity_traits>;
 
-// ----------------------------------------------------------------------------
-// World
-// ----------------------------------------------------------------------------
-
 namespace detail
 {
-// Built-in component backing the optional parent/child links. Stable storage:
-// link surgery holds pointers across sibling-list edits.
+
 template <class Traits>
 struct basic_kin
 {
@@ -5035,44 +4688,44 @@ struct basic_kin
 
     entity parent{};
     entity first_child{};
+    entity last_child{};
     entity prev_sibling{};
     entity next_sibling{};
 
     static constexpr auto ecs_storage = storage::stable;
 };
 
-// The parent/child link invariants, kept in one place: world::adopt/orphan/
-// kill call in; nothing else may edit kin records.
 namespace kin_links
 {
-// Detaches child_k from its parent's sibling list (links only; the record's
-// own fields are the caller's to reset).
 template <class Traits>
 void unlink(stable_pool<basic_kin<Traits>, Traits>& pool, basic_kin<Traits>& child_k) noexcept
 {
-    constexpr ecs::basic_entity<Traits> no_entity{};  // shadows the default-traits constant
+    constexpr ecs::basic_entity<Traits> no_entity{};
+    basic_kin<Traits>* parent_k = pool.at(child_k.parent.index());
     if (child_k.prev_sibling != no_entity)
     {
         pool.at(child_k.prev_sibling.index())->next_sibling = child_k.next_sibling;
     }
     else
     {
-        pool.at(child_k.parent.index())->first_child = child_k.next_sibling;
+        parent_k->first_child = child_k.next_sibling;
     }
     if (child_k.next_sibling != no_entity)
     {
         pool.at(child_k.next_sibling.index())->prev_sibling = child_k.prev_sibling;
     }
+    else
+    {
+        parent_k->last_child = child_k.prev_sibling;
+    }
 }
 
-// Pre-kill surgery: detach e from its parent's list and orphan all of its
-// children, so no other entity ever holds a link to the dying one.
 template <class Traits>
 void sever(stable_pool<basic_kin<Traits>, Traits>& pool, ecs::basic_entity<Traits> e) noexcept
 {
     using entity = ecs::basic_entity<Traits>;
     using kin = basic_kin<Traits>;
-    constexpr entity no_entity{};  // shadows the default-traits constant
+    constexpr entity no_entity{};
     kin* k = pool.at(e.index());
     if (k == nullptr)
     {
@@ -5093,14 +4746,13 @@ void sever(stable_pool<basic_kin<Traits>, Traits>& pool, ecs::basic_entity<Trait
     }
 }
 
-// Link-graph audit for world::validate().
 template <class Traits>
 [[nodiscard]] std::expected<void, fault> check(const stable_pool<basic_kin<Traits>, Traits>& pool,
                                                const basic_entity_table<Traits>& table)
 {
     using entity = ecs::basic_entity<Traits>;
     using kin = basic_kin<Traits>;
-    constexpr entity no_entity{};  // shadows the default-traits constant
+    constexpr entity no_entity{};
     const auto broken = [&](const char* note)
     { return std::unexpected(fault{fault_code::links_broken, pool.name(), note}); };
     for (std::size_t pos = 0; pos < pool.size(); ++pos)
@@ -5128,7 +4780,6 @@ template <class Traits>
         }
         if (k->first_child != no_entity)
         {
-            // Bounded walk: a corrupt cycle must not hang validate().
             std::size_t steps = 0;
             for (entity child = k->first_child; child != no_entity;)
             {
@@ -5140,25 +4791,573 @@ template <class Traits>
                 child = child_k->next_sibling;
             }
         }
+        if ((k->first_child == no_entity) != (k->last_child == no_entity))
+        {
+            return broken("first_child/last_child presence mismatch");
+        }
+        if (k->last_child != no_entity)
+        {
+            const kin* tail_k = pool.at(k->last_child.index());
+            if (tail_k == nullptr || tail_k->parent != e || tail_k->next_sibling != no_entity)
+            {
+                return broken("last_child not the tail of the child list");
+            }
+        }
     }
     return {};
 }
 }  // namespace kin_links
 }  // namespace detail
 
+namespace detail
+{
+struct system_root
+{
+    system_root() = default;
+    system_root(const system_root&) = delete;
+    system_root& operator=(const system_root&) = delete;
+    system_root(system_root&&) = delete;
+    system_root& operator=(system_root&&) = delete;
+    virtual ~system_root() = default;
+};
+
+template <entity_traits Traits, class E>
+struct system_handler
+{
+    virtual void process(basic_registry<Traits>& world, const E& event) = 0;
+
+protected:
+    ~system_handler() = default;
+};
+
+template <entity_traits Traits>
+struct dispatch_bucket_base
+{
+    bool order_dirty = false;
+
+    virtual ~dispatch_bucket_base() = default;
+
+    virtual void add_after(std::uint32_t system_id, std::uint32_t dep) = 0;
+
+    virtual void sort_by_dependencies() = 0;
+
+    virtual void remove_listener(std::uint32_t listener) = 0;
+};
+
+template <entity_traits Traits, class E>
+struct dispatch_bucket : dispatch_bucket_base<Traits>
+{
+    struct entry
+    {
+        std::uint32_t feature = 0;
+        std::uint32_t system_id = 0;
+        std::vector<std::uint32_t> after;
+        std::move_only_function<void(basic_registry<Traits>&, const E&)> fn;
+        std::uint32_t listener = 0;
+    };
+
+    std::vector<entry> entries;
+
+    void add_after(std::uint32_t system_id, std::uint32_t dep) override
+    {
+        for (entry& e : entries)
+        {
+            if (e.system_id == system_id && e.listener == 0)
+            {
+                e.after.push_back(dep);
+            }
+        }
+        this->order_dirty = true;
+    }
+
+    void sort_by_dependencies() override
+    {
+        const std::size_t n = entries.size();
+        std::vector<std::size_t> indegree(n, 0);
+        std::vector<std::vector<std::size_t>> successors(n);
+        const auto index_of = [&](std::uint32_t sid) -> std::size_t
+        {
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                if (entries[i].system_id == sid && entries[i].listener == 0)
+                {
+                    return i;
+                }
+            }
+            return n;
+        };
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            for (const std::uint32_t dep : entries[i].after)
+            {
+                const std::size_t j = index_of(dep);
+                if (j < n && j != i)
+                {
+                    successors[j].push_back(i);
+                    ++indegree[i];
+                }
+            }
+        }
+        std::vector<entry> ordered;
+        ordered.reserve(n);
+        std::vector<bool> emitted(n, false);
+        for (std::size_t step = 0; step < n; ++step)
+        {
+            std::size_t pick = n;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                if (!emitted[i] && indegree[i] == 0)
+                {
+                    pick = i;
+                    break;
+                }
+            }
+            if (pick == n)
+            {
+                if constexpr (checks_enabled)
+                {
+                    violate("system ordering cycle in an event bucket");
+                }
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    if (!emitted[i])
+                    {
+                        ordered.push_back(std::move(entries[i]));
+                        emitted[i] = true;
+                    }
+                }
+                break;
+            }
+            emitted[pick] = true;
+            ordered.push_back(std::move(entries[pick]));
+            for (const std::size_t s : successors[pick])
+            {
+                --indegree[s];
+            }
+        }
+        entries = std::move(ordered);
+    }
+
+    void remove_listener(std::uint32_t listener) override
+    {
+        std::erase_if(entries, [listener](const entry& e) { return e.listener == listener; });
+    }
+};
+}  // namespace detail
+
+template <entity_traits Traits, class... Events>
+class basic_system : public detail::system_root, public detail::system_handler<Traits, Events>...
+{
+public:
+    static_assert(sizeof...(Events) > 0, "ecs: system<> needs at least one event type");
+    static_assert(detail::all_distinct<Events...>, "ecs: duplicate event type in system<...>");
+
+    using events = types<Events...>;
+    using traits_type = Traits;
+};
+
+template <class... Events>
+using system = basic_system<default_entity_traits, Events...>;
+
+namespace detail
+{
+template <entity_traits Traits>
+class basic_dispatcher;
+
+template <entity_traits Traits>
+struct event_queue_base
+{
+    virtual ~event_queue_base() = default;
+    virtual void flush(basic_dispatcher<Traits>& disp, basic_registry<Traits>& w) = 0;
+    [[nodiscard]] virtual std::size_t size() const noexcept = 0;
+};
+
+template <entity_traits Traits, class E>
+struct event_queue;
+
+template <entity_traits Traits>
+class basic_dispatcher
+{
+    using world = basic_registry<Traits>;
+    using command_buffer = basic_command_buffer<Traits>;
+
+    static constexpr std::uint32_t max_dispatch_depth = 64;
+
+public:
+    explicit basic_dispatcher(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+        : deferred_(memory),
+          memory_(memory)
+    {
+    }
+
+    basic_dispatcher(basic_dispatcher&&) noexcept = default;
+    basic_dispatcher& operator=(basic_dispatcher&&) = default;
+    basic_dispatcher(const basic_dispatcher&) = delete;
+    basic_dispatcher& operator=(const basic_dispatcher&) = delete;
+    ~basic_dispatcher() = default;
+
+    std::uint32_t ensure_feature(std::uint32_t feature_id)
+    {
+        for (std::uint32_t i = 0; i < feature_ids_.size(); ++i)
+        {
+            if (feature_ids_[i] == feature_id)
+            {
+                return i;
+            }
+        }
+        feature_ids_.push_back(feature_id);
+        feature_enabled_.push_back(std::uint8_t{1});
+        return static_cast<std::uint32_t>(feature_ids_.size() - 1);
+    }
+
+    void set_feature_enabled(std::uint32_t feature_id, bool on)
+    {
+        const std::uint32_t f = ensure_feature(feature_id);
+        feature_enabled_[f] = static_cast<std::uint8_t>(on ? 1 : 0);
+        any_disabled_ = any_disabled_ || !on;
+    }
+
+    template <class Sys, class... Args>
+        requires std::derived_from<Sys, system_root>
+    void add_system(std::uint32_t feature, Args&&... args)
+    {
+        static_assert(std::same_as<typename Sys::traits_type, Traits>,
+                      "ecs: system traits do not match registry traits");
+        if (depth_ != 0)
+        {
+            if constexpr (checks_enabled)
+            {
+                violate("add_system during dispatch()");
+            }
+            return;
+        }
+        auto owned = std::make_unique<Sys>(std::forward<Args>(args)...);
+        Sys* ptr = owned.get();
+        const std::uint32_t sid = type_id<Sys>();
+        last_system_id_ = sid;
+        last_event_ids_.clear();
+        for_each(typename Sys::events{},
+                 [this, ptr, feature, sid]<class E>()
+                 {
+                     auto* handler = static_cast<system_handler<Traits, E>*>(ptr);
+                     this->template ensure_bucket<E>().entries.push_back(
+                         {feature,
+                          sid,
+                          {},
+                          [handler](world& w, const E& ev) { handler->process(w, ev); }});
+                     last_event_ids_.push_back(type_id<E>());
+                 });
+        owned_.push_back(std::move(owned));
+    }
+
+    void depend_after(std::uint32_t dep)
+    {
+        for (const std::uint32_t eid : last_event_ids_)
+        {
+            if (eid < buckets_.size() && buckets_[eid])
+            {
+                buckets_[eid]->add_after(last_system_id_, dep);
+            }
+        }
+    }
+
+    template <class E>
+    void process(world& w, const E& ev)
+    {
+        dispatch_bucket<Traits, E>* bucket = find_bucket<E>();
+        if (bucket == nullptr)
+        {
+            return;
+        }
+
+        if constexpr (checks_enabled)
+        {
+            if (depth_ >= max_dispatch_depth)
+            {
+                violate("dispatch nested beyond the maximum dispatch depth");
+                return;
+            }
+        }
+
+        if (bucket->order_dirty)
+        {
+            bucket->sort_by_dependencies();
+            bucket->order_dirty = false;
+        }
+
+        const bool nested = depth_ != 0;
+        command_buffer parent_pending(memory_);
+        if (nested)
+        {
+            using std::swap;
+            swap(deferred_, parent_pending);
+        }
+
+        struct level_guard
+        {
+            std::uint32_t* depth;
+            command_buffer* live;
+            command_buffer* stash;
+            bool nested;
+            ~level_guard()
+            {
+                if (nested)
+                {
+                    using std::swap;
+                    swap(*live, *stash);
+                }
+                --*depth;
+            }
+        } guard{&depth_, &deferred_, &parent_pending, nested};
+        ++depth_;
+
+        for (auto& entry : bucket->entries)
+        {
+            if (any_disabled_ && entry.listener == 0 && !feature_enabled_[entry.feature])
+            {
+                continue;
+            }
+            entry.fn(w, ev);
+            if (!deferred_.empty())
+            {
+                w.apply(deferred_);
+            }
+        }
+    }
+
+    [[nodiscard]] command_buffer& deferred() noexcept { return deferred_; }
+
+    template <class E, class Fn>
+        requires(std::invocable<Fn&, world&, const E&> || std::invocable<Fn&, const E&>)
+    std::uint32_t connect(Fn&& fn)
+    {
+        if (depth_ != 0)
+        {
+            if constexpr (checks_enabled)
+            {
+                violate("connect during dispatch()");
+            }
+            return 0;
+        }
+        const std::uint32_t id = ++last_listener_id_;
+        dispatch_bucket<Traits, E>& bucket = ensure_bucket<E>();
+        if constexpr (std::invocable<Fn&, world&, const E&>)
+        {
+            bucket.entries.push_back({0U, 0U, {}, std::forward<Fn>(fn), id});
+        }
+        else
+        {
+            bucket.entries.push_back({0U,
+                                      0U,
+                                      {},
+                                      [call = std::forward<Fn>(fn)](world&, const E& ev) mutable
+                                      { call(ev); },
+                                      id});
+        }
+        return id;
+    }
+
+    void disconnect(std::uint32_t bucket_id, std::uint32_t listener)
+    {
+        if (depth_ != 0)
+        {
+            if constexpr (checks_enabled)
+            {
+                violate("disconnect during dispatch()");
+            }
+            return;
+        }
+        if (listener != 0 && bucket_id < buckets_.size() && buckets_[bucket_id])
+        {
+            buckets_[bucket_id]->remove_listener(listener);
+        }
+    }
+
+    template <class E>
+    void enqueue(E ev)
+    {
+        ensure_queue<E>().items.push_back(std::move(ev));
+    }
+
+    template <class E>
+    void flush(world& w)
+    {
+        const std::uint32_t id = type_id<E>();
+        if (id < queues_.size() && queues_[id])
+        {
+            queues_[id]->flush(*this, w);
+        }
+    }
+
+    void flush(world& w)
+    {
+        for (std::size_t i = 0; i < queues_.size(); ++i)
+        {
+            if (queues_[i])
+            {
+                queues_[i]->flush(*this, w);
+            }
+        }
+    }
+
+    template <class E>
+    [[nodiscard]] std::size_t queued() const noexcept
+    {
+        const std::uint32_t id = type_id<E>();
+        return id < queues_.size() && queues_[id] ? queues_[id]->size() : 0;
+    }
+
+private:
+    template <class E>
+    dispatch_bucket<Traits, E>& ensure_bucket()
+    {
+        const std::uint32_t id = type_id<E>();
+        if (id >= buckets_.size())
+        {
+            buckets_.resize(static_cast<std::size_t>(id) + 1U);
+        }
+        if (!buckets_[id])
+        {
+            buckets_[id] = std::make_unique<dispatch_bucket<Traits, E>>();
+        }
+        return static_cast<dispatch_bucket<Traits, E>&>(*buckets_[id]);
+    }
+
+    template <class E>
+    dispatch_bucket<Traits, E>* find_bucket() noexcept
+    {
+        const std::uint32_t id = type_id<E>();
+        if (id >= buckets_.size() || !buckets_[id])
+        {
+            return nullptr;
+        }
+        return static_cast<dispatch_bucket<Traits, E>*>(buckets_[id].get());
+    }
+
+    template <class E>
+    event_queue<Traits, E>& ensure_queue()
+    {
+        const std::uint32_t id = type_id<E>();
+        if (id >= queues_.size())
+        {
+            queues_.resize(static_cast<std::size_t>(id) + 1U);
+        }
+        if (!queues_[id])
+        {
+            queues_[id] = std::make_unique<event_queue<Traits, E>>(memory_);
+        }
+        return static_cast<event_queue<Traits, E>&>(*queues_[id]);
+    }
+
+    std::vector<std::unique_ptr<dispatch_bucket_base<Traits>>> buckets_;
+    std::vector<std::unique_ptr<event_queue_base<Traits>>> queues_;
+    std::vector<std::unique_ptr<system_root>> owned_;
+    std::vector<std::uint32_t> feature_ids_;
+    std::vector<std::uint8_t> feature_enabled_;
+    std::vector<std::uint32_t> last_event_ids_;
+    command_buffer deferred_;
+    std::pmr::memory_resource* memory_;
+    std::uint32_t last_system_id_ = 0;
+    std::uint32_t last_listener_id_ = 0;
+    std::uint32_t depth_ = 0;
+    bool any_disabled_ = false;
+};
+
+template <entity_traits Traits, class E>
+struct event_queue : event_queue_base<Traits>
+{
+    std::pmr::vector<E> items;
+
+    explicit event_queue(std::pmr::memory_resource* memory)
+        : items(memory)
+    {
+    }
+
+    void flush(basic_dispatcher<Traits>& disp, basic_registry<Traits>& w) override
+    {
+        std::pmr::vector<E> batch(items.get_allocator());
+        using std::swap;
+        swap(batch, items);
+        for (E& ev : batch)
+        {
+            disp.template process<E>(w, ev);
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept override { return items.size(); }
+};
+}  // namespace detail
+
+struct listener_token
+{
+    std::uint32_t bucket = 0;
+    std::uint32_t id = 0;
+};
+
+template <entity_traits Traits>
+class basic_system_ref
+{
+public:
+    basic_system_ref(detail::basic_dispatcher<Traits>* dispatcher, std::uint32_t feature) noexcept
+        : dispatcher_(dispatcher),
+          feature_(feature)
+    {
+    }
+
+    template <class Other>
+    basic_system_ref& after()
+    {
+        dispatcher_->depend_after(detail::type_id<Other>());
+        return *this;
+    }
+
+    template <class Sys, class... Args>
+    basic_system_ref add_system(Args&&... args)
+    {
+        dispatcher_->template add_system<Sys>(feature_, std::forward<Args>(args)...);
+        return basic_system_ref(dispatcher_, feature_);
+    }
+
+private:
+    detail::basic_dispatcher<Traits>* dispatcher_;
+    std::uint32_t feature_;
+};
+
+template <entity_traits Traits>
+class basic_feature_builder
+{
+public:
+    basic_feature_builder(detail::basic_dispatcher<Traits>* dispatcher,
+                          std::uint32_t feature) noexcept
+        : dispatcher_(dispatcher),
+          feature_(feature)
+    {
+    }
+
+    template <class Sys, class... Args>
+    basic_system_ref<Traits> add_system(Args&&... args)
+    {
+        dispatcher_->template add_system<Sys>(feature_, std::forward<Args>(args)...);
+        return basic_system_ref<Traits>(dispatcher_, feature_);
+    }
+
+private:
+    detail::basic_dispatcher<Traits>* dispatcher_;
+    std::uint32_t feature_;
+};
+
 template <class Traits>
-class basic_world
+class basic_registry
 {
 public:
     using traits_type = Traits;
     using entity = ecs::basic_entity<Traits>;
 
 private:
-    using world = basic_world;  // the historical body spelling
+    using world = basic_registry;
     using entity_table = detail::basic_entity_table<Traits>;
     using index_type = typename Traits::index_type;
     using pool_base = detail::basic_pool_base<Traits>;
-    using group_core = detail::basic_group_core<Traits>;
     using single_pool_lock = detail::basic_single_pool_lock<Traits>;
     using kin = detail::basic_kin<Traits>;
     using component_hook = ecs::basic_component_hook<Traits>;
@@ -5166,80 +5365,67 @@ private:
     using blueprint = basic_blueprint<Traits>;
     using pool_ref = basic_pool_ref<Traits>;
     using runtime_selection = basic_runtime_selection<Traits>;
-    using entity_ref = basic_entity_ref<basic_world>;
-    using const_entity_ref = basic_entity_ref<const basic_world>;
+    using entity_filler = basic_entity_filler<basic_registry>;
+    using const_entity_filler = basic_entity_filler<const basic_registry>;
     using limits = detail::entity_limits<Traits>;
     template <class T>
     using pool_of_t = ecs::pool_of_t<T, Traits>;
-    static constexpr entity no_entity{};  // shadows the default-traits constant
+    static constexpr entity no_entity{};
 
 public:
-    // The optional memory resource feeds all scaling storage (payloads,
-    // sparse pages, dense arrays, entity table) and must outlive the world.
-    // Bounded structures (pool objects, hook lists) use the global allocator.
-    explicit basic_world(
+    explicit basic_registry(
         std::pmr::memory_resource* memory = std::pmr::get_default_resource()) noexcept
         : table_(memory),
           pools_(memory),
           active_(memory),
-          bonds_(memory),
-          memory_(memory)
+          memory_(memory),
+          dispatcher_(memory)
     {
     }
 
-    // Move-construction carries the pools along, so prior selections stay
-    // valid. Move-ASSIGNMENT destroys the target's pools first (its
-    // selections dangle). Moved-from worlds are empty and reusable.
-    basic_world(basic_world&& other) noexcept
+    basic_registry(basic_registry&& other) noexcept
         : table_(std::move(other.table_)),
           pools_(std::move(other.pools_)),
           active_(std::move(other.active_)),
-          bonds_(std::move(other.bonds_)),  // bond objects are heap-stable: pool
-          memory_(other.memory_),           // bond_ pointers stay valid
-          globals_(std::exchange(other.globals_, entity{}))
+          memory_(other.memory_),
+          globals_(std::exchange(other.globals_, entity{})),
+          dispatcher_(std::move(other.dispatcher_))
     {
-        other.pools_.clear();  // guarantee the moved-from world is empty
+        other.pools_.clear();
         other.active_.clear();
-        other.bonds_.clear();
         repoint_pools();
     }
 
-    // Not noexcept: differing memory resources force element-wise moves that
-    // may allocate; matching resources are O(1) pointer steals.
     // NOLINTNEXTLINE(cppcoreguidelines-noexcept-move-operations,performance-noexcept-move-constructor,bugprone-exception-escape)
-    basic_world& operator=(basic_world&& other)
+    basic_registry& operator=(basic_registry&& other)
     {
         if (this != &other)
         {
             if constexpr (checks_enabled)
             {
-                // The target's pools are about to die under any running loop.
                 if (any_locked())
                 {
                     detail::violate("world move-assigned over while an iteration is running");
                 }
             }
             table_ = std::move(other.table_);
-            active_.clear();  // a throwing cross-resource move leaves nothing dangling
+            active_.clear();
             pools_ = std::move(other.pools_);
             active_ = std::move(other.active_);
-            bonds_ = std::move(other.bonds_);
-            memory_ = other.memory_;  // future pools follow the adopted content
+            memory_ = other.memory_;
             globals_ = std::exchange(other.globals_, no_entity);
-            other.pools_.clear();  // guarantee the moved-from world is empty
+            dispatcher_ = std::move(other.dispatcher_);
+            other.pools_.clear();
             other.active_.clear();
-            other.bonds_.clear();
             repoint_pools();
         }
         return *this;
     }
 
-    basic_world(const basic_world&) = delete;
-    basic_world& operator=(const basic_world&) = delete;
+    basic_registry(const basic_registry&) = delete;
+    basic_registry& operator=(const basic_registry&) = delete;
 
-    // Destroys all components. Teardown mid-iteration is reported in checked
-    // builds, then UB regardless (a destructor cannot refuse).
-    ~basic_world()
+    ~basic_registry()
     {
         if constexpr (checks_enabled)
         {
@@ -5250,63 +5436,124 @@ public:
         }
     }
 
-    // ------------------------------------------------------------------ life
+    template <class F>
+    basic_feature_builder<Traits> feature()
+    {
+        return basic_feature_builder<Traits>(&dispatcher_,
+                                             dispatcher_.ensure_feature(detail::type_id<F>()));
+    }
 
-    // O(1) amortized. Touches no pools: the one structural op always legal
-    // during iteration.
-    entity spawn() { return table_.create(); }
+    template <class E>
+    void dispatch(const E& ev)
+    {
+        dispatcher_.template process<E>(*this, ev);
+    }
 
-    // Spawn with initial components. Writes pools, so illegal while any of
-    // them iterates (checked; use spawn() + command_buffer adds instead).
+    template <class F>
+    void enable_feature()
+    {
+        dispatcher_.set_feature_enabled(detail::type_id<F>(), true);
+    }
+    template <class F>
+    void disable_feature()
+    {
+        dispatcher_.set_feature_enabled(detail::type_id<F>(), false);
+    }
+
+    [[nodiscard]] command_buffer& deferred() noexcept { return dispatcher_.deferred(); }
+    template <class E>
+    void enqueue(E ev)
+    {
+        dispatcher_.template enqueue<E>(std::move(ev));
+    }
+
+    template <class E>
+    void flush()
+    {
+        dispatcher_.template flush<E>(*this);
+    }
+
+    void flush() { dispatcher_.flush(*this); }
+
+    template <class E>
+    [[nodiscard]] std::size_t queued() const noexcept
+    {
+        return dispatcher_.template queued<E>();
+    }
+
+    template <class E, class Fn>
+        requires(std::invocable<Fn&, basic_registry&, const E&> || std::invocable<Fn&, const E&>)
+    listener_token connect(Fn&& fn)
+    {
+        return {detail::type_id<E>(), dispatcher_.template connect<E>(std::forward<Fn>(fn))};
+    }
+
+    void disconnect(listener_token token) { dispatcher_.disconnect(token.bucket, token.id); }
+
+    entity_filler create() { return ref(table_.create()); }
+
     template <class... Cs>
         requires(sizeof...(Cs) > 0 && (component<std::remove_cvref_t<Cs>> && ...) &&
                  (!std::same_as<std::remove_cvref_t<Cs>, blueprint> && ...))
-    entity spawn(Cs&&... components)
+    entity_filler create(Cs&&... components)
     {
         static_assert(detail::all_distinct<std::remove_cvref_t<Cs>...>,
-                      "ecs: duplicate component type in spawn(...)");
+                      "ecs: duplicate component type in create(...)");
         const entity e = table_.create();
         (add_value(e, std::forward<Cs>(components)), ...);
-        return e;
+        return ref(e);
     }
 
-    // Stamps a blueprint onto a fresh entity (components copy-constructed).
-    // Same iteration rules as spawn with components. O(recorded components).
-    entity spawn(const blueprint& recipe)
+    entity_filler create(const blueprint& recipe)
     {
         const entity e = table_.create();
         for (const blueprint::op& o : recipe.ops_)
         {
             o.apply_fn(*this, e, o.payload);
         }
-        return e;
+        return ref(e);
     }
 
-    // Stamps a recipe count times (zero is a no-op); pre-size big batches
-    // with reserve<T>(n). Same iteration rules. O(count * recorded components).
-    void spawn(const blueprint& recipe, std::size_t count)
+    void create(const blueprint& recipe, std::size_t count)
     {
         for (std::size_t i = 0; i < count; ++i)
         {
-            spawn(recipe);
+            create(recipe);
         }
     }
 
-    // The same, handing each entity back after its full stamp.
     template <class F>
         requires std::invocable<F&, basic_entity<Traits>>
-    void spawn(const blueprint& recipe, std::size_t count, F&& fn)
+    void create(const blueprint& recipe, std::size_t count, F&& fn)
     {
         for (std::size_t i = 0; i < count; ++i)
         {
-            fn(spawn(recipe));
+            fn(create(recipe));
         }
     }
 
-    // Spawns a copy of src: copy-constructible components are duplicated,
-    // non-copyable ones counted in `skipped`; parent/child links are NOT
-    // copied (clones start unlinked). Same iteration rules as spawn with
-    // components. O(pools this world uses).
+    template <class OutputIt>
+        requires std::output_iterator<OutputIt, basic_entity<Traits>>
+    OutputIt create_n(std::size_t count, OutputIt out)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            *out = table_.create();
+            ++out;
+        }
+        return out;
+    }
+
+    template <class F>
+        requires std::invocable<F&, basic_entity<Traits>>
+    void create_n(std::size_t count, F&& fn)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            fn(table_.create());
+        }
+    }
+
     duplicate_result duplicate(entity src)
     {
         if (!table_.alive(src))
@@ -5319,7 +5566,6 @@ public:
         }
         if (is_globals(src))
         {
-            // A second marked entity would break globals() uniqueness.
             if constexpr (checks_enabled)
             {
                 detail::violate("duplicate of the globals entity");
@@ -5330,21 +5576,17 @@ public:
         {
             for (pool_base* pool : active_)
             {
-                if (pool->bond_locked() && pool->contains(src.index()))
+                if (pool->locked() && pool->contains(src.index()))
                 {
-                    detail::violate_pool(
-                        "duplicate during iteration over pool (or its bonded partner)",
-                        pool->name());
+                    detail::violate_pool("duplicate during iteration over pool", pool->name());
                     return {};
                 }
             }
         }
         duplicate_result result{table_.create()};
         const pool_base* links = peek_pool<kin>();
-        // Index loop: on_add hooks may register new pools (growing active_).
-        // Hooks observe a partially built clone; a component a hook already
-        // gave the clone is not copied over it.
-        // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
+
+        // NOLINTNEXTLINE(modernize-loop-convert)
         for (std::size_t i = 0; i < active_.size(); ++i)
         {
             pool_base* pool = active_[i];
@@ -5365,48 +5607,42 @@ public:
         return result;
     }
 
-    // Immediate destroy: removes every component, severs links, recycles the
-    // slot (generation bump kills outstanding handles). O(pools this world
-    // uses), noexcept. Checked builds refuse (skip) a kill while the entity
-    // belongs to any iterated pool, before any mutation.
-    void kill(entity e) noexcept
+    void destroy(entity e) noexcept
     {
-        if (!table_.alive(e) || e == dying_)  // dying_: re-entrant kill from a hook
+        if (!table_.alive(e) || e == dying_)
         {
             if constexpr (checks_enabled)
             {
-                detail::violate("kill on a dead, dying, stale, or null entity handle");
+                detail::violate("destroy on a dead, dying, stale, or null entity handle");
             }
             return;
         }
-        if (is_globals(e))  // cached compare, then one mark-pool probe
+        if (is_globals(e))
         {
             if constexpr (checks_enabled)
             {
-                detail::violate("kill of the globals entity (reset() clears world state)");
+                detail::violate("destroy of the globals entity (reset() clears state)");
             }
             return;
         }
         const index_type index = e.index();
         if constexpr (checks_enabled)
         {
-            // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
+            // NOLINTNEXTLINE(modernize-loop-convert)
             for (std::size_t i = 0; i < active_.size(); ++i)
             {
                 pool_base* pool = active_[i];
-                if (pool->bond_locked() && pool->contains(index))
+                if (pool->locked() && pool->contains(index))
                 {
-                    detail::violate_pool("kill during iteration over pool (or its bonded partner)",
-                                         pool->name());
+                    detail::violate_pool("destroy during iteration over pool", pool->name());
                     return;
                 }
             }
         }
-        // Index loops: an on_remove hook may register a new pool, growing
-        // active_ under us (pool objects never move; new pools get visited).
+
         const entity previous_dying = std::exchange(dying_, e);
         sever_links(e);
-        // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
+        // NOLINTNEXTLINE(modernize-loop-convert)
         for (std::size_t i = 0; i < active_.size(); ++i)
         {
             active_[i]->erase_if_present(index);
@@ -5415,9 +5651,19 @@ public:
         table_.destroy(index);
     }
 
+    template <class EntityIt>
+        requires(std::input_iterator<EntityIt> &&
+                 std::convertible_to<std::iter_value_t<EntityIt>, basic_entity<Traits>>)
+    void destroy(EntityIt first, EntityIt last) noexcept
+    {
+        for (; first != last; ++first)
+        {
+            destroy(static_cast<entity>(*first));
+        }
+    }
+
     [[nodiscard]] bool alive(entity e) const noexcept { return table_.alive(e); }
 
-    // The live handle occupying a slot, or no_entity. For inspectors/tools.
     [[nodiscard]] entity current_handle(index_type slot) const noexcept
     {
         if (!table_.occupied(slot))
@@ -5427,36 +5673,18 @@ public:
         return entity(slot, table_.generation_at(slot));
     }
 
-    // Call-site sugar: a {world, entity} view forwarding the component verbs.
-    // For passing down call chains, not storage (store ecs::entity instead).
-    [[nodiscard]] entity_ref ref(entity e) noexcept;
-    [[nodiscard]] const_entity_ref ref(entity e) const noexcept;
+    [[nodiscard]] entity_filler ref(entity e) noexcept;
+    [[nodiscard]] const_entity_filler ref(entity e) const noexcept;
 
-    // The world's singleton carrier: one lazily spawned entity marked with
-    // globals_mark; world-scoped state is just components on it. Never store
-    // the handle (reset() wipes it; the next call respawns or re-finds it,
-    // including after unpack). kill()/duplicate() refuse it. It IS a visible
-    // live entity (live_count()/live_entities()/pack() include it); filter
-    // broad queries with except<globals_mark> if needed.
-    [[nodiscard]] entity_ref globals();
-    [[nodiscard]] const_entity_ref globals() const noexcept;  // never spawns
+    [[nodiscard]] entity_filler globals();
+    [[nodiscard]] const_entity_filler globals() const noexcept;
 
     void reserve_entities(std::size_t n) { table_.reserve(n); }
 
-    // ------------------------------------------------------------ components
-
-    // Adds T; the entity must not already have it (checked: the duplicate is
-    // dropped, the existing component returned). Returns T& (void for tags).
-    // O(1) amortized; invalidates pointers into packed storage. During an
-    // iteration over T's pool a tag add is refused; a value add must produce
-    // a reference, so it reports then PROCEEDS -- held component references
-    // may dangle. Record into a command_buffer instead.
     template <component T, class... Args>
     decltype(auto) add(entity e, Args&&... args)
     {
         auto& pool = ensure_pool<T>();
-        // Fatal in all builds (matching replace()): a dead/stale/null handle
-        // would corrupt pool membership, and a reference must be produced.
         if (!table_.alive(e))
         {
             if constexpr (checks_enabled)
@@ -5470,7 +5698,7 @@ public:
             static_assert(sizeof...(Args) == 0,
                           "ecs: T uses tag storage and carries no data; call add<T>(e) with "
                           "no arguments (or give T members / a non-tag storage policy)");
-            if (clearing_ || e == dying_)  // a hook adding to a doomed entity
+            if (clearing_ || e == dying_)
             {
                 if constexpr (checks_enabled)
                 {
@@ -5481,11 +5709,10 @@ public:
             }
             if constexpr (checks_enabled)
             {
-                if (pool.bond_locked())
+                if (pool.locked())
                 {
-                    detail::violate_pool("add during iteration over pool (or its bonded partner)",
-                                         pool.name());
-                    return;  // refusal is possible here: nothing to return
+                    detail::violate_pool("add during iteration over pool", pool.name());
+                    return;
                 }
             }
             if (pool.contains(e.index()))
@@ -5507,8 +5734,6 @@ public:
                           "components must be constructed in place from constructor arguments)");
             if (clearing_ || e == dying_)
             {
-                // Would leave a pool holding a dead entity: fatal in every
-                // build, like add through a dead handle.
                 if constexpr (checks_enabled)
                 {
                     detail::violate_pool("add to a dying entity or during reset; pool",
@@ -5518,13 +5743,9 @@ public:
             }
             if constexpr (checks_enabled)
             {
-                if (pool.bond_locked())
+                if (pool.locked())
                 {
-                    // Reported, then proceeds: a T& must be produced. The loop
-                    // itself stays safe, but previously fetched references die
-                    // and a bonded partner's iteration order shifts.
-                    detail::violate_pool("add during iteration over pool (or its bonded partner)",
-                                         pool.name());
+                    detail::violate_pool("add during iteration over pool", pool.name());
                 }
             }
             if (T* existing = pool.at(e.index()); existing != nullptr)
@@ -5540,8 +5761,15 @@ public:
         }
     }
 
-    // Replaces the existing T with a newly constructed value. The entity must
-    // have T (checked). Pointer-stable in every storage policy. O(1).
+    // Single-value overload: lets braced-init deduce, e.g. add<T>(e, {x, y}).
+    // Multi-arg emplace, lvalues, and zero-arg fall through to the variadic above.
+    template <component T>
+        requires(!detail::is_tag_v<T>)
+    decltype(auto) add(entity e, T&& value)
+    {
+        return add<T, T>(e, std::forward<T>(value));
+    }
+
     template <component T, class... Args>
     T& replace(entity e, Args&&... args)
     {
@@ -5556,7 +5784,7 @@ public:
                 detail::violate_pool("replace of a component the entity does not have; pool",
                                      name_of<T>());
             }
-            std::abort();  // cannot produce a component reference
+            std::abort();
         }
         if constexpr (std::is_move_assignable_v<T>)
         {
@@ -5567,14 +5795,10 @@ public:
             std::destroy_at(existing);
             std::construct_at(existing, std::forward<Args>(args)...);
         }
-        peek_pool<T>()->fire_replace(e);  // non-null: the component exists
+        peek_pool<T>()->fire_replace(e);
         return *existing;
     }
 
-    // Mutates T in place through fn(T&), then fires on_replace -- the funnel
-    // for OBSERVED writes (plain get<T>() writes are invisible to hooks).
-    // Mirrors replace: entity must have T (checked), pointer-stable, not
-    // structural, so legal during iteration of T's pool. O(1) plus fn.
     template <component T, class F>
         requires std::invocable<F&, T&>
     T& amend(entity e, F&& fn)
@@ -5590,15 +5814,20 @@ public:
                 detail::violate_pool("amend of a component the entity does not have; pool",
                                      name_of<T>());
             }
-            std::abort();  // cannot produce a component reference
+            std::abort();
         }
         std::invoke(fn, *existing);
-        peek_pool<T>()->fire_replace(e);  // non-null: the component exists
+        peek_pool<T>()->fire_replace(e);
         return *existing;
     }
 
-    // Add-or-replace. Structural (with add's iteration rules) only when the
-    // component is actually added. O(1) amortized.
+    template <component T>
+        requires(!detail::is_tag_v<T>)
+    T& replace(entity e, T&& value)
+    {
+        return replace<T, T>(e, std::forward<T>(value));
+    }
+
     template <component T, class... Args>
     decltype(auto) put(entity e, Args&&... args)
     {
@@ -5632,9 +5861,13 @@ public:
         }
     }
 
-    // Removes T if present; returns whether anything was removed. A stale
-    // handle is a checked violation (removes nothing). Swap-remove:
-    // invalidates pointers into packed pools. O(1).
+    template <component T>
+        requires(!detail::is_tag_v<T>)
+    decltype(auto) put(entity e, T&& value)
+    {
+        return put<T, T>(e, std::forward<T>(value));
+    }
+
     template <component T>
     bool remove(entity e)
     {
@@ -5655,10 +5888,9 @@ public:
         }
         if constexpr (checks_enabled)
         {
-            if (pool->bond_locked())
+            if (pool->locked())
             {
-                detail::violate_pool("remove during iteration over pool (or its bonded partner)",
-                                     pool->name());
+                detail::violate_pool("remove during iteration over pool", pool->name());
                 return false;
             }
         }
@@ -5666,7 +5898,6 @@ public:
         return true;
     }
 
-    // True when e is alive and has T. Safe on any handle. O(1).
     template <component T>
     [[nodiscard]] bool has(entity e) const noexcept
     {
@@ -5677,8 +5908,6 @@ public:
         return probe<T>(e.index());
     }
 
-    // True when e is alive and has EVERY listed component. Tags are legal.
-    // Safe on any handle. O(types).
     template <component T, component U, component... Rest>
     [[nodiscard]] bool has_all(entity e) const noexcept
     {
@@ -5691,8 +5920,6 @@ public:
         return probe<T>(e.index()) && probe<U>(e.index()) && (probe<Rest>(e.index()) && ...);
     }
 
-    // True when e is alive and has AT LEAST ONE listed component. Same
-    // contract as has_all; short-circuits. O(types).
     template <component T, component U, component... Rest>
     [[nodiscard]] bool has_any(entity e) const noexcept
     {
@@ -5705,14 +5932,12 @@ public:
         return probe<T>(e.index()) || probe<U>(e.index()) || (probe<Rest>(e.index()) || ...);
     }
 
-    // Checked reference access; the safe form is find<T>. O(1). One deduced-
-    // this body serves both constnesses: const worlds yield const T&.
     template <component T, class Self>
     [[nodiscard]] auto& get(this Self&& self, entity e)
     {
         static_assert(!detail::is_tag_v<T>,
                       "ecs: T uses tag storage and carries no data; use has<T>(e)");
-        auto* p = self.template lookup<T>(e);  // T* or const T* per Self
+        auto* p = self.template lookup<T>(e);
         if constexpr (checks_enabled)
         {
             if (p == nullptr)
@@ -5721,14 +5946,12 @@ public:
                     "get of a missing component (dead entity or never added); "
                     "pool",
                     name_of<T>());
-                std::abort();  // cannot produce a component reference
+                std::abort();
             }
         }
         return *p;
     }
 
-    // Multi-component point lookup (structured bindings); each component
-    // keeps single-get's checked contract. O(types).
     template <component T, component U, component... Rest, class Self>
     [[nodiscard]] auto get(this Self&& self, entity e)
     {
@@ -5738,7 +5961,6 @@ public:
             self.template get<T>(e), self.template get<U>(e), self.template get<Rest>(e)...};
     }
 
-    // Pointer access: nullptr when e is dead/stale or lacks T. O(1).
     template <component T, class Self>
     [[nodiscard]] auto* find(this Self&& self, entity e) noexcept
     {
@@ -5747,8 +5969,6 @@ public:
         return self.template lookup<T>(e);
     }
 
-    // Multi-component find: one liveness check, a pointer per type (all null
-    // for dead handles). O(types).
     template <component T, component U, component... Rest, class Self>
     [[nodiscard]] auto find_all(this Self&& self, entity e) noexcept
     {
@@ -5764,8 +5984,6 @@ public:
                    self.template find_in_pool<Rest>(e)...};
     }
 
-    // Get-or-add: returns the existing T, or adds one constructed from args.
-    // O(1) amortized; add's iteration rules apply only when it actually adds.
     template <component T, class... Args>
     decltype(auto) obtain(entity e, Args&&... args)
     {
@@ -5789,9 +6007,13 @@ public:
         }
     }
 
-    // Destroys every T in the world, O(count of T). The pool object survives
-    // (selections stay valid) but contents and capacity may be released;
-    // stable-storage pointer stability ends here.
+    template <component T>
+        requires(!detail::is_tag_v<T>)
+    decltype(auto) obtain(entity e, T&& value)
+    {
+        return obtain<T, T>(e, std::forward<T>(value));
+    }
+
     template <component T>
     void purge()
     {
@@ -5804,17 +6026,45 @@ public:
         }
         if constexpr (checks_enabled)
         {
-            if (pool->bond_locked())
+            if (pool->locked())
             {
-                detail::violate_pool("purge during iteration over pool (or its bonded partner)",
-                                     pool->name());
+                detail::violate_pool("purge during iteration over pool", pool->name());
                 return;
             }
         }
         pool->wipe();
-        if (pool->bond_ != nullptr)
+    }
+
+    template <component T, class EntityIt>
+        requires(std::input_iterator<EntityIt> && !detail::is_tag_v<T>)
+    void insert(EntityIt first, EntityIt last, const T& value)
+    {
+        if constexpr (std::random_access_iterator<EntityIt>)
         {
-            pool->bond_->paired = 0;  // the intersection emptied with the pool
+            const auto* pool = peek_pool<T>();
+            reserve<T>((pool != nullptr ? pool->size() : 0) +
+                       static_cast<std::size_t>(last - first));
+        }
+        for (; first != last; ++first)
+        {
+            add<T>(*first, value);
+        }
+    }
+
+    template <component T, class EntityIt, class ValueIt>
+        requires(std::input_iterator<EntityIt> && std::input_iterator<ValueIt> &&
+                 !detail::is_tag_v<T>)
+    void insert(EntityIt first, EntityIt last, ValueIt vfirst)
+    {
+        if constexpr (std::random_access_iterator<EntityIt>)
+        {
+            const auto* pool = peek_pool<T>();
+            reserve<T>((pool != nullptr ? pool->size() : 0) +
+                       static_cast<std::size_t>(last - first));
+        }
+        for (; first != last; ++first, static_cast<void>(++vfirst))
+        {
+            add<T>(*first, *vfirst);
         }
     }
 
@@ -5824,31 +6074,12 @@ public:
         ensure_pool<T>().reserve(n);
     }
 
-    // Reorders T's pool (the dense order selections, snapshots, and range()
-    // iterate in). cmp compares values (const T&, const T&) or entities; the
-    // value form wins when both bind. Optional algo(first, last, cmp) must
-    // permute like a comparison sort (default std::sort). Cold, O(n log n)
-    // plus one scratch allocation; refused while T's pool iterates. Packed
-    // T* die; stable pools keep component pointers.
     template <component T, class Compare, class Algorithm = detail::std_sort>
     void sort(Compare cmp, Algorithm&& algo = {})
     {
         auto* pool = peek_pool<T>();
         if (pool == nullptr || pool->size() < 2)
         {
-            return;
-        }
-        // Refused in EVERY build: reordering a bond owner breaks the mirrored
-        // partition. Use bonded(...).sort(...), or unbond first.
-        if (pool->bond() != nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate_pool(
-                    "sort on an owned (bonded) pool -- use bonded(...).sort(...) for "
-                    "in-partition order, or unbond first; pool",
-                    pool->name());
-            }
             return;
         }
         if constexpr (checks_enabled)
@@ -5880,291 +6111,12 @@ public:
         }
     }
 
-    // Reorders Follow's pool so entities shared with Lead appear in Lead's
-    // dense order (non-shared ones after, order unspecified) -- the opt-in
-    // locality optimization for select<Lead, Follow>. One-shot, no standing
-    // coupling; re-run after churn. Cold, O(size of Lead); refused while
-    // Follow's pool iterates. Packed Follow pointers die; stable survive.
-    template <component Follow, component Lead>
-    void sort_along()
-    {
-        static_assert(!std::same_as<Follow, Lead>,
-                      "ecs: sort_along needs two different component types");
-        auto* follow = peek_pool<Follow>();
-        const auto* lead = peek_pool<Lead>();
-        if (follow == nullptr || lead == nullptr || follow->size() < 2)
-        {
-            return;
-        }
-        // Every build: reordering a bonded Follow breaks the mirror. A bonded
-        // Lead is read-only here and stays legal.
-        if (follow->bond() != nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate_pool("sort_along on a bonded pool (unbond first); pool",
-                                     follow->name());
-            }
-            return;
-        }
-        if constexpr (checks_enabled)
-        {
-            if (follow->locked())
-            {
-                detail::violate_pool("sort_along during iteration over pool", follow->name());
-                return;
-            }
-        }
-        index_type front = 0;
-        const std::size_t n = lead->size();
-        for (std::size_t pos = 0; pos < n; ++pos)
-        {
-            const entity e = lead->entity_at(pos);
-            const auto at = follow->position_of(e.index());
-            if (at == detail::entity_limits<Traits>::npos)
-            {
-                continue;
-            }
-            // Unprocessed entities always sit at or beyond the front cursor.
-            if (at != front)
-            {
-                follow->swap_positions(front, at);
-            }
-            ++front;
-        }
-    }
-
-    // --------------------------------------------------------- bonded pools
-    //
-    // See the bonded_view block for the contract. bond() builds the partition
-    // over existing members (O(|first| * owners)); afterwards every add/
-    // remove maintains it with one O(1) mirrored swap per owner. Re-bonding
-    // the same owned set (any order) is idempotent and returns a view;
-    // overlapping or nested owned sets are refused.
-
-    template <class... Ts>  // const-qualify for read-only payload parts
-        requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    basic_bonded_view<Traits, except<>, Ts...> bond()
-    {
-        static_assert(detail::all_distinct<detail::bare<Ts>...>,
-                      "ecs: duplicate component type in bond<...>");
-        static_assert((!detail::is_maybe_v<detail::bare<Ts>> && ...),
-                      "ecs: maybe<> marks optional selection parts and cannot be bonded");
-        static_assert((!detail::is_any_of_v<detail::bare<Ts>> && ...),
-                      "ecs: bonds own pools, not alternatives -- any_of<> belongs in select");
-        // derived_from, not same_as: packed-derived custom pools swap the
-        // same way and need the same wall.
-        static_assert(((!std::derived_from<pool_of_t<detail::bare<Ts>>,
-                                           detail::packed_pool<detail::bare<Ts>, Traits>> ||
-                        std::is_swappable_v<detail::bare<Ts>>) &&
-                       ...),
-                      "ecs: bonded packed pools swap components to maintain the partition; "
-                      "make every packed side swappable or store it in stable storage");
-        static_assert(sizeof...(Ts) <= group_core::max_owners,
-                      "ecs: a bond spans at most group_core::max_owners (8) pools");
-        const std::array<pool_base*, sizeof...(Ts)> pools{&ensure_pool<detail::bare<Ts>>()...};
-        // Idempotent for the SAME standing owned set, in any order.
-        if (group_core* standing = pools[0]->bond_;
-            standing != nullptr && standing->owner_count == sizeof...(Ts))
-        {
-            bool same = true;
-            for (pool_base* pool : pools)
-            {
-                same = same && standing->owns(pool);
-            }
-            if (same)
-            {
-                return bonded<Ts...>();
-            }
-        }
-        for (pool_base* pool : pools)
-        {
-            if (pool->bond_ != nullptr)
-            {
-                if constexpr (checks_enabled)
-                {
-                    detail::violate_pool("bond on an already bonded pool", pool->name());
-                }
-                return {};
-            }
-        }
-        if constexpr (checks_enabled)
-        {
-            for (pool_base* pool : pools)
-            {
-                if (pool->locked())
-                {
-                    detail::violate_pool("bond during iteration over pool", pool->name());
-                    return {};
-                }
-            }
-        }
-        bonds_.push_back(std::make_unique<group_core>());
-        group_core* bond = bonds_.back().get();
-        bond->owner_count = sizeof...(Ts);
-        for (std::size_t i = 0; i < pools.size(); ++i)
-        {
-            bond->owners[i] = pools[i];
-        }
-        // One-time partition build: partition the FIRST owner probing all
-        // others, then mirror each remaining owner's prefix into its order.
-        pool_base& first = *pools[0];
-        index_type k = 0;
-        const auto n = static_cast<index_type>(first.size());
-        for (index_type pos = 0; pos < n; ++pos)
-        {
-            const index_type index = first.entity_at(pos).index();
-            bool in_all = true;
-            for (std::size_t i = 1; i < pools.size(); ++i)
-            {
-                in_all = in_all && pools[i]->contains(index);
-            }
-            if (in_all)
-            {
-                if (pos != k)
-                {
-                    first.mirror_swap(k, pos);
-                }
-                ++k;
-            }
-        }
-        for (std::size_t i = 1; i < pools.size(); ++i)
-        {
-            for (index_type j = 0; j < k; ++j)
-            {
-                const index_type there = pools[i]->position_of(first.entity_at(j).index());
-                if (there != j)
-                {
-                    pools[i]->mirror_swap(j, there);
-                }
-            }
-        }
-        bond->paired = k;
-        for (pool_base* pool : pools)
-        {
-            pool->bond_ = bond;  // armed last: the build itself must not re-enter
-        }
-        return bonded<Ts...>();
-    }
-
-    // Dissolves the bond; owners keep their current order. Stored views read
-    // as empty (the bond is tombstoned, not freed). Name the full owned set,
-    // in any order.
-    template <class... Ts>
-        requires(sizeof...(Ts) >= 2) && (component<detail::bare<Ts>> && ...)
-    bool unbond()
-    {
-        const std::array<pool_base*, sizeof...(Ts)> pools{peek_pool<detail::bare<Ts>>()...};
-        group_core* bond = standing_bond(pools);
-        if (bond == nullptr)
-        {
-            return false;
-        }
-        if constexpr (checks_enabled)
-        {
-            for (pool_base* pool : pools)
-            {
-                if (pool->locked())
-                {
-                    detail::violate_pool("unbond during iteration over pool", pool->name());
-                    return false;
-                }
-            }
-        }
-        bond->owners = {};  // tombstone
-        bond->owner_count = 0;
-        bond->paired = 0;
-        for (pool_base* pool : pools)
-        {
-            pool->bond_ = nullptr;
-        }
-        return true;
-    }
-
-    // The standing bond's view. Plain-listed types must be the FULL owned
-    // set, in any order; maybe<>-marked types are OBSERVED extras probed per
-    // row (T* parts, null when absent); except<> filters rows. Without a
-    // standing bond over exactly that set: checked violation, empty view.
-    template <class... Ts, class... Xs>
-        requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] basic_bonded_view<Traits, except<Xs...>, Ts...> bonded(except<Xs...>)
-    {
-        constexpr std::size_t n = sizeof...(Ts);
-        constexpr std::array<bool, n> observed{detail::is_maybe_v<Ts>...};
-        const std::array<pool_base*, n> pools{
-            peek_pool<detail::bare<detail::maybe_inner<Ts>>>()...};
-        const group_core* bond = nullptr;
-        bool listed_exactly = true;
-        std::size_t owned_listed = 0;
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            if (observed[i])
-            {
-                continue;  // observed pools may be missing: null = absent parts
-            }
-            ++owned_listed;
-            if (pools[i] == nullptr || pools[i]->bond_ == nullptr ||
-                (bond != nullptr && pools[i]->bond_ != bond))
-            {
-                listed_exactly = false;
-                break;
-            }
-            bond = pools[i]->bond_;
-        }
-        listed_exactly = listed_exactly && bond != nullptr && bond->owner_count == owned_listed;
-        if (!listed_exactly)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate(
-                    "bonded view must plain-list the standing owned set in full (any order); "
-                    "mark observed extras maybe<>, or use select for subset queries");
-            }
-            return {};
-        }
-        const std::array<pool_base*, sizeof...(Xs)> excludes{peek_pool<Xs>()...};
-        return basic_bonded_view<Traits, except<Xs...>, Ts...>(pools, excludes, bond);
-    }
-
-    template <class... Ts>
-        requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] basic_bonded_view<Traits, except<>, Ts...> bonded()
-    {
-        return bonded<Ts...>(except<>{});
-    }
-
-    // Const worlds yield all-const views (observed parts become
-    // maybe<const T>, hence const T* row parts).
-    template <class... Ts, class... Xs>
-        requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] auto bonded(except<Xs...> tag) const
-    {
-        // The view only reads through these pointers (const payload parts).
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-        auto* self = const_cast<world*>(this);
-        return self->template bonded<typename detail::as_const_part<Ts>::type...>(tag);
-    }
-
-    template <class... Ts>
-        requires(sizeof...(Ts) >= 2)
-    [[nodiscard]] auto bonded() const
-    {
-        return bonded<Ts...>(except<>{});
-    }
-
-    // ----------------------------------------------------------------- hooks
-    //
-    // See the hook_token block near the top of the header for the contract.
-    // Connecting/disconnecting is structural: refused while T's pool iterates.
-
     template <component T>
     hook_token on_add(component_hook fn, void* user = nullptr)
     {
         return connect_hook<T>(pool_base::hook_kind::add, fn, user);
     }
 
-    // Compile-time candidate: free function or capture-less callable, taking
-    // (world&, entity) or (entity).
     template <component T, auto Candidate>
     hook_token on_add()
     {
@@ -6172,20 +6124,14 @@ public:
             pool_base::hook_kind::add, detail::free_hook_thunk<Traits, Candidate>(), nullptr);
     }
 
-    // Member function (or instance-first callable) bound to an instance that
-    // must outlive the hook; const instances need const-invocable candidates.
     template <component T, auto Candidate, class Inst>
     hook_token on_add(Inst* instance)
     {
-        return connect_hook<T>(
-            pool_base::hook_kind::add,
-            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
-            const_cast<void*>(static_cast<const void*>(instance)));
+        return connect_hook<T>(pool_base::hook_kind::add,
+                               detail::bound_hook_thunk<Traits, Candidate, Inst>(),
+                               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                               const_cast<void*>(static_cast<const void*>(instance)));
     }
-
-    // Fires before the component is destroyed (remove, kill, purge, reset,
-    // command-buffer replay -- but not world destruction).
     template <component T>
     hook_token on_remove(component_hook fn, void* user = nullptr)
     {
@@ -6202,15 +6148,11 @@ public:
     template <component T, auto Candidate, class Inst>
     hook_token on_remove(Inst* instance)
     {
-        return connect_hook<T>(
-            pool_base::hook_kind::remove,
-            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
-            const_cast<void*>(static_cast<const void*>(instance)));
+        return connect_hook<T>(pool_base::hook_kind::remove,
+                               detail::bound_hook_thunk<Traits, Candidate, Inst>(),
+                               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                               const_cast<void*>(static_cast<const void*>(instance)));
     }
-
-    // Fires after replace<T> or the replacing half of put<T>. Writes through
-    // get()/find()/iteration references are invisible to hooks by design.
     template <component T>
     hook_token on_replace(component_hook fn, void* user = nullptr)
     {
@@ -6233,15 +6175,12 @@ public:
     {
         static_assert(!detail::is_tag_v<T>,
                       "ecs: tags carry no data and are never replaced; use on_add/on_remove");
-        return connect_hook<T>(
-            pool_base::hook_kind::replace,
-            detail::bound_hook_thunk<Traits, Candidate, Inst>(),
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast) -- restored at dispatch
-            const_cast<void*>(static_cast<const void*>(instance)));
+        return connect_hook<T>(pool_base::hook_kind::replace,
+                               detail::bound_hook_thunk<Traits, Candidate, Inst>(),
+                               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+                               const_cast<void*>(static_cast<const void*>(instance)));
     }
 
-    // Returns whether the token was found. Stale or empty tokens are a no-op.
-    // Structural like connect: refused while the pool iterates or dispatches.
     bool unhook(hook_token token) noexcept
     {
         if (!token || token.pool >= pools_.size() || !pools_[token.pool])
@@ -6260,85 +6199,72 @@ public:
         return pools_[token.pool]->disconnect_hook(token.id);
     }
 
-    // --------------------------------------------------------------- queries
-
-    // Builds a selection; mark types const for read-only access. Non-const
-    // worlds create missing pools; const worlds yield all-const selections,
-    // where a missing pool reads as empty. One deduced-this body serves both.
     template <class... Ts, class Self>
-    [[nodiscard]] auto select(this Self&& self)
+    [[nodiscard]] auto view(this Self&& self)
     {
-        return self.template select<Ts...>(except<>{});
+        return self.template view<Ts...>(detail::true_filter{});
     }
 
-    template <class... Ts, class... Xs, class Self>
-    [[nodiscard]] auto select(this Self&& self, except<Xs...>)
+    template <class... Ts, class Filter, class Self>
+        requires detail::filter_expr<Filter>
+    [[nodiscard]] auto view(this Self&& self, Filter)
     {
         if constexpr (std::is_const_v<std::remove_reference_t<Self>>)
         {
-            // Dependent template argument: not a typename-optional context.
             // NOLINTNEXTLINE(readability-redundant-typename)
-            using result =
-                basic_selection<Traits, except<Xs...>, typename detail::as_const_part<Ts>::type...>;
-            // Missing include pools propagate as null -> an empty selection.
-            return result{self.template flat_include_pools<Ts...>(),
-                          {self.template pool_base_of<Xs>()...}};
+            using result = basic_view<Traits, Filter, typename detail::as_const_part<Ts>::type...>;
+            return result{self.template include_pools<Ts...>(),
+                          self.template filter_pools<Filter>()};
         }
         else
         {
-            using result = basic_selection<Traits, except<Xs...>, Ts...>;
-            // maybe<T> contributes its inner pool, any_of<As...> one per
-            // alternative; registering keeps the pointer array complete.
-            return result{self.template flat_include_pools<Ts...>(),
-                          {&self.template ensure_pool<Xs>()...}};
+            using result = basic_view<Traits, Filter, Ts...>;
+            return result{self.template include_pools<Ts...>(),
+                          self.template filter_pools<Filter>()};
         }
     }
 
-    // Manifest forms: the same queries from a types<> list, so a component
-    // set named once drives selections, archives, and tools alike.
-    template <class... Ts, class... Xs, class Self>
-    [[nodiscard]] auto select(this Self&& self, types<Ts...>, except<Xs...> x)
+    template <class... Ts, class Filter, class Self>
+        requires detail::filter_expr<Filter>
+    [[nodiscard]] auto view(this Self&& self, types<Ts...>, Filter f)
     {
-        return self.template select<Ts...>(x);
+        return self.template view<Ts...>(f);
     }
 
     template <class... Ts, class Self>
-    [[nodiscard]] auto select(this Self&& self, types<Ts...>)
+    [[nodiscard]] auto view(this Self&& self, types<Ts...>)
     {
-        return self.template select<Ts...>(except<>{});
+        return self.template view<Ts...>(detail::true_filter{});
     }
 
-    // One-shot iteration sugar: world.each<A, B>(fn).
     template <class... Ts, class F, class Self>
+        requires(sizeof...(Ts) >= 1 && !detail::filter_expr<F>)
     void each(this Self&& self, F&& fn)
     {
-        self.template select<Ts...>().each(std::forward<F>(fn));
+        self.template view<Ts...>().each(std::forward<F>(fn));
     }
 
-    template <class... Ts, class... Xs, class F, class Self>
-    void each(this Self&& self, except<Xs...> x, F&& fn)
+    template <class... Ts, class F, class Filter, class Self>
+        requires(sizeof...(Ts) >= 1 && detail::filter_expr<Filter>)
+    void each(this Self&& self, F&& fn, Filter f)
     {
-        self.template select<Ts...>(x).each(std::forward<F>(fn));
+        self.template view<Ts...>(f).each(std::forward<F>(fn));
     }
 
     template <class... Ts, class F, class Self>
+        requires(!detail::filter_expr<F>)
     void each(this Self&& self, types<Ts...> list, F&& fn)
     {
-        self.select(list).each(std::forward<F>(fn));
+        self.view(list).each(std::forward<F>(fn));
     }
 
-    template <class... Ts, class... Xs, class F, class Self>
-    void each(this Self&& self, types<Ts...> list, except<Xs...> x, F&& fn)
+    template <class... Ts, class F, class Filter, class Self>
+        requires detail::filter_expr<Filter>
+    void each(this Self&& self, types<Ts...> list, F&& fn, Filter f)
     {
-        self.select(list, x).each(std::forward<F>(fn));
+        self.view(list, f).each(std::forward<F>(fn));
     }
 
-    // -------------------------------------------------------- command buffer
-
-    // Replays a buffer: every op runs in recording order, gated on its target
-    // being alive (dead targets are skipped and counted); the buffer is
-    // cleared for reuse. O(recorded ops). Checked builds refuse to apply
-    // while any iteration is running.
     apply_result apply(command_buffer& buffer)
     {
         if (!apply_allowed())
@@ -6350,9 +6276,6 @@ public:
         return result;
     }
 
-    // Like apply(buffer), additionally reporting what each deferred spawn
-    // became: on_spawn(provisional, real) once per cmd.spawn(), in recording
-    // order, before the buffer is cleared.
     template <class F>
     apply_result apply(command_buffer& buffer, F&& on_spawn)
     {
@@ -6365,8 +6288,6 @@ public:
         }
         const apply_result result = apply_replay(buffer);
         std::size_t ticket = 0;
-        // Index loop for the same reason as apply_replay; ops recorded from
-        // inside on_spawn never apply (the clear below is terminal).
         for (std::size_t i = 0; i < buffer.ops_.size(); ++i)
         {
             const command_buffer::op o = buffer.ops_[i];
@@ -6379,14 +6300,6 @@ public:
         return result;
     }
 
-    // ---------------------------------------------------------- relationships
-    //
-    // Optional, minimal parent/child links: no transform propagation, no
-    // scene graph. Destroying an entity unlinks it; children become
-    // parentless roots (use a command_buffer for recursive destruction).
-
-    // Makes child a child of parent (re-parenting if it already had one).
-    // O(1) (checked builds add an O(depth) ancestor walk to refuse cycles).
     void adopt(entity parent, entity child)
     {
         if (!table_.alive(parent) || !table_.alive(child) || parent == child || clearing_ ||
@@ -6432,20 +6345,22 @@ public:
         kin* parent_k = pool.at(parent.index());
         if (parent_k == nullptr)
         {
-            // Stable storage: emplacing the parent's record cannot move child_k.
             parent_k = &pool.emplace(parent);
         }
         child_k->parent = parent;
-        child_k->prev_sibling = no_entity;
-        child_k->next_sibling = parent_k->first_child;
-        if (parent_k->first_child != no_entity)
+        child_k->next_sibling = no_entity;
+        child_k->prev_sibling = parent_k->last_child;
+        if (parent_k->last_child != no_entity)
         {
-            pool.at(parent_k->first_child.index())->prev_sibling = child;
+            pool.at(parent_k->last_child.index())->next_sibling = child;
         }
-        parent_k->first_child = child;
+        else
+        {
+            parent_k->first_child = child;
+        }
+        parent_k->last_child = child;
     }
 
-    // Detaches child from its parent (no-op when it has none). O(1).
     void orphan(entity child)
     {
         if (!table_.alive(child))
@@ -6480,6 +6395,79 @@ public:
         k->next_sibling = no_entity;
     }
 
+    void reorder_child(entity child, entity before = no_entity)
+    {
+        if (!table_.alive(child))
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate("reorder_child on a dead, stale, or null entity handle");
+            }
+            return;
+        }
+        auto* pool = peek_pool<kin>();
+        kin* child_k = (pool != nullptr) ? pool->at(child.index()) : nullptr;
+        if (child_k == nullptr || child_k->parent == no_entity)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate("reorder_child on a child that has no parent");
+            }
+            return;
+        }
+        if constexpr (checks_enabled)
+        {
+            if (pool->locked())
+            {
+                detail::violate("reorder_child while children_of is iterating");
+                return;
+            }
+        }
+        if (before != no_entity)
+        {
+            const kin* before_k = pool->at(before.index());
+            if (before == child || before_k == nullptr || before_k->parent != child_k->parent)
+            {
+                if constexpr (checks_enabled)
+                {
+                    detail::violate("reorder_child: `before` is not a sibling of child");
+                }
+                return;
+            }
+        }
+        detail::kin_links::unlink(*pool, *child_k);
+        kin* parent_k = pool->at(child_k->parent.index());
+        if (before == no_entity)
+        {
+            child_k->next_sibling = no_entity;
+            child_k->prev_sibling = parent_k->last_child;
+            if (parent_k->last_child != no_entity)
+            {
+                pool->at(parent_k->last_child.index())->next_sibling = child;
+            }
+            else
+            {
+                parent_k->first_child = child;
+            }
+            parent_k->last_child = child;
+        }
+        else
+        {
+            kin* before_k = pool->at(before.index());
+            child_k->next_sibling = before;
+            child_k->prev_sibling = before_k->prev_sibling;
+            if (before_k->prev_sibling != no_entity)
+            {
+                pool->at(before_k->prev_sibling.index())->next_sibling = child;
+            }
+            else
+            {
+                parent_k->first_child = child;
+            }
+            before_k->prev_sibling = child;
+        }
+    }
+
     [[nodiscard]] entity parent_of(entity child) const noexcept
     {
         const auto* pool = peek_pool<kin>();
@@ -6491,10 +6479,8 @@ public:
         return k == nullptr ? no_entity : k->parent;
     }
 
-    // Visits direct children (newest first), O(children); fn may return bool
-    // to stop early. Link edits (adopt/orphan/kill of a linked entity) are
-    // blocked while this runs.
     template <class F>
+        requires std::invocable<F&, entity>
     void children_of(entity parent, F&& fn) const
     {
         const auto* pool = peek_pool<kin>();
@@ -6507,7 +6493,7 @@ public:
         {
             return;
         }
-        const single_pool_lock lock(pool);  // unwinds on early exit and exceptions
+        const single_pool_lock lock(pool);
         for (entity child = k->first_child; child != no_entity;)
         {
             const entity next = pool->at(child.index())->next_sibling;
@@ -6526,7 +6512,6 @@ public:
         }
     }
 
-    // O(children); symmetry with the selection count vocabulary.
     [[nodiscard]] std::size_t child_count(entity parent) const noexcept
     {
         std::size_t n = 0;
@@ -6534,17 +6519,223 @@ public:
         return n;
     }
 
-    // -------------------------------------------------------------- snapshot
-    //
-    // ecs does not serialize; it gives deterministic primitives for save/
-    // load, rollback, or replay: live_entities() walks slot order,
-    // selections iterate dense order (stable between structural edits), and
-    // restore_entity() re-creates exact handles in a fresh world.
-
-    // Visits every live entity in increasing slot order, O(slots); fn may
-    // return bool to stop early.
     template <class F>
-    void live_entities(F&& fn) const
+        requires std::invocable<F&, entity>
+    void descendants_of(entity root, F&& fn) const
+    {
+        const auto* pool = peek_pool<kin>();
+        if (pool == nullptr || !table_.alive(root))
+        {
+            return;
+        }
+        const kin* rk = pool->at(root.index());
+        if (rk == nullptr)
+        {
+            return;
+        }
+        const single_pool_lock lock(pool);
+        std::pmr::vector<entity> stack(memory_);
+        for (entity c = rk->last_child; c != no_entity; c = pool->at(c.index())->prev_sibling)
+        {
+            stack.push_back(c);
+        }
+        while (!stack.empty())
+        {
+            const entity e = stack.back();
+            stack.pop_back();
+            if constexpr (std::predicate<F&, entity>)
+            {
+                if (!fn(e))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                fn(e);
+            }
+            const kin* k = pool->at(e.index());
+            for (entity c = k->last_child; c != no_entity; c = pool->at(c.index())->prev_sibling)
+            {
+                stack.push_back(c);
+            }
+        }
+    }
+
+    template <class F>
+        requires std::invocable<F&, entity>
+    void ancestors_of(entity e, F&& fn) const
+    {
+        const auto* pool = peek_pool<kin>();
+        if (pool == nullptr || !table_.alive(e))
+        {
+            return;
+        }
+        const kin* k = pool->at(e.index());
+        if (k == nullptr)
+        {
+            return;
+        }
+        const single_pool_lock lock(pool);
+        for (entity up = k->parent; up != no_entity;)
+        {
+            const kin* uk = pool->at(up.index());
+            const entity next = (uk != nullptr) ? uk->parent : no_entity;
+            if constexpr (std::predicate<F&, entity>)
+            {
+                if (!fn(up))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                fn(up);
+            }
+            up = next;
+        }
+    }
+
+    [[nodiscard]] entity root_of(entity e) const noexcept
+    {
+        const auto* pool = peek_pool<kin>();
+        if (!table_.alive(e))
+        {
+            return no_entity;
+        }
+        if (pool == nullptr)
+        {
+            return e;
+        }
+        entity cur = e;
+        for (const kin* k = pool->at(cur.index()); k != nullptr && k->parent != no_entity;
+             k = pool->at(cur.index()))
+        {
+            cur = k->parent;
+        }
+        return cur;
+    }
+
+    [[nodiscard]] std::size_t depth_of(entity e) const noexcept
+    {
+        const auto* pool = peek_pool<kin>();
+        if (pool == nullptr || !table_.alive(e))
+        {
+            return 0;
+        }
+        std::size_t d = 0;
+        for (const kin* k = pool->at(e.index()); k != nullptr && k->parent != no_entity;
+             k = pool->at(k->parent.index()))
+        {
+            ++d;
+        }
+        return d;
+    }
+
+    template <class F>
+        requires std::invocable<F&, entity>
+    void roots(F&& fn) const
+    {
+        const auto* pool = peek_pool<kin>();
+        if (pool == nullptr)
+        {
+            return;
+        }
+        const single_pool_lock lock(pool);
+        for (std::size_t pos = 0; pos < pool->size(); ++pos)
+        {
+            const entity e = pool->entity_at(pos);
+            if (pool->at(e.index())->parent != no_entity)
+            {
+                continue;
+            }
+            if constexpr (std::predicate<F&, entity>)
+            {
+                if (!fn(e))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                fn(e);
+            }
+        }
+    }
+
+    std::size_t destroy_subtree(entity root)
+    {
+        if (!table_.alive(root))
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate("destroy_subtree on a dead, stale, or null entity handle");
+            }
+            return 0;
+        }
+        std::pmr::vector<entity> doomed(memory_);
+        doomed.push_back(root);
+        descendants_of(root, [&](entity e) { doomed.push_back(e); });
+        std::size_t n = 0;
+        for (const entity e : doomed)
+        {
+            if (table_.alive(e))
+            {
+                destroy(e);
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    entity duplicate_subtree(entity root)
+    {
+        if (!table_.alive(root))
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate("duplicate_subtree on a dead, stale, or null entity handle");
+            }
+            return no_entity;
+        }
+        std::pmr::vector<entity> originals(memory_);
+        originals.push_back(root);
+        descendants_of(root, [&](entity e) { originals.push_back(e); });
+        std::pmr::vector<std::pair<entity, entity>> map(memory_);
+        map.reserve(originals.size());
+        for (const entity o : originals)
+        {
+            map.emplace_back(o, duplicate(o).clone);
+        }
+        const auto clone_of = [&](entity o) -> entity
+        {
+            for (const auto& [orig, cl] : map)
+            {
+                if (orig == o)
+                {
+                    return cl;
+                }
+            }
+            return no_entity;
+        };
+        for (const entity o : originals)
+        {
+            if (o == root)
+            {
+                continue;
+            }
+            const entity cp = clone_of(parent_of(o));
+            if (cp != no_entity)
+            {
+                adopt(cp, clone_of(o));
+            }
+        }
+        return map.front().second;
+    }
+
+    template <class F>
+        requires std::invocable<F&, entity>
+    void each(F&& fn) const
     {
         for (index_type slot = 0; slot < table_.slots(); ++slot)
         {
@@ -6567,19 +6758,8 @@ public:
         }
     }
 
-    // Re-creates an entity with an exact index and generation. Errors (not
-    // asserts: load data is untrusted) on malformed handles or occupied
-    // slots. O(1) amortized plus table growth up to the index -- bound
-    // indices before feeding hostile data in. Restoring a lower generation
-    // is the rollback semantic: discard handles issued after the snapshot.
     std::expected<entity, fault> restore_entity(entity e) { return table_.restore(e); }
 
-    // ------------------------------------------------------------- world ops
-
-    // Destroys all components and entities, O(everything). Generations are
-    // bumped, so pre-reset handles read as dead rather than aliasing. Pools,
-    // selections, hooks, and tokens survive; on_remove fires per live
-    // component, and hook ADDS during the reset are refused.
     void reset()
     {
         if constexpr (checks_enabled)
@@ -6590,17 +6770,9 @@ public:
                 return;
             }
         }
-        // Partitions zero BEFORE the wipes: an on_remove hook reading a
-        // bonded view mid-reset must see it empty, not a stale partition.
-        // Bonds survive reset, like hooks; repopulation re-pairs.
-        for (const auto& bond : bonds_)
-        {
-            bond->paired = 0;
-        }
-        // Index loop (hooks may register new pools); clearing_ refuses hook
-        // adds that would otherwise outlive the entities reset is destroying.
+
         clearing_ = true;
-        // NOLINTNEXTLINE(modernize-loop-convert) -- tolerates active_ growth from hooks
+        // NOLINTNEXTLINE(modernize-loop-convert)
         for (std::size_t i = 0; i < active_.size(); ++i)
         {
             active_[i]->wipe();
@@ -6609,8 +6781,6 @@ public:
         table_.destroy_all();
     }
 
-    // Returns slack memory, O(everything). Stable-storage pointers survive;
-    // packed pools may reallocate, invalidating outstanding pointers.
     void shrink()
     {
         if constexpr (checks_enabled)
@@ -6628,15 +6798,11 @@ public:
         table_.shrink();
     }
 
-    // Total slots ever allocated (live + recycled); live_count() counts
-    // existing entities.
     [[nodiscard]] std::size_t slot_count() const noexcept { return table_.slots(); }
     [[nodiscard]] std::size_t live_count() const noexcept { return table_.live(); }
     [[nodiscard]] std::size_t capacity() const noexcept { return table_.capacity(); }
-
-    // Visits a pool_info per registered pool, O(pools) -- enough for an
-    // editor overlay or stats HUD, no RTTI needed.
     template <class F>
+        requires std::invocable<F&, const pool_info&>
     void each_pool(F&& fn) const
     {
         for (const pool_base* pool : active_)
@@ -6645,9 +6811,8 @@ public:
         }
     }
 
-    // The other inspector axis: visits a pool_info per pool containing e,
-    // O(pools this world uses).
     template <class F>
+        requires std::invocable<F&, const pool_info&>
     void components_of(entity e, F&& fn) const
     {
         if (!table_.alive(e))
@@ -6663,8 +6828,9 @@ public:
         }
     }
 
-    // Aggregated memory accounting, O(pools); counts capacity (allocated),
-    // not size (used).
+    template <class F>
+    void visit_components(entity e, F&& visitor) const;
+
     [[nodiscard]] memory_footprint footprint() const noexcept
     {
         memory_footprint f{};
@@ -6679,23 +6845,17 @@ public:
         return f;
     }
 
-    // --- runtime pool addressing (feeds runtime_selection and tooling) ---
-
-    // By compile-time type: the typed bridge into the runtime layer.
     template <component T>
     [[nodiscard]] pool_ref find_pool() const noexcept
     {
         return pool_ref{peek_pool<T>()};
     }
 
-    // By dense type id (as seen in pool_info::id). O(1).
     [[nodiscard]] pool_ref find_pool(std::uint32_t type_id) const noexcept
     {
         return pool_ref{type_id < pools_.size() ? pools_[type_id].get() : nullptr};
     }
 
-    // By stable name hash (hash_of<T>(), pool_info::name_hash) -- the form
-    // save files and tools should persist. O(pools this world uses).
     [[nodiscard]] pool_ref find_pool_by_hash(std::uint64_t name_hash) const noexcept
     {
         for (const pool_base* pool : active_)
@@ -6708,8 +6868,6 @@ public:
         return {};
     }
 
-    // Full consistency audit: table bookkeeping, sparse/dense mappings, slot
-    // accounting, link integrity. O(everything); for tests and tools.
     [[nodiscard]] std::expected<void, fault> validate() const
     {
         if (auto r = table_.check(); !r)
@@ -6723,10 +6881,6 @@ public:
                 return r;
             }
         }
-        if (auto r = check_bonds(); !r)
-        {
-            return r;
-        }
         if (const auto* marks = peek_pool<globals_mark>(); marks != nullptr && marks->size() > 1)
         {
             return std::unexpected(
@@ -6738,10 +6892,7 @@ public:
 private:
     friend struct test_access;
     template <class>
-    friend class basic_scoped_hook;  // resolves its pool anchor through the token
-
-    // The pool a hook token belongs to; null for empty/stale tokens. Pools
-    // are heap-stable for the world's life: the pointer survives world moves.
+    friend class basic_scoped_hook;
     [[nodiscard]] pool_base* pool_for_token(hook_token token) noexcept
     {
         if (!token || token.pool >= pools_.size() || !pools_[token.pool])
@@ -6751,8 +6902,6 @@ private:
         return pools_[token.pool].get();
     }
 
-    // Membership-based, not cache-based: an unpack-restored globals entity is
-    // protected before the first globals() call repopulates the cache.
     [[nodiscard]] bool is_globals(entity e) const noexcept
     {
         if (e == globals_)
@@ -6783,8 +6932,6 @@ private:
             pool->owner_ = this;
             if constexpr (checks_enabled)
             {
-                // Cold, once per type: a name-hash collision would corrupt any
-                // snapshot keyed on hash_of, so make it loud immediately.
                 for (const pool_base* existing : active_)
                 {
                     if (existing->name_hash() == pool->name_hash())
@@ -6800,7 +6947,6 @@ private:
         return static_cast<pool_of_t<T>&>(*pools_[id]);
     }
 
-    // Never registers; null when the world has not seen T.
     template <component T>
     [[nodiscard]] pool_of_t<T>* peek_pool() const noexcept
     {
@@ -6818,8 +6964,6 @@ private:
         return peek_pool<T>();
     }
 
-    // The post-liveness-check half of has, for has_all/has_any's single
-    // liveness gate. An unregistered pool counts as absent.
     template <component T>
     [[nodiscard]] bool probe(index_type index) const noexcept
     {
@@ -6827,81 +6971,37 @@ private:
         return pool != nullptr && pool->contains(index);
     }
 
-    // Builds a selection's flattened include array: one pool per element,
-    // except any_of elements which contribute one pool per alternative.
-    // Non-const worlds register pools; const worlds leave missing ones null.
     template <class... Es, class Self>
-    [[nodiscard]] auto flat_include_pools(this Self&& self)
+    [[nodiscard]] auto include_pools(this Self&& self)
     {
-        constexpr std::size_t n =
-            (std::size_t{0} + ... +
-             detail::any_of_traits<detail::bare<detail::maybe_inner<Es>>>::width);
-        std::array<pool_base*, n> out{};
-        std::size_t at = 0;
-        (self.template fill_flat<Es>(out, at), ...);
-        return out;
-    }
-
-    template <class E, std::size_t N, class Self>
-    void fill_flat(this Self&& self, std::array<pool_base*, N>& out, std::size_t& at)
-    {
-        using core = detail::bare<detail::maybe_inner<E>>;
-        constexpr bool from_const = std::is_const_v<std::remove_reference_t<Self>>;
-        if constexpr (detail::is_any_of_v<core>)
+        if constexpr (std::is_const_v<std::remove_reference_t<Self>>)
         {
-            [&]<class... As>(types<As...>)
-            {
-                if constexpr (from_const)
-                {
-                    ((out[at++] = self.template pool_base_of<detail::bare<As>>()), ...);
-                }
-                else
-                {
-                    ((out[at++] = &self.template ensure_pool<detail::bare<As>>()), ...);
-                }
-            }(typename detail::any_of_traits<core>::alts{});
+            return std::array<pool_base*, sizeof...(Es)>{
+                self.template pool_base_of<detail::bare<detail::maybe_inner<Es>>>()...};
         }
         else
         {
-            if constexpr (from_const)
+            return std::array<pool_base*, sizeof...(Es)>{
+                &self.template ensure_pool<detail::bare<detail::maybe_inner<Es>>>()...};
+        }
+    }
+
+    template <class Filter, class Self>
+    [[nodiscard]] auto filter_pools(this Self&& self)
+    {
+        return [&self]<class... Ls>(types<Ls...>)
+        {
+            if constexpr (std::is_const_v<std::remove_reference_t<Self>>)
             {
-                out[at++] = self.template pool_base_of<core>();
+                return std::array<pool_base*, sizeof...(Ls)>{self.template pool_base_of<Ls>()...};
             }
             else
             {
-                out[at++] = &self.template ensure_pool<core>();
+                return std::array<pool_base*, sizeof...(Ls)>{&self.template ensure_pool<Ls>()...};
             }
-        }
+        }(detail::filter_leaves_t<Filter>{});
     }
 
-    // The group whose owned set is EXACTLY the given pools (any order); null
-    // when any pool is missing, unbonded, or the sets differ.
-    template <std::size_t N>
-    [[nodiscard]] static group_core* standing_bond(const std::array<pool_base*, N>& pools) noexcept
-    {
-        for (pool_base* pool : pools)
-        {
-            if (pool == nullptr)
-            {
-                return nullptr;
-            }
-        }
-        group_core* bond = pools[0]->bond_;
-        if (bond == nullptr || bond->owner_count != N)
-        {
-            return nullptr;
-        }
-        for (pool_base* pool : pools)
-        {
-            if (!bond->owns(pool))
-            {
-                return nullptr;
-            }
-        }
-        return bond;
-    }
-
-    // Constness flows from the world: const Self yields const T*.
     template <component T, class Self>
     [[nodiscard]] auto* lookup(this Self&& self, entity e) noexcept
     {
@@ -6915,7 +7015,6 @@ private:
         return pool == nullptr ? pointer{nullptr} : pointer{pool->at(e.index())};
     }
 
-    // The post-liveness-check half of lookup, for find_all's single check.
     template <component T, class Self>
     [[nodiscard]] auto* find_in_pool(this Self&& self, entity e) noexcept
     {
@@ -6953,7 +7052,6 @@ private:
         return false;
     }
 
-    // Hooks receive the owning world; moves must re-aim the back-pointers.
     void repoint_pools() noexcept
     {
         for (pool_base* pool : active_)
@@ -6982,8 +7080,6 @@ private:
         return hook_token{detail::type_id<T>(), pool.connect_hook(kind, fn, user)};
     }
 
-    // The shared pre-check for both apply overloads: refused (with the buffer
-    // left intact for a retry) while any iteration is running.
     [[nodiscard]] bool apply_allowed() const
     {
         if constexpr (checks_enabled)
@@ -7000,136 +7096,88 @@ private:
         return true;
     }
 
-    // Replays the buffer without clearing it: ops run in recording order,
-    // gated on a generation-checked alive(target); provisional spawns resolve
-    // on encounter (recording order makes lazy resolution exact). Callers
-    // clear() afterwards.
     apply_result apply_replay(command_buffer& buffer)
     {
         buffer.resolved_.clear();
         apply_result result{};
-        // Index loop, ops copied by value: a hook may legally record MORE ops
-        // into this buffer (the escape hatch for structural work from hooks);
-        // they replay in this same pass. Payload pointers stay valid (the
-        // arena never relocates).
         for (std::size_t i = 0; i < buffer.ops_.size(); ++i)
         {
             const command_buffer::op o = buffer.ops_[i];
-            entity target = o.target;
             if (o.kind == command_buffer::op_kind::spawn)
             {
                 buffer.resolved_.push_back(table_.create());
                 ++result.applied;
                 continue;
             }
-            if (detail::is_provisional(target))
+            bool ok = true;
+            const auto resolve = [&](entity h) -> entity
             {
-                // The handle's nonce must match this buffer: handles from
-                // another buffer or from before clear() are refused, not
-                // silently mis-resolved.
-                const auto ticket =
-                    static_cast<index_type>(target.index() & ~limits::provisional_bit);
-                if (target.generation() != buffer.nonce_ || ticket >= buffer.resolved_.size())
+                if (!detail::is_provisional(h))
                 {
-                    if constexpr (checks_enabled)
-                    {
-                        detail::violate(
-                            "command_buffer: provisional handle from another buffer "
-                            "or from before clear()");
-                    }
-                    ++result.skipped;
-                    continue;
+                    return h;
                 }
-                target = buffer.resolved_[ticket];
+                const auto ticket = static_cast<index_type>(h.index() & ~limits::provisional_bit);
+                if (h.generation() != buffer.nonce_ || ticket >= buffer.resolved_.size())
+                {
+                    ok = false;
+                    return no_entity;
+                }
+                return buffer.resolved_[ticket];
+            };
+            const entity target = resolve(o.target);
+            if (!ok)
+            {
+                if constexpr (checks_enabled)
+                {
+                    detail::violate(
+                        "command_buffer: provisional handle from another buffer "
+                        "or from before clear()");
+                }
+                ++result.skipped;
+                continue;
             }
             if (!table_.alive(target))
             {
                 ++result.skipped;
                 continue;
             }
-            if (o.kind == command_buffer::op_kind::kill)
+            switch (o.kind)
             {
-                kill(target);
-            }
-            else
-            {
-                o.apply_fn(*this, target, o.payload);
+                case command_buffer::op_kind::kill:
+                    destroy(target);
+                    break;
+                case command_buffer::op_kind::orphan:
+                    orphan(target);
+                    break;
+                case command_buffer::op_kind::subtree_kill:
+                    destroy_subtree(target);
+                    break;
+                case command_buffer::op_kind::adopt:
+                {
+                    const entity parent = resolve(*static_cast<const entity*>(o.payload));
+                    if (!ok)
+                    {
+                        ++result.skipped;
+                        continue;
+                    }
+                    adopt(parent, target);
+                    break;
+                }
+                default:
+                    o.apply_fn(*this, target, o.payload);
+                    break;
             }
             ++result.applied;
         }
         return result;
     }
 
-    // Thin shims over detail::kin_links so call sites read as policy.
     void sever_links(entity e) noexcept
     {
         if (auto* pool = peek_pool<kin>())
         {
             detail::kin_links::sever(*pool, e);
         }
-    }
-
-    [[nodiscard]] std::expected<void, fault> check_bonds() const
-    {
-        for (const auto& bond : bonds_)
-        {
-            if (bond->owner_count == 0)  // tombstoned by unbond
-            {
-                continue;
-            }
-            const pool_base& first = *bond->owners[0];
-            for (std::uint32_t i = 0; i < bond->owner_count; ++i)
-            {
-                if (bond->paired > bond->owners[i]->size())
-                {
-                    return std::unexpected(fault{fault_code::bond_broken,
-                                                 bond->owners[i]->name(),
-                                                 "partition exceeds pool size"});
-                }
-            }
-            // Mirror equality: the same entity at the same position in every
-            // owner, across the whole partition.
-            for (index_type pos = 0; pos < bond->paired; ++pos)
-            {
-                const entity e = first.entity_at(pos);
-                for (std::uint32_t i = 1; i < bond->owner_count; ++i)
-                {
-                    if (bond->owners[i]->entity_at(pos) != e)
-                    {
-                        return std::unexpected(fault{fault_code::bond_broken,
-                                                     bond->owners[i]->name(),
-                                                     "partition out of mirror"});
-                    }
-                }
-            }
-            // Completeness: no intersection member may sit beyond the
-            // partition. Walk the smallest owner's tail probing all others.
-            const pool_base* smallest = &first;
-            for (std::uint32_t i = 1; i < bond->owner_count; ++i)
-            {
-                if (bond->owners[i]->size() < smallest->size())
-                {
-                    smallest = bond->owners[i];
-                }
-            }
-            for (std::size_t pos = bond->paired; pos < smallest->size(); ++pos)
-            {
-                const auto index = smallest->entity_at(pos).index();
-                bool in_all = true;
-                for (std::uint32_t i = 0; i < bond->owner_count; ++i)
-                {
-                    in_all =
-                        in_all && (bond->owners[i] == smallest || bond->owners[i]->contains(index));
-                }
-                if (in_all)
-                {
-                    return std::unexpected(fault{fault_code::bond_broken,
-                                                 smallest->name(),
-                                                 "intersection member outside the partition"});
-                }
-            }
-        }
-        return {};
     }
 
     [[nodiscard]] std::expected<void, fault> check_links() const
@@ -7140,35 +7188,19 @@ private:
     }
 
     entity_table table_;
-    std::pmr::vector<std::unique_ptr<pool_base>> pools_;  // indexed by type_id (holes ok)
-    // Dense, creation-order view of the same pools (pools_ may carry null
-    // holes in multi-world processes); every O(pools) walk uses this list.
+    std::pmr::vector<std::unique_ptr<pool_base>> pools_;
     std::pmr::vector<pool_base*> active_;
-    // Bond objects are heap-stable for the life of the world; unbond
-    // tombstones instead of freeing so stored bonded_views degrade to empty.
-    std::pmr::vector<std::unique_ptr<group_core>> bonds_;
     std::pmr::memory_resource* memory_;
-    // Guards against hooks resurrecting state on doomed entities (see add()):
-    entity dying_;           // the entity kill() is currently sweeping
-    bool clearing_ = false;  // reset() is wiping pools
-    entity globals_;         // cached globals() carrier; revalidated on use
+    entity dying_;
+    bool clearing_ = false;
+    entity globals_;
+    detail::basic_dispatcher<Traits> dispatcher_;
 };
 
-// The classic world: the default-traits alias every existing spelling uses.
-using world = basic_world<default_entity_traits>;
+using registry = basic_registry<default_entity_traits>;
 
-using entity_ref = basic_entity_ref<world>;
-using const_entity_ref = basic_entity_ref<const world>;
-
-// ----------------------------------------------------------------------------
-// Scoped hooks
-//
-// RAII over a hook_token: disconnects on destruction. Move-only. Anchored to
-// the POOL (heap-stable for the world's life), not the world object, so the
-// connection releases correctly after world moves. Releasing while the pool
-// iterates (including from inside the hook's own dispatch) is refused and the
-// token is KEPT for a later retry.
-// ----------------------------------------------------------------------------
+using entity_filler = basic_entity_filler<registry>;
+using const_entity_filler = basic_entity_filler<const registry>;
 
 template <class Traits>
 class basic_scoped_hook
@@ -7176,7 +7208,7 @@ class basic_scoped_hook
 public:
     basic_scoped_hook() = default;
 
-    basic_scoped_hook(basic_world<Traits>& w, hook_token token) noexcept
+    basic_scoped_hook(basic_registry<Traits>& w, hook_token token) noexcept
         : pool_(w.pool_for_token(token)),
           token_(token)
     {
@@ -7204,8 +7236,6 @@ public:
 
     ~basic_scoped_hook() { release(); }
 
-    // Disconnect now; idempotent. Refused (token kept) while the pool
-    // iterates, so a retry stays possible.
     void release() noexcept
     {
         if (pool_ == nullptr || !token_)
@@ -7219,7 +7249,7 @@ public:
             if (pool_->locked())
             {
                 detail::violate_pool("hook change during iteration over pool", pool_->name());
-                return;  // still connected; the token survives for a retry
+                return;
             }
         }
         pool_->disconnect_hook(token_.id);
@@ -7237,19 +7267,6 @@ private:
 
 using scoped_hook = basic_scoped_hook<default_entity_traits>;
 
-// ----------------------------------------------------------------------------
-// Trackers
-//
-// Collects the entities whose T changed since the last drain -- added,
-// replaced (via replace/put), removed -- deduplicated, in event order. Read
-// the lists, then clear(), once per frame. removed() may hold dead handles
-// (kill fires the hook first); added-then-removed appears in both lists.
-// Between drains a recycled slot keeps only the LIVE successor in added()/
-// replaced(), while removed() keeps every distinct entity's record. The
-// replaced channel is inert for tags. Trackers are pinned (hooks hold a
-// pointer to the tracker); destroy them before their world.
-// ----------------------------------------------------------------------------
-
 enum class track : std::uint8_t
 {
     added = 1,
@@ -7260,7 +7277,6 @@ enum class track : std::uint8_t
 
 [[nodiscard]] constexpr track operator|(track a, track b) noexcept
 {
-    // Flag enum: combined values are intentional.
     // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
     return static_cast<track>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
 }
@@ -7271,17 +7287,17 @@ enum class track : std::uint8_t
     return static_cast<track>(static_cast<std::uint8_t>(a) & static_cast<std::uint8_t>(b));
 }
 
-template <component T, class Traits = default_entity_traits>
-class tracker
+template <entity_traits Traits, component T>
+class basic_tracker
 {
     using entity = ecs::basic_entity<Traits>;
-    using world = basic_world<Traits>;
+    using world = basic_registry<Traits>;
     using scoped_hook = basic_scoped_hook<Traits>;
 
 public:
-    explicit tracker(world& w,
-                     track which = track::all,
-                     std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    explicit basic_tracker(world& w,
+                           track which = track::all,
+                           std::pmr::memory_resource* memory = std::pmr::get_default_resource())
         : seen_added_(memory),
           seen_replaced_(memory),
           seen_removed_(memory),
@@ -7291,27 +7307,28 @@ public:
     {
         if ((which & track::added) == track::added)
         {
-            on_added_ = scoped_hook(w, w.template on_add<T>(&tracker::record_added, this));
+            on_added_ = scoped_hook(w, w.template on_add<T>(&basic_tracker::record_added, this));
         }
         if constexpr (!detail::is_tag_v<T>)
         {
             if ((which & track::replaced) == track::replaced)
             {
                 on_replaced_ =
-                    scoped_hook(w, w.template on_replace<T>(&tracker::record_replaced, this));
+                    scoped_hook(w, w.template on_replace<T>(&basic_tracker::record_replaced, this));
             }
         }
         if ((which & track::removed) == track::removed)
         {
-            on_removed_ = scoped_hook(w, w.template on_remove<T>(&tracker::record_removed, this));
+            on_removed_ =
+                scoped_hook(w, w.template on_remove<T>(&basic_tracker::record_removed, this));
         }
     }
 
-    tracker(const tracker&) = delete;  // pinned: the hooks hold `this`
-    tracker(tracker&&) = delete;
-    tracker& operator=(const tracker&) = delete;
-    tracker& operator=(tracker&&) = delete;
-    ~tracker() = default;  // scoped_hooks disconnect
+    basic_tracker(const basic_tracker&) = delete;
+    basic_tracker(basic_tracker&&) = delete;
+    basic_tracker& operator=(const basic_tracker&) = delete;
+    basic_tracker& operator=(basic_tracker&&) = delete;
+    ~basic_tracker() = default;
 
     [[nodiscard]] std::span<const entity> added() const noexcept { return added_; }
     [[nodiscard]] std::span<const entity> replaced() const noexcept { return replaced_; }
@@ -7327,19 +7344,19 @@ public:
 private:
     static void record_added(world&, entity e, void* user)
     {
-        auto* self = static_cast<tracker*>(user);
+        auto* self = static_cast<basic_tracker*>(user);
         self->record(self->added_, self->seen_added_, e, false);
     }
 
     static void record_replaced(world&, entity e, void* user)
     {
-        auto* self = static_cast<tracker*>(user);
+        auto* self = static_cast<basic_tracker*>(user);
         self->record(self->replaced_, self->seen_replaced_, e, false);
     }
 
     static void record_removed(world&, entity e, void* user)
     {
-        auto* self = static_cast<tracker*>(user);
+        auto* self = static_cast<basic_tracker*>(user);
         self->record(self->removed_, self->seen_removed_, e, true);
     }
 
@@ -7351,16 +7368,13 @@ private:
         const auto pos = seen.get(e.index());
         if (pos != detail::entity_limits<Traits>::npos)
         {
-            // Slot recycled before a drain: for added/replaced the live
-            // successor wins; for removed() a DISTINCT entity's removal must
-            // not erase its predecessor's, so it appends instead.
             if (!keep_history || list[pos] == e)
             {
                 list[pos] = e;
                 return;
             }
         }
-        seen.ensure(e.index());  // nofail set below
+        seen.ensure(e.index());
         list.push_back(e);
         seen.set_existing(e.index(), static_cast<typename Traits::index_type>(list.size() - 1));
     }
@@ -7375,7 +7389,7 @@ private:
         list.clear();
     }
 
-    detail::basic_sparse_index<Traits> seen_added_;  // entity slot -> list position (dedupe)
+    detail::basic_sparse_index<Traits> seen_added_;
     detail::basic_sparse_index<Traits> seen_replaced_;
     detail::basic_sparse_index<Traits> seen_removed_;
     std::pmr::vector<entity> added_;
@@ -7386,21 +7400,14 @@ private:
     scoped_hook on_removed_;
 };
 
-// ----------------------------------------------------------------------------
-// Watchers
-//
-// Monitors a CONDITION SET -- entities holding every component in types<>
-// and none in except<> -- and collects, deduplicated, those that BEGAN
-// matching since the last drain (changed<C>: also those whose C was replaced
-// via replace/put/amend WHILE matching). Entities that stop matching are
-// evicted, so matched() is live truth at drain time -- a membership monitor,
-// unlike the tracker's event log. Watchers see EDGES: members predating
-// construction stay out until a fresh edge re-collects them. Pinned (hooks
-// hold `this`); destroy before the world.
-// ----------------------------------------------------------------------------
+template <component T>
+using tracker = basic_tracker<default_entity_traits, T>;
 
-// Trigger marker: collect entities whose T was replaced while the watcher's
-// condition set held.
+template <class... Es>
+struct except
+{
+};
+
 template <class T>
 struct changed
 {
@@ -7444,15 +7451,6 @@ struct watcher_spec<changed<C>>
     using list = types<C>;
 };
 
-template <class List>
-struct list_size;
-
-template <class... Us>
-struct list_size<types<Us...>>
-{
-    static constexpr std::size_t value = sizeof...(Us);
-};
-
 template <class A, class B>
 struct lists_disjoint;
 
@@ -7494,9 +7492,9 @@ template <class Traits, class... Specs>
 class basic_watcher
 {
     using entity = ecs::basic_entity<Traits>;
-    using world = basic_world<Traits>;
+    using world = basic_registry<Traits>;
     using scoped_hook = basic_scoped_hook<Traits>;
-    using watcher = basic_watcher;  // the historical body spelling
+    using watcher = basic_watcher;
 
     static_assert((std::size_t{0} + ... + std::size_t{detail::watcher_spec<Specs>::is_includes}) ==
                       1,
@@ -7520,8 +7518,7 @@ class basic_watcher
                                                      typename detail::watcher_spec<Specs>::list,
                                                      types<>>...>;
 
-    static_assert(detail::list_size<include_list>::value >= 1,
-                  "ecs: a watcher needs at least one condition component");
+    static_assert(include_list::size >= 1, "ecs: a watcher needs at least one condition component");
     static_assert(detail::watcher_conditions_ok<include_list>::value);
     static_assert(detail::watcher_conditions_ok<exclude_list>::value);
     static_assert(detail::watcher_triggers_ok<trigger_list>::value);
@@ -7529,9 +7526,8 @@ class basic_watcher
                   "ecs: a component type appears in both the watcher's types<...> and "
                   "except<...> lists");
 
-    static constexpr std::size_t hook_count = (detail::list_size<include_list>::value * 2) +
-                                              (detail::list_size<exclude_list>::value * 2) +
-                                              detail::list_size<trigger_list>::value;
+    static constexpr std::size_t hook_count =
+        (include_list::size * 2) + (exclude_list::size * 2) + trigger_list::size;
 
 public:
     explicit basic_watcher(world& w,
@@ -7545,13 +7541,12 @@ public:
         connect_triggers(w, k, trigger_list{});
     }
 
-    basic_watcher(const basic_watcher&) = delete;  // pinned: the hooks hold `this`
+    basic_watcher(const basic_watcher&) = delete;
     basic_watcher(basic_watcher&&) = delete;
     basic_watcher& operator=(const basic_watcher&) = delete;
     basic_watcher& operator=(basic_watcher&&) = delete;
-    ~basic_watcher() = default;  // scoped_hooks disconnect
+    ~basic_watcher() = default;
 
-    // Deduplicated; every entry currently matches the condition set.
     [[nodiscard]] std::span<const entity> matched() const noexcept { return matched_; }
     [[nodiscard]] std::size_t count() const noexcept { return matched_.size(); }
     [[nodiscard]] bool empty() const noexcept { return matched_.empty(); }
@@ -7607,8 +7602,6 @@ private:
         }
     }
 
-    // An exclude's on_remove fires BEFORE the component leaves: probe as if
-    // it were already gone.
     template <class SkipX>
     static void unshielded_edge(world& w, entity e, void* user)
     {
@@ -7639,9 +7632,9 @@ private:
     {
         if (seen_.get(e.index()) != detail::entity_limits<Traits>::npos)
         {
-            return;  // already collected
+            return;
         }
-        seen_.ensure(e.index());  // nofail set below
+        seen_.ensure(e.index());
         matched_.push_back(e);
         seen_.set_existing(e.index(),
                            static_cast<typename Traits::index_type>(matched_.size() - 1));
@@ -7661,28 +7654,13 @@ private:
         seen_.erase(e.index());
     }
 
-    detail::basic_sparse_index<Traits> seen_;  // slot -> matched_ position (dedupe + O(1) evict)
+    detail::basic_sparse_index<Traits> seen_;
     std::pmr::vector<entity> matched_;
     std::array<scoped_hook, hook_count> hooks_;
 };
 
-// The public spelling: condition lists over the classic world.
 template <class... Specs>
 using watcher = basic_watcher<default_entity_traits, Specs...>;
-
-// ----------------------------------------------------------------------------
-// Archives: pack / unpack / graft
-//
-// Typed, not byte-oriented: ecs owns ordering and identity, your archive
-// (writer/reader callables) owns the encoding. Rows emit in dense order,
-// which round-trips sort<T> order; list the same types in the same order on
-// both sides. unpack requires an EMPTY world and restores exact handles
-// (rollback semantics); faults are not rolled back. graft spawns FRESH
-// entities and returns the old->new graft_map -- stored handles relink only
-// by explicit opt-in (ecs_relink / relink_traits, never member-guessing),
-// and resolve() answers no_entity for handles outside the archive. Bound
-// untrusted entity counts before unpack, like restore_entity.
-// ----------------------------------------------------------------------------
 
 template <class W, class Traits = default_entity_traits>
 concept archive_writer = requires(W& w, std::uint64_t n, basic_entity<Traits> e) {
@@ -7708,8 +7686,6 @@ namespace detail
 {
 struct archive_access;
 
-// One u64 stamp identifying the handle layout a stream was packed with;
-// unpack/graft refuse streams from a different layout with archive_mismatch.
 template <class Traits>
 [[nodiscard]] consteval std::uint64_t layout_stamp() noexcept
 {
@@ -7726,8 +7702,6 @@ template <class Traits>
 }
 }  // namespace detail
 
-// The old-handle -> fresh-handle mapping a graft produces. Sorted by old slot
-// (pack emits slot order); resolve is a binary search.
 template <class Traits>
 class basic_graft_map
 {
@@ -7739,8 +7713,6 @@ public:
     {
     }
 
-    // The fresh handle minted for `old`; no_entity when the archive never
-    // contained it.
     [[nodiscard]] entity resolve(entity old) const noexcept
     {
         const auto it = std::ranges::partition_point(pairs_,
@@ -7757,7 +7729,8 @@ public:
     [[nodiscard]] bool empty() const noexcept { return pairs_.empty(); }
 
     template <class F>
-    void each(F&& fn) const  // fn(entity old, entity fresh)
+        requires std::invocable<F&, entity, entity>
+    void each(F&& fn) const
     {
         for (const auto& [old, fresh] : pairs_)
         {
@@ -7774,7 +7747,7 @@ using graft_map = basic_graft_map<default_entity_traits>;
 
 namespace detail
 {
-struct archive_access  // pack/unpack/graft internals; not user API
+struct archive_access
 {
     template <class Traits>
     static auto& pairs(basic_graft_map<Traits>& map) noexcept
@@ -7787,10 +7760,6 @@ template <class T, class Traits>
 concept has_member_relink = requires(T& v, const basic_graft_map<Traits>& m) { v.ecs_relink(m); };
 }  // namespace detail
 
-// Opt-in entity-handle rewriting for graft: give the component
-// `void ecs_relink(const graft_map&)`, or specialize relink_traits<T, Traits>
-// (links = true, static relink) for types you do not own. A hook written for
-// one layout reports links == false under every other layout.
 template <class T, class Traits = default_entity_traits>
 struct relink_traits
 {
@@ -7805,12 +7774,32 @@ struct relink_traits
 
 namespace detail
 {
+template <class T>
+[[nodiscard]] consteval std::uint64_t schema_hash() noexcept
+{
+    std::uint64_t h = hash_of<T>();
+    const auto mix = [&h](std::uint64_t v)
+    {
+        h ^= v;
+        h *= 0x100000001b3ULL;
+    };
+    mix(sizeof(T));
+    mix(alignof(T));
+    if constexpr (reflectable_aggregate<T>)
+    {
+        mix(field_count_v<T>);
+        [&]<std::size_t... Is>(std::index_sequence<Is...>)
+        { (mix(fnv1a(field_name<T, Is>())), ...); }(std::make_index_sequence<field_count_v<T>>{});
+    }
+    return h;
+}
+
 template <component T, class Traits, class W>
-void pack_one(const basic_world<Traits>& w, W& out)
+void pack_one(const basic_registry<Traits>& w, W& out)
 {
     using entity = ecs::basic_entity<Traits>;
-    out(hash_of<T>());
-    const auto sel = w.template select<T>();  // const world: all-const, never registers
+    out(schema_hash<T>());
+    const auto sel = w.template view<T>();
     out(static_cast<std::uint64_t>(sel.count()));
     if constexpr (is_tag_v<T>)
     {
@@ -7828,18 +7817,25 @@ void pack_one(const basic_world<Traits>& w, W& out)
 }
 
 template <component T, class Traits, class R>
-[[nodiscard]] std::expected<void, fault> unpack_one(basic_world<Traits>& w, R& in)
+[[nodiscard]] std::expected<void, fault> unpack_one(basic_registry<Traits>& w,
+                                                    R& in,
+                                                    std::uint64_t max_entities)
 {
     using entity = ecs::basic_entity<Traits>;
     std::uint64_t hash{};
     in(hash);
-    if (hash != hash_of<T>())
+    if (hash != schema_hash<T>())
     {
         return std::unexpected(
-            fault{fault_code::archive_mismatch, name_of<T>(), "type hash differs"});
+            fault{fault_code::archive_mismatch, name_of<T>(), "type hash or layout differs"});
     }
     std::uint64_t count{};
     in(count);
+    if (count > max_entities)
+    {
+        return std::unexpected(
+            fault{fault_code::archive_too_large, name_of<T>(), "row count exceeds cap"});
+    }
     for (std::uint64_t i = 0; i < count; ++i)
     {
         entity e;
@@ -7867,21 +7863,27 @@ template <component T, class Traits, class R>
 }
 
 template <component T, class Traits, class R>
-[[nodiscard]] std::expected<void, fault> graft_one(basic_world<Traits>& w,
+[[nodiscard]] std::expected<void, fault> graft_one(basic_registry<Traits>& w,
                                                    R& in,
-                                                   const basic_graft_map<Traits>& map)
+                                                   const basic_graft_map<Traits>& map,
+                                                   std::uint64_t max_entities)
 {
     using entity = ecs::basic_entity<Traits>;
-    constexpr entity no_entity{};  // shadows the default-traits constant
+    constexpr entity no_entity{};
     std::uint64_t hash{};
     in(hash);
-    if (hash != hash_of<T>())
+    if (hash != schema_hash<T>())
     {
         return std::unexpected(
-            fault{fault_code::archive_mismatch, name_of<T>(), "type hash differs"});
+            fault{fault_code::archive_mismatch, name_of<T>(), "type hash or layout differs"});
     }
     std::uint64_t count{};
     in(count);
+    if (count > max_entities)
+    {
+        return std::unexpected(
+            fault{fault_code::archive_too_large, name_of<T>(), "row count exceeds cap"});
+    }
     for (std::uint64_t i = 0; i < count; ++i)
     {
         entity old;
@@ -7914,11 +7916,9 @@ template <component T, class Traits, class R>
 }
 }  // namespace detail
 
-// Serializes the live entity set plus the listed component types. The stream
-// opens with a layout stamp; loads under different handle traits refuse with
-// archive_mismatch.
+inline constexpr std::uint64_t archive_unbounded = std::numeric_limits<std::uint64_t>::max();
 template <component... Ts, class Traits, class W>
-void pack(const basic_world<Traits>& w, W& out)
+void pack(const basic_registry<Traits>& w, W& out)
 {
     using entity = ecs::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "ecs: pack needs at least one component type");
@@ -7930,21 +7930,20 @@ void pack(const basic_world<Traits>& w, W& out)
     static_assert(detail::all_distinct<Ts...>, "ecs: duplicate component type in pack");
     out(detail::layout_stamp<Traits>());
     out(static_cast<std::uint64_t>(w.live_count()));
-    w.live_entities([&](entity e) { out(e); });
+    w.each([&](entity e) { out(e); });
     (detail::pack_one<Ts>(w, out), ...);
 }
 
-// Manifest form: pack(world, writer, Saved{}).
 template <class Traits, class W, component... Ts>
-void pack(const basic_world<Traits>& w, W& out, types<Ts...>)
+void pack(const basic_registry<Traits>& w, W& out, types<Ts...>)
 {
     pack<Ts...>(w, out);
 }
 
-// Restores a pack stream into an EMPTY world: exact index+generation pairs
-// (rollback semantics -- handles saved elsewhere stay meaningful).
 template <component... Ts, class Traits, class R>
-[[nodiscard]] std::expected<void, fault> unpack(basic_world<Traits>& w, R& in)
+[[nodiscard]] std::expected<void, fault> unpack(basic_registry<Traits>& w,
+                                                R& in,
+                                                std::uint64_t max_entities = archive_unbounded)
 {
     using entity = ecs::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "ecs: unpack needs at least one component type");
@@ -7970,36 +7969,44 @@ template <component... Ts, class Traits, class R>
     }
     std::uint64_t count{};
     in(count);
+    if (count > max_entities)
+    {
+        return std::unexpected(
+            fault{fault_code::archive_too_large, {}, "entity count exceeds cap"});
+    }
     for (std::uint64_t i = 0; i < count; ++i)
     {
         entity e;
         in(e);
+        if (static_cast<std::uint64_t>(e.index()) >= max_entities)
+        {
+            return std::unexpected(
+                fault{fault_code::archive_too_large, {}, "entity index exceeds cap"});
+        }
         if (auto restored = w.restore_entity(e); !restored)
         {
             return std::unexpected(restored.error());
         }
     }
     std::expected<void, fault> result{};
-    // Left-to-right with short-circuit: stop at the first faulting type.
-    static_cast<void>(((result = detail::unpack_one<Ts>(w, in)).has_value() && ...));
+    static_cast<void>(((result = detail::unpack_one<Ts>(w, in, max_entities)).has_value() && ...));
     return result;
 }
-
-// Manifest form: unpack(world, reader, Saved{}).
 template <class Traits, class R, component... Ts>
-[[nodiscard]] std::expected<void, fault> unpack(basic_world<Traits>& w, R& in, types<Ts...>)
+[[nodiscard]] std::expected<void, fault> unpack(basic_registry<Traits>& w,
+                                                R& in,
+                                                types<Ts...>,
+                                                std::uint64_t max_entities = archive_unbounded)
 {
-    return unpack<Ts...>(w, in);
+    return unpack<Ts...>(w, in, max_entities);
 }
 
-// Merges a pack stream into a (possibly populated) world: every archived
-// entity becomes a FRESH spawn; returns the old->new map. Component values
-// relink their stored handles per relink_traits (explicit opt-in).
 template <component... Ts, class Traits, class R>
 [[nodiscard]] std::expected<basic_graft_map<Traits>, fault> graft(
-    basic_world<Traits>& w,
+    basic_registry<Traits>& w,
     R& in,
-    std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    std::pmr::memory_resource* memory = std::pmr::get_default_resource(),
+    std::uint64_t max_entities = archive_unbounded)
 {
     using entity = ecs::basic_entity<Traits>;
     static_assert(sizeof...(Ts) > 0, "ecs: graft needs at least one component type");
@@ -8019,15 +8026,21 @@ template <component... Ts, class Traits, class R>
     }
     std::uint64_t count{};
     in(count);
+    if (count > max_entities)
+    {
+        return std::unexpected(
+            fault{fault_code::archive_too_large, {}, "entity count exceeds cap"});
+    }
     pairs.reserve(count);
     for (std::uint64_t i = 0; i < count; ++i)
     {
         entity old;
         in(old);
-        pairs.emplace_back(old, w.spawn());
+        pairs.emplace_back(old, w.create().id());
     }
     std::expected<void, fault> result{};
-    static_cast<void>(((result = detail::graft_one<Ts>(w, in, map)).has_value() && ...));
+    static_cast<void>(
+        ((result = detail::graft_one<Ts>(w, in, map, max_entities)).has_value() && ...));
     if (!result)
     {
         return std::unexpected(result.error());
@@ -8035,129 +8048,111 @@ template <component... Ts, class Traits, class R>
     return map;
 }
 
-// Manifest form: graft(world, reader, Saved{}).
 template <class Traits, class R, component... Ts>
 [[nodiscard]] std::expected<basic_graft_map<Traits>, fault> graft(
-    basic_world<Traits>& w,
+    basic_registry<Traits>& w,
     R& in,
     types<Ts...>,
-    std::pmr::memory_resource* memory = std::pmr::get_default_resource())
+    std::pmr::memory_resource* memory = std::pmr::get_default_resource(),
+    std::uint64_t max_entities = archive_unbounded)
 {
-    return graft<Ts...>(w, in, memory);
+    return graft<Ts...>(w, in, memory, max_entities);
 }
 
-// ----------------------------------------------------------------------------
-// Pipeline
-//
-// An ordered list of plain stages your game loop calls once per frame -- ecs
-// never owns the loop. It owns a command buffer (deferred()) and applies it
-// AFTER EVERY STAGE, so each stage observes the previous stage's structural
-// changes and nothing mutates under an iteration. Stages are
-// std::move_only_function; the pipeline is move-only and owns them.
-// ----------------------------------------------------------------------------
-
-template <class Traits>
-class basic_pipeline
+template <class Traits, class W>
+void pack_links(const basic_registry<Traits>& w, W& out)
 {
-    using world = basic_world<Traits>;
-    using command_buffer = basic_command_buffer<Traits>;
-    using pipeline = basic_pipeline;  // the historical body spelling
-
-public:
-    using stage_fn = std::move_only_function<void(world&, float)>;
-
-    explicit basic_pipeline(std::pmr::memory_resource* memory = std::pmr::get_default_resource())
-        : deferred_(memory)
+    using entity = ecs::basic_entity<Traits>;
+    std::vector<std::pair<entity, entity>> edges;
+    w.roots([&](entity r)
+            { w.descendants_of(r, [&](entity e) { edges.emplace_back(e, w.parent_of(e)); }); });
+    out(static_cast<std::uint64_t>(edges.size()));
+    for (const auto& [child, parent] : edges)
     {
+        out(child);
+        out(parent);
     }
+}
 
-    basic_pipeline(basic_pipeline&&) noexcept = default;
-    basic_pipeline& operator=(basic_pipeline&&) = default;  // not noexcept: deferred_ may rebind
-    basic_pipeline(const basic_pipeline&) = delete;
-    basic_pipeline& operator=(const basic_pipeline&) = delete;
-    ~basic_pipeline() = default;
-
-    // Refused while run() executes (the running stage lives in this vector);
-    // register stages between frames.
-    pipeline& stage(std::string_view label, stage_fn fn)
+template <class Traits, class R>
+[[nodiscard]] std::expected<void, fault> unpack_links(
+    basic_registry<Traits>& w, R& in, std::uint64_t max_entities = archive_unbounded)
+{
+    using entity = ecs::basic_entity<Traits>;
+    std::uint64_t count{};
+    in(count);
+    if (count > max_entities)
     {
-        if (running_)
+        return std::unexpected(
+            fault{fault_code::archive_too_large, {}, "link edge count exceeds cap"});
+    }
+    for (std::uint64_t i = 0; i < count; ++i)
+    {
+        entity child;
+        entity parent;
+        in(child);
+        in(parent);
+        if (!w.alive(child) || !w.alive(parent))
         {
-            if constexpr (checks_enabled)
-            {
-                detail::violate("pipeline::stage during run()");
-            }
-            return *this;
+            return std::unexpected(
+                fault{fault_code::archive_mismatch, {}, "link endpoint not restored"});
         }
-        stages_.push_back(stage_entry{std::string(label), std::move(fn)});
-        return *this;
+        w.adopt(parent, child);
     }
+    return {};
+}
 
-    pipeline& stage(stage_fn fn) { return stage({}, std::move(fn)); }
-
-    // Runs every stage in declaration order, applying deferred() after each.
-    void run(world& w, float dt)
+template <class Traits, class R>
+[[nodiscard]] std::expected<void, fault> graft_links(basic_registry<Traits>& w,
+                                                     R& in,
+                                                     const basic_graft_map<Traits>& map,
+                                                     std::uint64_t max_entities = archive_unbounded)
+{
+    using entity = ecs::basic_entity<Traits>;
+    constexpr entity no_entity{};
+    std::uint64_t count{};
+    in(count);
+    if (count > max_entities)
     {
-        running_ = true;
-        for (stage_entry& entry : stages_)
+        return std::unexpected(
+            fault{fault_code::archive_too_large, {}, "link edge count exceeds cap"});
+    }
+    for (std::uint64_t i = 0; i < count; ++i)
+    {
+        entity child;
+        entity parent;
+        in(child);
+        in(parent);
+        const entity nc = map.resolve(child);
+        const entity np = map.resolve(parent);
+        if (nc == no_entity || np == no_entity)
         {
-            entry.fn(w, dt);
-            if (!deferred_.empty())
-            {
-                w.apply(deferred_);
-            }
+            return std::unexpected(
+                fault{fault_code::archive_mismatch, {}, "link endpoint outside archive"});
         }
-        running_ = false;
+        w.adopt(np, nc);
     }
+    return {};
+}
 
-    // The pipeline-owned buffer stages record structural changes into.
-    [[nodiscard]] command_buffer& deferred() noexcept { return deferred_; }
-
-    [[nodiscard]] std::size_t stages() const noexcept { return stages_.size(); }
-    [[nodiscard]] std::string_view label(std::size_t i) const noexcept { return stages_[i].label; }
-
-private:
-    struct stage_entry
-    {
-        std::string label;
-        stage_fn fn;
-    };
-
-    std::vector<stage_entry> stages_;  // bounded structure: global allocator
-    command_buffer deferred_;
-    bool running_ = false;  // stage() during run() would relocate the running stage
-};
-
-using pipeline = basic_pipeline<default_entity_traits>;
-
-// ----------------------------------------------------------------------------
-// Entity references
-//
-// Pure forwarding sugar over the world verbs; nothing is cached. 16 bytes;
-// pass it down call chains instead of (world&, entity) pairs. Never store it
-// in components -- it pins the world's address. A default-constructed ref is
-// EMPTY: queries answer false/null/no-op on it, while reference-producing
-// verbs (add, put, replace, obtain, get, owner) are checked violations.
-// ----------------------------------------------------------------------------
-
-template <class W>  // W = world (full verb set) or const world (read-only)
-class basic_entity_ref
+template <class W>
+class basic_entity_filler
 {
     static constexpr bool writable = !std::is_const_v<W>;
-    using entity = typename std::remove_const_t<W>::entity;  // the world's handle type
+    using entity = typename std::remove_const_t<W>::entity;
 
 public:
-    basic_entity_ref() = default;
+    basic_entity_filler() = default;
 
-    basic_entity_ref(W& w, entity e) noexcept
+    basic_entity_filler(W& w, entity e) noexcept
         : world_(&w),
           entity_(e)
     {
     }
 
-    // entity_ref converts to const_entity_ref, never the other way.
-    basic_entity_ref(const basic_entity_ref<std::remove_const_t<W>>& other) noexcept
-        requires std::is_const_v<W>
+    template <class V>
+        requires(std::is_const_v<W> && std::same_as<V, std::remove_const_t<W>>)
+    basic_entity_filler(const basic_entity_filler<V>& other) noexcept
         : world_(other.world_),
           entity_(other.entity_)
     {
@@ -8177,29 +8172,60 @@ public:
     decltype(auto) add(Args&&... args) const
         requires writable
     {
-        return bound("entity_ref::add").template add<T>(entity_, std::forward<Args>(args)...);
+        return bound("entity_filler::add").template add<T>(entity_, std::forward<Args>(args)...);
+    }
+
+    template <component T>
+        requires(writable && !detail::is_tag_v<T>)
+    decltype(auto) add(T&& value) const
+    {
+        return bound("entity_filler::add").template add<T, T>(entity_, std::forward<T>(value));
     }
 
     template <component T, class... Args>
     decltype(auto) put(Args&&... args) const
         requires writable
     {
-        return bound("entity_ref::put").template put<T>(entity_, std::forward<Args>(args)...);
+        return bound("entity_filler::put").template put<T>(entity_, std::forward<Args>(args)...);
+    }
+
+    template <component T>
+        requires(writable && !detail::is_tag_v<T>)
+    decltype(auto) put(T&& value) const
+    {
+        return bound("entity_filler::put").template put<T, T>(entity_, std::forward<T>(value));
     }
 
     template <component T, class... Args>
     T& replace(Args&&... args) const
         requires writable
     {
-        return bound("entity_ref::replace")
+        return bound("entity_filler::replace")
             .template replace<T>(entity_, std::forward<Args>(args)...);
+    }
+
+    template <component T>
+        requires(writable && !detail::is_tag_v<T>)
+    T& replace(T&& value) const
+    {
+        return bound("entity_filler::replace")
+            .template replace<T, T>(entity_, std::forward<T>(value));
     }
 
     template <component T, class... Args>
     decltype(auto) obtain(Args&&... args) const
         requires writable
     {
-        return bound("entity_ref::obtain").template obtain<T>(entity_, std::forward<Args>(args)...);
+        return bound("entity_filler::obtain")
+            .template obtain<T>(entity_, std::forward<Args>(args)...);
+    }
+
+    template <component T>
+        requires(writable && !detail::is_tag_v<T>)
+    decltype(auto) obtain(T&& value) const
+    {
+        return bound("entity_filler::obtain")
+            .template obtain<T, T>(entity_, std::forward<T>(value));
     }
 
     template <component T>
@@ -8215,19 +8241,16 @@ public:
         return world_ != nullptr && world_->template has<T>(entity_);
     }
 
-    // T& from an entity_ref, const T& from a const_entity_ref.
     template <component T>
     [[nodiscard]] decltype(auto) get() const
     {
-        return bound("entity_ref::get").template get<T>(entity_);
+        return bound("entity_filler::get").template get<T>(entity_);
     }
 
-    // Multi-component point lookup: a tuple of references, const through a
-    // const_entity_ref.
     template <component T, component U, component... Rest>
     [[nodiscard]] auto get() const
     {
-        return bound("entity_ref::get").template get<T, U, Rest...>(entity_);
+        return bound("entity_filler::get").template get<T, U, Rest...>(entity_);
     }
 
     template <component T>
@@ -8237,12 +8260,55 @@ public:
         return world_ != nullptr ? world_->template find<T>(entity_) : pointer{nullptr};
     }
 
-    void kill() const noexcept
+    template <component T, component U, component... Rest>
+    [[nodiscard]] bool has_all() const noexcept
+    {
+        return world_ != nullptr && world_->template has_all<T, U, Rest...>(entity_);
+    }
+
+    template <component T, component U, component... Rest>
+    [[nodiscard]] bool has_any() const noexcept
+    {
+        return world_ != nullptr && world_->template has_any<T, U, Rest...>(entity_);
+    }
+
+    template <component T, component U, component... Rest>
+    [[nodiscard]] auto find_all() const noexcept
+    {
+        using row =
+            decltype(std::declval<W&>().template find_all<T, U, Rest...>(std::declval<entity>()));
+        return world_ != nullptr ? world_->template find_all<T, U, Rest...>(entity_) : row{};
+    }
+
+    template <component T, class F>
+        requires(writable && std::invocable<F&, T&>)
+    T& amend(F&& fn) const
+    {
+        return bound("entity_filler::amend").template amend<T>(entity_, std::forward<F>(fn));
+    }
+
+    template <component T, class... Args>
+    const basic_entity_filler& component(Args&&... args) const
+        requires writable
+    {
+        bound("entity_filler::component").template add<T>(entity_, std::forward<Args>(args)...);
+        return *this;
+    }
+
+    template <ecs::component T>
+        requires(writable && !detail::is_tag_v<T>)
+    const basic_entity_filler& component(T&& value) const
+    {
+        bound("entity_filler::component").template add<T, T>(entity_, std::forward<T>(value));
+        return *this;
+    }
+
+    void destroy() const noexcept
         requires writable
     {
         if (world_ != nullptr)
         {
-            world_->kill(entity_);
+            world_->destroy(entity_);
         }
     }
 
@@ -8255,24 +8321,23 @@ public:
         }
     }
 
-    [[nodiscard]] basic_entity_ref parent() const noexcept
+    [[nodiscard]] basic_entity_filler parent() const noexcept
     {
-        return world_ != nullptr ? basic_entity_ref{*world_, world_->parent_of(entity_)}
-                                 : basic_entity_ref{};
+        return world_ != nullptr ? basic_entity_filler{*world_, world_->parent_of(entity_)}
+                                 : basic_entity_filler{};
     }
 
 private:
     template <class>
-    friend class basic_entity_ref;  // the converting constructor reads members
+    friend class basic_entity_filler;
 
-    // The reference-producing verbs cannot no-op an empty ref.
     [[nodiscard]] W& bound(const char* what) const
     {
         if (world_ == nullptr)
         {
             if constexpr (checks_enabled)
             {
-                detail::violate_pool("call on an empty (default-constructed) entity_ref:", what);
+                detail::violate_pool("call on an empty (default-constructed) entity_filler:", what);
             }
             std::abort();
         }
@@ -8284,23 +8349,24 @@ private:
 };
 
 template <class Traits>
-typename basic_world<Traits>::entity_ref basic_world<Traits>::ref(entity e) noexcept
+typename basic_registry<Traits>::entity_filler basic_registry<Traits>::ref(entity e) noexcept
 {
-    return entity_ref{*this, e};
+    return entity_filler{*this, e};
 }
 
 template <class Traits>
-typename basic_world<Traits>::const_entity_ref basic_world<Traits>::ref(entity e) const noexcept
+typename basic_registry<Traits>::const_entity_filler basic_registry<Traits>::ref(
+    entity e) const noexcept
 {
-    return const_entity_ref{*this, e};
+    return const_entity_filler{*this, e};
 }
 
 template <class Traits>
-typename basic_world<Traits>::entity_ref basic_world<Traits>::globals()
+typename basic_registry<Traits>::entity_filler basic_registry<Traits>::globals()
 {
     if (!table_.alive(globals_))
     {
-        globals_ = select<globals_mark>().first();  // an unpack may have restored it
+        globals_ = view<globals_mark>().first();
         if (globals_ == no_entity)
         {
             globals_ = table_.create();
@@ -8308,345 +8374,21 @@ typename basic_world<Traits>::entity_ref basic_world<Traits>::globals()
     }
     if (!has<globals_mark>(globals_))
     {
-        // First call -- or self-healing after a lazy mark add was refused
-        // (first globals() under an iteration of the mark pool).
         add<globals_mark>(globals_);
     }
-    return entity_ref{*this, globals_};
+    return entity_filler{*this, globals_};
 }
 
 template <class Traits>
-typename basic_world<Traits>::const_entity_ref basic_world<Traits>::globals() const noexcept
+typename basic_registry<Traits>::const_entity_filler basic_registry<Traits>::globals()
+    const noexcept
 {
     if (table_.alive(globals_))
     {
-        return const_entity_ref{*this, globals_};
+        return const_entity_filler{*this, globals_};
     }
-    // No spawning on const worlds; a dead-safe ref when none exists yet.
-    return const_entity_ref{*this, select<globals_mark>().first()};
+    return const_entity_filler{*this, view<globals_mark>().first()};
 }
-
-// ----------------------------------------------------------------------------
-// any -- a type-erased value with small-buffer optimization
-//
-// RTTI-free: identity is hash_of<T> (the hash pools and archives key on);
-// the vtable is a static per-type table of plain function pointers. Payloads
-// up to three words with ordinary alignment live inline; larger or
-// over-aligned ones take one heap allocation. make<T>() owns; ref() makes a
-// NON-OWNING view that aliases the original (copies of a ref are more refs).
-// Copying a non-copyable payload is a checked violation yielding an empty
-// any. as<T>() aborts on mismatch (checked); try_as<T>() answers null.
-// ----------------------------------------------------------------------------
-
-class any
-{
-    static constexpr std::size_t sbo_bytes = 3 * sizeof(void*);
-
-    union storage
-    {
-        void* remote;
-        alignas(std::max_align_t) std::byte local[sbo_bytes];
-    };
-
-    template <class T>
-    static constexpr bool fits_inline =
-        sizeof(T) <= sbo_bytes && alignof(T) <= alignof(std::max_align_t) &&
-        std::is_nothrow_move_constructible_v<T>;
-
-    enum class place : std::uint8_t
-    {
-        local,
-        remote,
-        ref,
-    };
-
-    struct vtable_t
-    {
-        std::uint64_t hash;
-        place where;
-        void (*destroy)(any&) noexcept;
-        void (*copy)(any& dst, const any& src);     // null: payload not copyable
-        void (*move)(any& dst, any& src) noexcept;  // src left empty
-        void* (*address)(const any&) noexcept;
-    };
-
-    template <class T, place Where>
-    static const vtable_t* table() noexcept
-    {
-        static constexpr vtable_t vt{
-            hash_of<T>(),
-            Where,
-            // destroy
-            +[](any& self) noexcept
-            {
-                if constexpr (Where == place::local)
-                {
-                    std::destroy_at(static_cast<T*>(static_cast<void*>(self.store_.local)));
-                }
-                else if constexpr (Where == place::remote)
-                {
-                    T* payload = static_cast<T*>(self.store_.remote);
-                    std::destroy_at(payload);
-                    ::operator delete(payload, std::align_val_t{alignof(T)});
-                }
-            },
-            // copy (refs copy as refs; owned payloads deep-copy when they can)
-            []() -> void (*)(any&, const any&)
-            {
-                if constexpr (Where == place::ref)
-                {
-                    return +[](any& dst, const any& src)
-                    {
-                        dst.vt_ = src.vt_;
-                        dst.store_.remote = src.store_.remote;
-                    };
-                }
-                else if constexpr (std::copy_constructible<T>)
-                {
-                    return +[](any& dst, const any& src)
-                    { dst.emplace_value<T>(*static_cast<const T*>(src.vt_->address(src))); };
-                }
-                else
-                {
-                    return nullptr;
-                }
-            }(),
-            // move
-            +[](any& dst, any& src) noexcept
-            {
-                if constexpr (Where == place::local)
-                {
-                    std::construct_at(
-                        static_cast<T*>(static_cast<void*>(dst.store_.local)),
-                        std::move(*static_cast<T*>(static_cast<void*>(src.store_.local))));
-                    dst.vt_ = src.vt_;
-                    src.vt_->destroy(src);
-                }
-                else  // remote and ref: steal the pointer
-                {
-                    dst.store_.remote = src.store_.remote;
-                    dst.vt_ = src.vt_;
-                }
-                src.vt_ = nullptr;
-            },
-            // address
-            +[](const any& self) noexcept -> void*
-            {
-                if constexpr (Where == place::local)
-                {
-                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-                    return const_cast<std::byte*>(self.store_.local);
-                }
-                else
-                {
-                    return self.store_.remote;
-                }
-            },
-        };
-        return &vt;
-    }
-
-    template <class T, class... Args>
-    void emplace_value(Args&&... args)
-    {
-        if constexpr (fits_inline<T>)
-        {
-            std::construct_at(static_cast<T*>(static_cast<void*>(store_.local)),
-                              std::forward<Args>(args)...);
-            vt_ = table<T, place::local>();
-        }
-        else
-        {
-            void* raw = ::operator new(sizeof(T), std::align_val_t{alignof(T)});
-            try
-            {
-                store_.remote =
-                    std::construct_at(static_cast<T*>(raw), std::forward<Args>(args)...);
-            }
-            catch (...)
-            {
-                ::operator delete(raw, std::align_val_t{alignof(T)});
-                throw;
-            }
-            vt_ = table<T, place::remote>();
-        }
-    }
-
-public:
-    any() noexcept = default;  // empty
-
-    // The owning maker (any's analogue of add: explicit, never implicit).
-    template <class T, class... Args>
-    [[nodiscard]] static any make(Args&&... args)
-    {
-        static_assert(std::same_as<T, detail::bare<T>>,
-                      "ecs: any::make<T> takes a plain, unqualified value type");
-        any out;
-        out.emplace_value<T>(std::forward<Args>(args)...);
-        return out;
-    }
-
-    // The non-owning view maker.
-    template <class T>
-    [[nodiscard]] static any ref(T& object) noexcept
-    {
-        static_assert(std::same_as<T, detail::bare<T>>,
-                      "ecs: any::ref<T> views a plain, unqualified value type");
-        any out;
-        out.store_.remote = &object;
-        out.vt_ = table<T, place::ref>();
-        return out;
-    }
-
-    any(const any& other)
-    {
-        if (other.vt_ == nullptr)
-        {
-            return;
-        }
-        if (other.vt_->copy == nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate(
-                    "copy of an any holding a non-copyable payload (the copy is "
-                    "empty; move it or pass any::ref)");
-            }
-            return;
-        }
-        other.vt_->copy(*this, other);
-    }
-
-    any(any&& other) noexcept
-    {
-        if (other.vt_ != nullptr)
-        {
-            other.vt_->move(*this, other);
-        }
-    }
-
-    any& operator=(const any& other)
-    {
-        if (this != &other)
-        {
-            any copy(other);
-            reset();
-            if (copy.vt_ != nullptr)
-            {
-                copy.vt_->move(*this, copy);
-            }
-        }
-        return *this;
-    }
-
-    any& operator=(any&& other) noexcept
-    {
-        if (this != &other)
-        {
-            reset();
-            if (other.vt_ != nullptr)
-            {
-                other.vt_->move(*this, other);
-            }
-        }
-        return *this;
-    }
-
-    ~any() { reset(); }
-
-    void reset() noexcept
-    {
-        if (vt_ != nullptr)
-        {
-            vt_->destroy(*this);
-            vt_ = nullptr;
-        }
-    }
-
-    [[nodiscard]] bool holds() const noexcept { return vt_ != nullptr; }
-    explicit operator bool() const noexcept { return holds(); }
-
-    // hash_of<T> of the payload; 0 when empty.
-    [[nodiscard]] std::uint64_t type_hash() const noexcept
-    {
-        return vt_ != nullptr ? vt_->hash : 0;
-    }
-
-    // find-style access: null on empty or type mismatch.
-    template <class T>
-    [[nodiscard]] T* try_as() noexcept
-    {
-        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
-                   ? static_cast<T*>(vt_->address(*this))
-                   : nullptr;
-    }
-
-    template <class T>
-    [[nodiscard]] const T* try_as() const noexcept
-    {
-        return vt_ != nullptr && vt_->hash == hash_of<detail::bare<T>>()
-                   ? static_cast<const T*>(vt_->address(*this))
-                   : nullptr;
-    }
-
-    // get-style access: aborts on mismatch (a reference must be produced).
-    template <class T>
-    [[nodiscard]] T& as()
-    {
-        T* payload = try_as<T>();
-        if (payload == nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate(
-                    "as<T> on an any holding a different type (or nothing); "
-                    "try_as<T> is the safe form");
-            }
-            std::abort();  // cannot produce a reference
-        }
-        return *payload;
-    }
-
-    template <class T>
-    [[nodiscard]] const T& as() const
-    {
-        const T* payload = try_as<T>();
-        if (payload == nullptr)
-        {
-            if constexpr (checks_enabled)
-            {
-                detail::violate(
-                    "as<T> on an any holding a different type (or nothing); "
-                    "try_as<T> is the safe form");
-            }
-            std::abort();
-        }
-        return *payload;
-    }
-
-    // Raw payload bytes for tooling (null when empty); the pointer obeys the
-    // payload's own lifetime rules.
-    [[nodiscard]] void* data() noexcept { return vt_ != nullptr ? vt_->address(*this) : nullptr; }
-    [[nodiscard]] const void* data() const noexcept
-    {
-        return vt_ != nullptr ? vt_->address(*this) : nullptr;
-    }
-
-private:
-    const vtable_t* vt_ = nullptr;
-    storage store_{};
-};
-
-// ----------------------------------------------------------------------------
-// Reflection -- a process-wide, RTTI-free runtime type registry
-//
-// A fluent builder over compile-time member pointers; lookups are binary
-// searches keyed by hash_of<T> -- the SAME identity archives and pools use,
-// so all three agree on what a type is called. Register at startup
-// (externally synchronized, like world construction). Runtime operations are
-// fault-tolerant: mismatches answer empty handles, empty anys, or false --
-// never an abort.
-// ----------------------------------------------------------------------------
 
 namespace detail
 {
@@ -8673,14 +8415,11 @@ struct ctor_node
     any (*construct)(std::span<any> args);
 };
 
-// The meta x ECS bridge: structural verbs by hash, captured when reflect<T>()
-// sees a component type. Alive-gated and presence-gated so editor calls
-// refuse with false instead of tripping checked violations.
 struct ecs_bridge
 {
-    bool (*add_to)(world& w, entity e, any& value) = nullptr;
-    bool (*remove_from)(world& w, entity e) = nullptr;
-    bool (*present_on)(const world& w, entity e) = nullptr;
+    bool (*add_to)(registry& w, entity e, any& value) = nullptr;
+    bool (*remove_from)(registry& w, entity e) = nullptr;
+    bool (*present_on)(const registry& w, entity e) = nullptr;
 };
 
 struct type_node
@@ -8695,7 +8434,6 @@ struct type_node
     ecs_bridge ecs;
 };
 
-// Sorted by hash; nodes are heap-stable so handles survive registrations.
 inline std::vector<std::unique_ptr<type_node>>& reflection_registry()
 {
     static std::vector<std::unique_ptr<type_node>> nodes;
@@ -8713,7 +8451,6 @@ inline std::vector<std::unique_ptr<type_node>>& reflection_registry()
     return it != nodes.end() && (*it)->hash == hash ? it->get() : nullptr;
 }
 
-// Member-pointer introspection for the builder.
 template <class M>
 struct member_object_traits;
 
@@ -8746,7 +8483,6 @@ struct member_function_traits<R (C::*)(As...) const>
 };
 }  // namespace detail
 
-// A valid-or-empty handle over one registered data member.
 class field
 {
 public:
@@ -8756,8 +8492,6 @@ public:
     [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
     [[nodiscard]] std::uint64_t type_hash() const noexcept { return node_->type_hash; }
 
-    // Copies the member out of an any holding the owner type; empty any on
-    // mismatch.
     [[nodiscard]] any get(const any& object) const
     {
         if (node_ == nullptr || object.type_hash() != node_->owner_hash)
@@ -8767,8 +8501,6 @@ public:
         return node_->get(object.data());
     }
 
-    // Writes the member into an any holding the owner type; false on any
-    // mismatch, leaving the value untouched.
     bool set(any& object, const any& value) const
     {
         if (node_ == nullptr || object.type_hash() != node_->owner_hash)
@@ -8778,9 +8510,6 @@ public:
         return node_->set(object.data(), value);
     }
 
-    // Raw-pointer forms for LIVE components (pool_ref::raw bytes): the
-    // caller vouches that object points at the owner type, and the pointer
-    // obeys the pool's invalidation rules like any component reference.
     [[nodiscard]] any get_at(const void* object) const
     {
         return node_ != nullptr ? node_->get(object) : any{};
@@ -8802,7 +8531,6 @@ private:
     const detail::field_node* node_ = nullptr;
 };
 
-// A valid-or-empty handle over one registered member function.
 class method
 {
 public:
@@ -8811,9 +8539,6 @@ public:
     explicit operator bool() const noexcept { return node_ != nullptr; }
     [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
 
-    // Invokes with arguments unpacked from anys; the result rides back in
-    // one (empty for void). Wrong object type, arity, or argument types:
-    // empty any, no call.
     any invoke(any& object, std::span<any> args) const
     {
         if (node_ == nullptr || object.type_hash() != node_->owner_hash)
@@ -8823,14 +8548,13 @@ public:
         return node_->invoke(object.data(), args);
     }
 
-    // Const objects accept const member functions only.
     any invoke(const any& object, std::span<any> args) const
     {
         if (node_ == nullptr || !node_->is_const || object.type_hash() != node_->owner_hash)
         {
             return {};
         }
-        // Const member call through the object's address: safe by is_const.
+
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         return node_->invoke(const_cast<void*>(object.data()), args);
     }
@@ -8846,7 +8570,6 @@ private:
     const detail::method_node* node_ = nullptr;
 };
 
-// A valid-or-empty handle over one registered type.
 class reflection
 {
 public:
@@ -8888,8 +8611,8 @@ public:
         return {};
     }
 
-    // Walks fields in registration order: fn(const ecs::field&).
     template <class F>
+        requires std::invocable<F&, const field&>
     void each_field(F&& fn) const
     {
         if (node_ != nullptr)
@@ -8901,8 +8624,6 @@ public:
         }
     }
 
-    // Constructs an instance through the first registered constructor whose
-    // arity and argument types match; empty any when none do.
     [[nodiscard]] any construct(std::span<any> args) const
     {
         if (node_ != nullptr)
@@ -8923,23 +8644,18 @@ public:
         return {};
     }
 
-    // --- the meta x ECS bridge (captured for component types) ---
-    // add_to moves the payload in (an EMPTY any default-constructs; how tags
-    // add). Every verb is alive- and presence-gated: editor calls answer
-    // false, never checked violations. Mid-iteration calls follow the typed
-    // verbs' rules.
-    bool add_to(world& w, entity e, any value) const
+    bool add_to(registry& w, entity e, any value) const
     {
         return node_ != nullptr && node_->ecs.add_to != nullptr && node_->ecs.add_to(w, e, value);
     }
 
-    bool remove_from(world& w, entity e) const
+    bool remove_from(registry& w, entity e) const
     {
         return node_ != nullptr && node_->ecs.remove_from != nullptr &&
                node_->ecs.remove_from(w, e);
     }
 
-    [[nodiscard]] bool present_on(const world& w, entity e) const noexcept
+    [[nodiscard]] bool present_on(const registry& w, entity e) const noexcept
     {
         return node_ != nullptr && node_->ecs.present_on != nullptr && node_->ecs.present_on(w, e);
     }
@@ -8964,8 +8680,6 @@ private:
 
 [[nodiscard]] inline reflection reflection_of(std::string_view name) noexcept
 {
-    // Names hash with the same fnv1a hash_of<T> uses: the name lookup IS the
-    // hash lookup.
     return reflection_of(detail::fnv1a(name));
 }
 
@@ -8975,14 +8689,88 @@ template <class T>
     return reflection_of(hash_of<detail::bare<T>>());
 }
 
+template <class F>
+    requires std::invocable<F&, const reflection&>
+void for_each(F&& fn)
+{
+    for (const std::unique_ptr<detail::type_node>& node : detail::reflection_registry())
+    {
+        fn(reflection_of(node->hash));
+    }
+}
+[[nodiscard]] inline any get(const any& object, std::string_view field_name)
+{
+    return reflection_of(object.type_hash()).find_field(field_name).get(object);
+}
+
+inline bool set(any& object, std::string_view field_name, const any& value)
+{
+    return reflection_of(object.type_hash()).find_field(field_name).set(object, value);
+}
+
+inline any invoke(any& object, std::string_view method_name, std::span<any> args = {})
+{
+    return reflection_of(object.type_hash()).find_method(method_name).invoke(object, args);
+}
+
+inline any invoke(const any& object, std::string_view method_name, std::span<any> args = {})
+{
+    return reflection_of(object.type_hash()).find_method(method_name).invoke(object, args);
+}
+
+struct component_view
+{
+    pool_info info;
+    reflection reflect;
+    void* bytes = nullptr;
+
+    [[nodiscard]] std::string_view name() const noexcept { return info.name; }
+    [[nodiscard]] std::uint64_t name_hash() const noexcept { return info.name_hash; }
+    [[nodiscard]] bool reflected() const noexcept { return static_cast<bool>(reflect); }
+
+    [[nodiscard]] any value(std::string_view field_name) const
+    {
+        const field f = reflect.find_field(field_name);
+        return (f && bytes != nullptr) ? f.get_at(bytes) : any{};
+    }
+
+    template <class F>
+    void each_field(F&& visitor) const
+    {
+        if (bytes != nullptr)
+        {
+            reflect.each_field([&](const field& f) { visitor(f, f.get_at(bytes)); });
+        }
+    }
+};
+
+template <class Traits>
+template <class F>
+void basic_registry<Traits>::visit_components(entity e, F&& visitor) const
+{
+    if (!table_.alive(e))
+    {
+        return;
+    }
+    for (const pool_base* pool : active_)
+    {
+        if (!pool->contains(e.index()))
+        {
+            continue;
+        }
+        const pool_info info = pool->info();
+        auto ref = find_pool(info.id);
+        const component_view view{info, reflection_of(info.name_hash), ref.raw(e)};
+        visitor(view);
+    }
+}
+
 template <class T>
 class reflect_builder;
 
 template <class T>
 reflect_builder<T> reflect();
 
-// The fluent registrar. Duplicate registration of the same type is a checked
-// violation; the builder then appends to the existing node.
 template <class T>
 class reflect_builder
 {
@@ -9011,6 +8799,36 @@ public:
                 return true;
             },
         });
+        return *this;
+    }
+
+    template <class... Names>
+        requires reflectable_aggregate<T>
+    reflect_builder& fields(Names... names)
+    {
+        constexpr std::size_t n = field_count_v<T>;
+        static_assert(sizeof...(Names) == 0 || sizeof...(Names) == n,
+                      "ecs: fields(...) takes no names (positional) or exactly "
+                      "field_count_v<T> of them");
+        [&]<std::size_t... Is>(std::index_sequence<Is...>)
+        {
+            if constexpr (sizeof...(Names) == 0)
+            {
+                if constexpr (field_names_supported)
+                {
+                    (auto_field<Is>(field_names_v<T>[Is]), ...);  // real "x","y",...
+                }
+                else
+                {
+                    (auto_field<Is>(positional_name<Is>()), ...);  // "0","1",...
+                }
+            }
+            else
+            {
+                const std::array<std::string_view, n> labels{std::string_view{names}...};
+                (auto_field<Is>(labels[Is]), ...);
+            }
+        }(std::make_index_sequence<n>{});
         return *this;
     }
 
@@ -9090,6 +8908,40 @@ private:
         }(typename traits::args{});
     }
 
+    template <std::size_t I>
+    void auto_field(std::string_view name)
+    {
+        using value =
+            std::remove_cvref_t<std::tuple_element_t<I, decltype(tie_fields(std::declval<T&>()))>>;
+        node_->fields.push_back(detail::field_node{
+            name,
+            hash_of<T>(),
+            hash_of<detail::bare<value>>(),
+            +[](const void* object) -> any
+            {
+                return any::make<detail::bare<value>>(
+                    std::get<I>(tie_fields(*static_cast<const T*>(object))));
+            },
+            +[](void* object, const any& incoming) -> bool
+            {
+                const auto* payload = incoming.template try_as<detail::bare<value>>();
+                if (payload == nullptr)
+                {
+                    return false;
+                }
+                std::get<I>(tie_fields(*static_cast<T*>(object))) = *payload;
+                return true;
+            },
+        });
+    }
+
+    template <std::size_t I>
+    static std::string_view positional_name()
+    {
+        static const std::string label = std::to_string(I);
+        return label;
+    }
+
     explicit reflect_builder(detail::type_node* node) noexcept
         : node_(node)
     {
@@ -9098,8 +8950,6 @@ private:
     detail::type_node* node_;
 };
 
-// Registers T (idempotent identity: name from name_of<T>/ecs_label) and
-// returns the builder for fields, methods, and constructors.
 template <class T>
 reflect_builder<T> reflect()
 {
@@ -9127,7 +8977,7 @@ reflect_builder<T> reflect()
     node->align = alignof(T);
     if constexpr (component<T>)
     {
-        node->ecs.add_to = +[](world& w, entity e, any& value) -> bool
+        node->ecs.add_to = +[](registry& w, entity e, any& value) -> bool
         {
             if (!w.alive(e) || w.has<T>(e))
             {
@@ -9135,7 +8985,7 @@ reflect_builder<T> reflect()
             }
             if constexpr (detail::is_tag_v<T>)
             {
-                w.add<T>(e);  // membership is the whole payload
+                w.add<T>(e);
                 return true;
             }
             else
@@ -9149,14 +8999,14 @@ reflect_builder<T> reflect()
                     }
                     else
                     {
-                        return false;  // adds move the payload in
+                        return false;
                     }
                 }
                 if (!value.holds())
                 {
                     if constexpr (std::default_initializable<T>)
                     {
-                        w.add<T>(e);  // empty any: default-construct
+                        w.add<T>(e);
                         return true;
                     }
                     else
@@ -9164,20 +9014,18 @@ reflect_builder<T> reflect()
                         return false;
                     }
                 }
-                return false;  // payload of the wrong type
+                return false;
             }
         };
         node->ecs.remove_from =
-            +[](world& w, entity e) -> bool { return w.alive(e) && w.remove<T>(e); };
-        node->ecs.present_on = +[](const world& w, entity e) -> bool { return w.has<T>(e); };
+            +[](registry& w, entity e) -> bool { return w.alive(e) && w.remove<T>(e); };
+        node->ecs.present_on = +[](const registry& w, entity e) -> bool { return w.has<T>(e); };
     }
     detail::type_node* raw = node.get();
     nodes.insert(at, std::move(node));
     return reflect_builder<T>(raw);
 }
 
-// Manifest-driven identity registration: one call per types<> list.
-// Idempotent -- already registered types are skipped, not violations.
 template <class... Ts>
 void reflect_all(types<Ts...>)
 {
@@ -9187,46 +9035,27 @@ void reflect_all(types<Ts...>)
      ...);
 }
 
-// ----------------------------------------------------------------------------
-// Checked-build test backdoor: deliberately corrupts internal state so tests
-// can prove validate() detects real damage. Not part of the API contract.
-// ----------------------------------------------------------------------------
-
 #if ECS_CHECKS
 struct test_access
 {
     template <component T>
-    static void corrupt_sparse(world& w, entity e)
+    static void corrupt_sparse(registry& w, entity e)
     {
-        // Through the BASE pointer: test_access is the base's friend, and the
-        // derived pools' using-declarations are their own access path.
         static_cast<detail::pool_base*>(w.peek_pool<T>())
             ->sparse_.set(e.index(), detail::npos32 - 1);
     }
 
-    static void corrupt_generation(world& w, entity e) { ++w.table_.generation_[e.index()]; }
+    static void corrupt_generation(registry& w, entity e) { ++w.table_.generation_[e.index()]; }
 
     template <component T>
-    static std::uint32_t lock_count(const world& w)
+    static std::uint32_t lock_count(const registry& w)
     {
         const detail::pool_base* pool = w.peek_pool<T>();
         return pool == nullptr ? 0 : pool->locks_;
     }
-
-    // Breaks the mirror invariant in ONE pool of a bonded pair (the partner
-    // keeps its order), so tests can prove validate() detects it.
-    template <component T>
-    static void corrupt_bond(world& w)
-    {
-        detail::pool_base* pool = w.peek_pool<T>();
-        pool->swap_dense(0, 1);  // dense+sparse stay consistent; the mirror breaks
-    }
 };
 #endif
 
-// Named hasher mirroring std::hash<basic_entity<...>>, for module builds
-// where some toolchains hide global-module-fragment std::hash
-// specializations from importers.
 template <entity_traits Traits>
 struct basic_entity_hash
 {
