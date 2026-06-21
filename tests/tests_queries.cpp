@@ -266,6 +266,17 @@ TEST(Queries, AnyOfViolations)
     EXPECT_TRUE(w.has<Cat>(e));
     EXPECT_TRUE(RegistryValid(w));
 }
+
+TEST(Queries, ViewGetStaleHandleAborts)
+{
+    ecs::registry w;
+    const ecs::entity gone = w.create(Pos{1});
+    w.destroy(gone);
+    const ecs::entity fresh = w.create(Pos{2});
+    ASSERT_EQ(fresh.index(), gone.index());
+    EXPECT_DEATH({ (void)w.view<Pos>().get<Pos>(gone); }, "");
+    EXPECT_TRUE(RegistryValid(w));
+}
 #endif
 
 TEST(Queries, ViewBackAndReversed)
@@ -312,6 +323,33 @@ TEST(Queries, ViewBackAndReversed)
         ++count;
     }
     EXPECT_EQ(count, 0);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
+
+TEST(Queries, WhereValuePredicate)
+{
+    ecs::registry w;
+    const ecs::entity a = w.create(Pos{1}, Hp{5});
+    w.create(Pos{2}, Hp{50});
+    w.create(Pos{3}, Hp{8});
+    w.create(Hp{1});
+
+    const auto hurt = [](const Hp& h) { return h.hp < 10; };
+
+    EXPECT_EQ((w.view<Pos>(ecs::where<Hp>(hurt)).count()), 2);
+
+    std::vector<int> xs;
+    w.view<Pos>(ecs::where<Hp>(hurt)).each([&](Pos& p) { xs.push_back(p.x); });
+    std::sort(xs.begin(), xs.end());
+    EXPECT_EQ(xs, (std::vector<int>{1, 3}));
+
+    w.add<TagA>(a);
+    EXPECT_EQ((w.view<Pos>(ecs::where<Hp>(hurt) && ecs::exists<TagA>{}).count()), 1);
+    EXPECT_EQ((w.view<Pos>(!ecs::where<Hp>(hurt)).count()), 1);
+
+    const ecs::entity d = w.create(Pos{4});
+    EXPECT_FALSE(w.view<Pos>(ecs::where<Hp>(hurt)).contains(d));
 
     EXPECT_TRUE(RegistryValid(w));
 }
