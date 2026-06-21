@@ -1016,6 +1016,79 @@ TEST(Core, OrderedChildren)
     EXPECT_TRUE(RegistryValid(w));
 }
 
+TEST(Core, RelationshipHooks)
+{
+    ecs::registry w;
+    const ecs::entity p1 = w.create();
+    const ecs::entity p2 = w.create();
+    const ecs::entity c = w.create();
+
+    struct Rec
+    {
+        ecs::entity child;
+        ecs::entity parent;
+        int kind;
+    };
+    std::vector<Rec> log;
+
+    ecs::scoped_relationship_hook ah(
+        w,
+        w.on_adopt(
+            +[](ecs::registry&, ecs::entity ch, ecs::entity pa, void* u)
+            { static_cast<std::vector<Rec>*>(u)->push_back(Rec{ch, pa, 0}); },
+            &log));
+    ecs::scoped_relationship_hook oh(
+        w,
+        w.on_orphan(
+            +[](ecs::registry&, ecs::entity ch, ecs::entity pa, void* u)
+            { static_cast<std::vector<Rec>*>(u)->push_back(Rec{ch, pa, 1}); },
+            &log));
+    ecs::scoped_relationship_hook rh(
+        w,
+        w.on_reorder(
+            +[](ecs::registry&, ecs::entity ch, ecs::entity pa, void* u)
+            { static_cast<std::vector<Rec>*>(u)->push_back(Rec{ch, pa, 2}); },
+            &log));
+
+    w.adopt(p1, c);
+    ASSERT_EQ(log.size(), 1U);
+    EXPECT_EQ(log[0].child, c);
+    EXPECT_EQ(log[0].parent, p1);
+    EXPECT_EQ(log[0].kind, 0);
+
+    const ecs::entity c2 = w.create();
+    w.adopt(p1, c2);
+    ASSERT_EQ(log.size(), 2U);
+
+    w.reorder_child(c2, c);
+    ASSERT_EQ(log.size(), 3U);
+    EXPECT_EQ(log[2].child, c2);
+    EXPECT_EQ(log[2].parent, p1);
+    EXPECT_EQ(log[2].kind, 2);
+
+    w.adopt(p2, c);
+    ASSERT_EQ(log.size(), 5U);
+    EXPECT_EQ(log[3].kind, 1);
+    EXPECT_EQ(log[3].child, c);
+    EXPECT_EQ(log[3].parent, p1);
+    EXPECT_EQ(log[4].kind, 0);
+    EXPECT_EQ(log[4].child, c);
+    EXPECT_EQ(log[4].parent, p2);
+
+    w.orphan(c);
+    ASSERT_EQ(log.size(), 6U);
+    EXPECT_EQ(log[5].kind, 1);
+    EXPECT_EQ(log[5].parent, p2);
+
+    ah.release();
+    oh.release();
+    rh.release();
+    w.adopt(p1, c);
+    EXPECT_EQ(log.size(), 6U);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
+
 TEST(Core, RelationshipTraversal)
 {
     ecs::registry w;
