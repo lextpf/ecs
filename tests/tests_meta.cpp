@@ -42,6 +42,11 @@ struct MetaBlob
     double lanes[8] = {};
 };
 
+struct MetaProbe
+{
+    int a = 7;
+};
+
 TEST(Meta, AnyBasics)
 {
     ecs::any small = ecs::any::make<int>(42);
@@ -138,6 +143,51 @@ TEST(Meta, ReflectionRegistry)
         EXPECT_TRUE(static_cast<bool>(ecs::reflection_of<Vec2>()));
     }
 #endif
+}
+
+TEST(Meta, EmptyReflectionHandlesAreSafe)
+{
+    const ecs::field f;
+    EXPECT_FALSE(static_cast<bool>(f));
+    EXPECT_TRUE(f.name().empty());
+    EXPECT_EQ(f.type_hash(), 0U);
+
+    const ecs::method m;
+    EXPECT_FALSE(static_cast<bool>(m));
+    EXPECT_TRUE(m.name().empty());
+
+    const ecs::reflection r;
+    EXPECT_FALSE(static_cast<bool>(r));
+    EXPECT_TRUE(r.name().empty());
+    EXPECT_EQ(r.hash(), 0U);
+    EXPECT_EQ(r.size_bytes(), 0U);
+    EXPECT_EQ(r.align(), 0U);
+}
+
+TEST(Meta, ReflectionFieldHandlesSurviveAppend)
+{
+    ecs::reflect<MetaProbe>().field<&MetaProbe::a>("a");
+    const ecs::field fa = ecs::reflection_of<MetaProbe>().find_field("a");
+    ASSERT_TRUE(static_cast<bool>(fa));
+
+    {
+#if ECS_CHECKS
+        const violation_scope guard;
+#endif
+        ecs::reflect<MetaProbe>()
+            .field<&MetaProbe::a>("a02")
+            .field<&MetaProbe::a>("a03")
+            .field<&MetaProbe::a>("a04")
+            .field<&MetaProbe::a>("a05")
+            .field<&MetaProbe::a>("a06")
+            .field<&MetaProbe::a>("a07")
+            .field<&MetaProbe::a>("a08")
+            .field<&MetaProbe::a>("a09");
+    }
+
+    ASSERT_EQ(fa.name(), "a");
+    const MetaProbe obj{};
+    EXPECT_EQ(fa.get_at(&obj).as<int>(), 7);
 }
 
 TEST(Meta, ReflectionFields)
