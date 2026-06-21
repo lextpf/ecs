@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <iterator>
@@ -785,6 +786,29 @@ template <class Traits>
 using basic_component_hook = void (*)(basic_registry<Traits>&, basic_entity<Traits>, void* user);
 
 using component_hook = basic_component_hook<default_entity_traits>;
+
+template <class Traits>
+using basic_relationship_hook = void (*)(basic_registry<Traits>&,
+                                         basic_entity<Traits> child,
+                                         basic_entity<Traits> parent,
+                                         void* user);
+
+using relationship_hook = basic_relationship_hook<default_entity_traits>;
+
+enum class relationship_kind : std::uint8_t
+{
+    adopt,
+    orphan,
+    reorder,
+};
+
+struct relationship_token
+{
+    relationship_kind kind = relationship_kind::adopt;
+    std::uint32_t id = 0;
+
+    explicit operator bool() const noexcept { return id != 0; }
+};
 
 struct hook_token
 {
@@ -2728,6 +2752,12 @@ struct exists
 {
 };
 
+template <class T, class Pred>
+struct where_filter
+{
+    Pred pred;
+};
+
 namespace detail
 {
 template <class T>
@@ -2903,6 +2933,22 @@ struct filter_leaves<or_filter<L, R>>
 };
 template <class F>
 using filter_leaves_t = typename filter_leaves<F>::type;
+
+template <class T, class Pred>
+struct is_filter<where_filter<T, Pred>> : std::true_type
+{
+};
+template <class T, class Pred>
+struct filter_node<where_filter<T, Pred>>
+{
+    static constexpr int kind = 5;
+    using comp = bare<T>;
+};
+template <class T, class Pred>
+struct filter_leaves<where_filter<T, Pred>>
+{
+    using type = types<bare<T>>;
+};
 }  // namespace detail
 
 template <class L, class R>
@@ -2922,6 +2968,12 @@ template <class E>
 [[nodiscard]] constexpr detail::not_filter<E> operator!(E inner) noexcept
 {
     return {inner};
+}
+
+template <class T, class Pred>
+[[nodiscard]] constexpr where_filter<detail::bare<T>, Pred> where(Pred pred)
+{
+    return {std::move(pred)};
 }
 
 template <class Traits, class Filter, class... Ts>
@@ -3069,6 +3121,15 @@ public:
         constexpr bool slot_is_const =
             std::array<bool, sizeof...(Ts)>{std::is_const_v<detail::maybe_inner<Ts>>...}[s];
         auto* pool = static_cast<pool_of_t<detail::bare<T>>*>(includes_[s]);
+        if constexpr (checks_enabled)
+        {
+            if (pool == nullptr || !contains(e))
+            {
+                detail::violate_pool("view::get<T> for an entity the view does not match; pool",
+                                     name_of<detail::bare<T>>());
+                std::abort();
+            }
+        }
         if constexpr (slot_is_const)
         {
             return static_cast<const detail::bare<T>&>(*pool->at(e.index()));
@@ -3608,9 +3669,11 @@ private:
     friend struct test_access;
 
     explicit basic_view(std::array<pool_base*, sizeof...(Ts)> includes,
-                        std::array<pool_base*, leaf_count> filter_pools) noexcept
+                        std::array<pool_base*, leaf_count> filter_pools,
+                        Filter filter = {}) noexcept
         : includes_(includes),
-          filter_pools_(filter_pools)
+          filter_pools_(filter_pools),
+          filter_(std::move(filter))
     {
     }
 
@@ -3666,34 +3729,46 @@ private:
         else
         {
             std::size_t leaf = 0;
-            return eval_filter<Filter>(index, leaf);
+            return eval_filter(filter_, index, leaf);
         }
     }
 
     template <class F>
-    [[nodiscard]] bool eval_filter(index_type index, std::size_t& leaf) const noexcept
+    [[nodiscard]] bool eval_filter(const F& node,
+                                   index_type index,
+                                   std::size_t& leaf) const noexcept
     {
-        using node = detail::filter_node<F>;
-        if constexpr (node::kind == 1)  // exists<T>
+        using fnode = detail::filter_node<F>;
+        if constexpr (fnode::kind == 1)  // exists<T>
         {
             pool_base* pool = filter_pools_[leaf++];
             return pool != nullptr && pool->contains(index);
         }
-        else if constexpr (node::kind == 2)  // and
+        else if constexpr (fnode::kind == 5)  // where<T>(pred)
         {
-            const bool l = eval_filter<typename node::lhs>(index, leaf);
-            const bool r = eval_filter<typename node::rhs>(index, leaf);
+            auto* pool = static_cast<pool_of_t<typename fnode::comp>*>(filter_pools_[leaf++]);
+            if (pool == nullptr)
+            {
+                return false;
+            }
+            auto* value = pool->at(index);
+            return value != nullptr && node.pred(*value);
+        }
+        else if constexpr (fnode::kind == 2)  // and
+        {
+            const bool l = eval_filter(node.lhs, index, leaf);
+            const bool r = eval_filter(node.rhs, index, leaf);
             return l && r;
         }
-        else if constexpr (node::kind == 3)  // or
+        else if constexpr (fnode::kind == 3)  // or
         {
-            const bool l = eval_filter<typename node::lhs>(index, leaf);
-            const bool r = eval_filter<typename node::rhs>(index, leaf);
+            const bool l = eval_filter(node.lhs, index, leaf);
+            const bool r = eval_filter(node.rhs, index, leaf);
             return l || r;
         }
-        else if constexpr (node::kind == 4)  // not
+        else if constexpr (fnode::kind == 4)  // not
         {
-            return !eval_filter<typename node::inner>(index, leaf);
+            return !eval_filter(node.inner, index, leaf);
         }
         else  // true_filter
         {
@@ -3803,6 +3878,7 @@ private:
 
     std::array<pool_base*, sizeof...(Ts)> includes_{};
     std::array<pool_base*, leaf_count> filter_pools_{};
+    Filter filter_{};
     std::uint8_t driver_override_ = no_driver_override;
 };
 
@@ -5743,6 +5819,10 @@ public:
             }
             if constexpr (checks_enabled)
             {
+                // Add during iteration is flagged but still performed: the emplace appends
+                // (unlike the swap-removes of destroy/remove, which are refused). If that
+                // append reallocates the pool being iterated, the in-flight loop is corrupted
+                // -- reserve ahead or defer the add via a command_buffer.
                 if (pool.locked())
                 {
                     detail::violate_pool("add during iteration over pool", pool.name());
@@ -5786,6 +5866,7 @@ public:
             }
             std::abort();
         }
+        auto* pool = peek_pool<T>();
         if constexpr (std::is_move_assignable_v<T>)
         {
             *existing = T(std::forward<Args>(args)...);
@@ -5795,8 +5876,8 @@ public:
             std::destroy_at(existing);
             std::construct_at(existing, std::forward<Args>(args)...);
         }
-        peek_pool<T>()->fire_replace(e);
-        return *existing;
+        pool->fire_replace(e);
+        return *pool->at(e.index());
     }
 
     template <component T, class F>
@@ -5816,9 +5897,28 @@ public:
             }
             std::abort();
         }
+        auto* pool = peek_pool<T>();
         std::invoke(fn, *existing);
+        pool->fire_replace(e);
+        return *pool->at(e.index());
+    }
+
+    template <component T>
+    void touch(entity e)
+    {
+        static_assert(!detail::is_tag_v<T>,
+                      "ecs: T uses tag storage and carries no data; there is nothing to "
+                      "touch -- use has<T>/add<T>/remove<T>");
+        if (lookup<T>(e) == nullptr)
+        {
+            if constexpr (checks_enabled)
+            {
+                detail::violate_pool("touch of a component the entity does not have; pool",
+                                     name_of<T>());
+            }
+            std::abort();
+        }
         peek_pool<T>()->fire_replace(e);
-        return *existing;
     }
 
     template <component T>
@@ -5845,6 +5945,7 @@ public:
         {
             if (T* existing = lookup<T>(e); existing != nullptr)
             {
+                auto* pool = peek_pool<T>();
                 if constexpr (std::is_move_assignable_v<T>)
                 {
                     *existing = T(std::forward<Args>(args)...);
@@ -5854,8 +5955,8 @@ public:
                     std::destroy_at(existing);
                     std::construct_at(existing, std::forward<Args>(args)...);
                 }
-                peek_pool<T>()->fire_replace(e);
-                return *existing;
+                pool->fire_replace(e);
+                return *pool->at(e.index());
             }
             return add<T>(e, std::forward<Args>(args)...);
         }
@@ -6207,20 +6308,22 @@ public:
 
     template <class... Ts, class Filter, class Self>
         requires detail::filter_expr<Filter>
-    [[nodiscard]] auto view(this Self&& self, Filter)
+    [[nodiscard]] auto view(this Self&& self, Filter filter)
     {
         if constexpr (std::is_const_v<std::remove_reference_t<Self>>)
         {
             // NOLINTNEXTLINE(readability-redundant-typename)
             using result = basic_view<Traits, Filter, typename detail::as_const_part<Ts>::type...>;
             return result{self.template include_pools<Ts...>(),
-                          self.template filter_pools<Filter>()};
+                          self.template filter_pools<Filter>(),
+                          std::move(filter)};
         }
         else
         {
             using result = basic_view<Traits, Filter, Ts...>;
             return result{self.template include_pools<Ts...>(),
-                          self.template filter_pools<Filter>()};
+                          self.template filter_pools<Filter>(),
+                          std::move(filter)};
         }
     }
 
@@ -6300,6 +6403,29 @@ public:
         return result;
     }
 
+    relationship_token on_adopt(basic_relationship_hook<Traits> fn, void* user = nullptr)
+    {
+        return connect_relationship(relationship_kind::adopt, fn, user);
+    }
+    relationship_token on_orphan(basic_relationship_hook<Traits> fn, void* user = nullptr)
+    {
+        return connect_relationship(relationship_kind::orphan, fn, user);
+    }
+    relationship_token on_reorder(basic_relationship_hook<Traits> fn, void* user = nullptr)
+    {
+        return connect_relationship(relationship_kind::reorder, fn, user);
+    }
+
+    bool unhook(relationship_token token) noexcept
+    {
+        if (!token)
+        {
+            return false;
+        }
+        return std::erase_if(list_for(token.kind),
+                             [id = token.id](const rel_hook_entry& e) { return e.id == id; }) > 0;
+    }
+
     void adopt(entity parent, entity child)
     {
         if (!table_.alive(parent) || !table_.alive(child) || parent == child || clearing_ ||
@@ -6334,12 +6460,14 @@ public:
             }
         }
         kin* child_k = pool.at(child.index());
+        entity old_parent = no_entity;
         if (child_k == nullptr)
         {
             child_k = &pool.emplace(child);
         }
         else if (child_k->parent != no_entity)
         {
+            old_parent = child_k->parent;
             detail::kin_links::unlink(pool, *child_k);
         }
         kin* parent_k = pool.at(parent.index());
@@ -6359,6 +6487,11 @@ public:
             parent_k->first_child = child;
         }
         parent_k->last_child = child;
+        if (old_parent != no_entity)
+        {
+            fire_orphan(child, old_parent);
+        }
+        fire_adopt(child, parent);
     }
 
     void orphan(entity child)
@@ -6389,10 +6522,12 @@ public:
                 return;
             }
         }
+        const entity old_parent = k->parent;
         detail::kin_links::unlink(*pool, *k);
         k->parent = no_entity;
         k->prev_sibling = no_entity;
         k->next_sibling = no_entity;
+        fire_orphan(child, old_parent);
     }
 
     void reorder_child(entity child, entity before = no_entity)
@@ -6466,6 +6601,7 @@ public:
             }
             before_k->prev_sibling = child;
         }
+        fire_reorder(child, child_k->parent);
     }
 
     [[nodiscard]] entity parent_of(entity child) const noexcept
@@ -7195,6 +7331,64 @@ private:
     bool clearing_ = false;
     entity globals_;
     detail::basic_dispatcher<Traits> dispatcher_;
+
+    struct rel_hook_entry
+    {
+        basic_relationship_hook<Traits> fn;
+        void* user;
+        std::uint32_t id;
+    };
+
+    std::vector<rel_hook_entry>& list_for(relationship_kind kind) noexcept
+    {
+        switch (kind)
+        {
+            case relationship_kind::orphan:
+                return rel_orphan_;
+            case relationship_kind::reorder:
+                return rel_reorder_;
+            default:
+                return rel_adopt_;
+        }
+    }
+
+    relationship_token connect_relationship(relationship_kind kind,
+                                            basic_relationship_hook<Traits> fn,
+                                            void* user)
+    {
+        if constexpr (checks_enabled)
+        {
+            if (fn == nullptr)
+            {
+                detail::violate("null relationship hook");
+                return {};
+            }
+        }
+        const std::uint32_t id = rel_next_id_++;
+        list_for(kind).push_back(rel_hook_entry{fn, user, id});
+        return relationship_token{kind, id};
+    }
+
+    void fire_relationship(std::vector<rel_hook_entry>& list, entity child, entity parent)
+    {
+        for (std::size_t i = 0; i < list.size(); ++i)
+        {
+            const rel_hook_entry e = list[i];
+            e.fn(*this, child, parent, e.user);
+        }
+    }
+
+    void fire_adopt(entity child, entity parent) { fire_relationship(rel_adopt_, child, parent); }
+    void fire_orphan(entity child, entity parent) { fire_relationship(rel_orphan_, child, parent); }
+    void fire_reorder(entity child, entity parent)
+    {
+        fire_relationship(rel_reorder_, child, parent);
+    }
+
+    std::vector<rel_hook_entry> rel_adopt_;
+    std::vector<rel_hook_entry> rel_orphan_;
+    std::vector<rel_hook_entry> rel_reorder_;
+    std::uint32_t rel_next_id_ = 1;
 };
 
 using registry = basic_registry<default_entity_traits>;
@@ -7246,6 +7440,11 @@ public:
         }
         if constexpr (checks_enabled)
         {
+            // Disconnecting during iteration is refused (not deferred): mutating the hook
+            // list while a pool is locked could corrupt an in-flight dispatch. The hook stays
+            // connected and a later release() outside iteration cleans it up. If the owning
+            // tracker/watcher is destroyed here, its still-connected member-fn hook dangles --
+            // do not destroy reactive objects mid-iteration over a pool they watch.
             if (pool_->locked())
             {
                 detail::violate_pool("hook change during iteration over pool", pool_->name());
@@ -7266,6 +7465,60 @@ private:
 };
 
 using scoped_hook = basic_scoped_hook<default_entity_traits>;
+
+template <class Traits>
+class basic_scoped_relationship_hook
+{
+public:
+    basic_scoped_relationship_hook() = default;
+
+    basic_scoped_relationship_hook(basic_registry<Traits>& w, relationship_token token) noexcept
+        : world_(&w),
+          token_(token)
+    {
+    }
+
+    basic_scoped_relationship_hook(basic_scoped_relationship_hook&& other) noexcept
+        : world_(std::exchange(other.world_, nullptr)),
+          token_(std::exchange(other.token_, relationship_token{}))
+    {
+    }
+
+    basic_scoped_relationship_hook& operator=(basic_scoped_relationship_hook&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            world_ = std::exchange(other.world_, nullptr);
+            token_ = std::exchange(other.token_, relationship_token{});
+        }
+        return *this;
+    }
+
+    basic_scoped_relationship_hook(const basic_scoped_relationship_hook&) = delete;
+    basic_scoped_relationship_hook& operator=(const basic_scoped_relationship_hook&) = delete;
+
+    ~basic_scoped_relationship_hook() { release(); }
+
+    void release() noexcept
+    {
+        if (world_ != nullptr && token_)
+        {
+            world_->unhook(token_);
+        }
+        world_ = nullptr;
+        token_ = relationship_token{};
+    }
+
+    [[nodiscard]] relationship_token token() const noexcept { return token_; }
+    explicit operator bool() const noexcept { return static_cast<bool>(token_); }
+
+private:
+    basic_registry<Traits>* world_ = nullptr;
+    relationship_token token_{};
+};
+
+using scoped_relationship_hook = basic_scoped_relationship_hook<default_entity_traits>;
 
 enum class track : std::uint8_t
 {
@@ -8428,9 +8681,9 @@ struct type_node
     std::string_view name;
     std::size_t size_bytes = 0;
     std::size_t align = 0;
-    std::vector<field_node> fields;
-    std::vector<method_node> methods;
-    std::vector<ctor_node> ctors;
+    std::deque<field_node> fields;
+    std::deque<method_node> methods;
+    std::deque<ctor_node> ctors;
     ecs_bridge ecs;
 };
 
@@ -8489,8 +8742,14 @@ public:
     field() = default;
 
     explicit operator bool() const noexcept { return node_ != nullptr; }
-    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
-    [[nodiscard]] std::uint64_t type_hash() const noexcept { return node_->type_hash; }
+    [[nodiscard]] std::string_view name() const noexcept
+    {
+        return node_ != nullptr ? node_->name : std::string_view{};
+    }
+    [[nodiscard]] std::uint64_t type_hash() const noexcept
+    {
+        return node_ != nullptr ? node_->type_hash : 0;
+    }
 
     [[nodiscard]] any get(const any& object) const
     {
@@ -8537,7 +8796,10 @@ public:
     method() = default;
 
     explicit operator bool() const noexcept { return node_ != nullptr; }
-    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
+    [[nodiscard]] std::string_view name() const noexcept
+    {
+        return node_ != nullptr ? node_->name : std::string_view{};
+    }
 
     any invoke(any& object, std::span<any> args) const
     {
@@ -8576,10 +8838,16 @@ public:
     reflection() = default;
 
     explicit operator bool() const noexcept { return node_ != nullptr; }
-    [[nodiscard]] std::string_view name() const noexcept { return node_->name; }
-    [[nodiscard]] std::uint64_t hash() const noexcept { return node_->hash; }
-    [[nodiscard]] std::size_t size_bytes() const noexcept { return node_->size_bytes; }
-    [[nodiscard]] std::size_t align() const noexcept { return node_->align; }
+    [[nodiscard]] std::string_view name() const noexcept
+    {
+        return node_ != nullptr ? node_->name : std::string_view{};
+    }
+    [[nodiscard]] std::uint64_t hash() const noexcept { return node_ != nullptr ? node_->hash : 0; }
+    [[nodiscard]] std::size_t size_bytes() const noexcept
+    {
+        return node_ != nullptr ? node_->size_bytes : 0;
+    }
+    [[nodiscard]] std::size_t align() const noexcept { return node_ != nullptr ? node_->align : 0; }
 
     [[nodiscard]] field find_field(std::string_view name) const noexcept
     {
