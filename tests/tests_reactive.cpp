@@ -264,3 +264,48 @@ TEST(Reactive, ViewEachOf)
 
     EXPECT_TRUE(RegistryValid(w));
 }
+
+TEST(Reactive, MutatorsReturnLiveRefAfterReallocatingHook)
+{
+    const ecs::component_hook grow_pos =
+        +[](ecs::registry& reg, ecs::entity, void*) { reg.reserve<Pos>(1u << 16); };
+
+    {
+        ecs::registry w;
+        const ecs::entity e = w.create(Pos{1});
+        const ecs::scoped_hook hook(w, w.on_replace<Pos>(grow_pos));
+        Pos& r = w.replace<Pos>(e, Pos{2});
+        EXPECT_EQ(&r, w.find<Pos>(e));
+    }
+    {
+        ecs::registry w;
+        const ecs::entity e = w.create(Pos{1});
+        const ecs::scoped_hook hook(w, w.on_replace<Pos>(grow_pos));
+        Pos& r = w.amend<Pos>(e, [](Pos& p) { p.x = 3; });
+        EXPECT_EQ(&r, w.find<Pos>(e));
+    }
+    {
+        ecs::registry w;
+        const ecs::entity e = w.create(Pos{1});
+        const ecs::scoped_hook hook(w, w.on_replace<Pos>(grow_pos));
+        Pos& r = w.put<Pos>(e, Pos{4});
+        EXPECT_EQ(&r, w.find<Pos>(e));
+    }
+}
+
+TEST(Reactive, TouchFiresReplaceForBareWrite)
+{
+    ecs::registry w;
+    ecs::tracker<Hp> hurt(w, ecs::track::replaced);
+    const ecs::entity e = w.create(Hp{10});
+
+    w.get<Hp>(e).hp = 5;
+    EXPECT_TRUE(hurt.replaced().empty());
+
+    w.touch<Hp>(e);
+    EXPECT_EQ(hurt.replaced().size(), 1U);
+    EXPECT_EQ(hurt.replaced()[0], e);
+    EXPECT_EQ(w.get<Hp>(e).hp, 5);
+
+    EXPECT_TRUE(RegistryValid(w));
+}
